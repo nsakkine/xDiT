@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: BSD-2-Clause
 # Copyright (c) 2018 Jakub Červený
 
+from numba import njit
 import torch
 
-
+@njit
 def gilbert3d(width, height, depth):
     """
     Generalized Hilbert ('Gilbert') space-filling curve for arbitrary-sized
@@ -29,11 +30,11 @@ def gilbert3d(width, height, depth):
                              width, 0, 0,
                              0, height, 0)
 
-
+@njit
 def sgn(x):
     return -1 if x < 0 else (1 if x > 0 else 0)
 
-
+@njit
 def generate3d(x, y, z,
                ax, ay, az,
                bx, by, bz,
