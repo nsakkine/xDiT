@@ -318,7 +318,7 @@ def attention(
         value,
         dropout_p=dropout_p,
         is_causal=is_causal,
-        **attn_func_kwargs,
+        attn_func_kwargs=attn_func_kwargs,
     )
     return out
 
