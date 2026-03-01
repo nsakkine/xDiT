@@ -140,7 +140,7 @@ def reorder_sequence(t: torch.Tensor, order: torch.Tensor) -> torch.Tensor:
     nt = []
     for i in range(t.shape[0]):
         nt.append(
-            t[i].reshape(t.shape[1], -1).permute(1, 0)[order[i]]
+            t[i].reshape(t.shape[1], -1).transpose(0, 1)[order[i]]
         )
     nt = torch.stack(nt).contiguous()
 

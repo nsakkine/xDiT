@@ -86,13 +86,10 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         use_sparge_attention = (
             backend == AttentionBackendType.AITER_SPARGE
         )
+        attn_func_kwargs = {}
         if use_sparge_attention:
-            attn_func_kwargs = {
-                "simthreshold": get_runtime_state().runtime_config.spargeattn_simthreshold,
-                "cdfthreshold": get_runtime_state().runtime_config.spargeattn_cdfthreshold,
-            }
-        else:
-            attn_func_kwargs = {}
+            attn_func_kwargs["simthreshold"] = get_runtime_state().runtime_config.spargeattn_simthreshold
+            attn_func_kwargs["cdfthreshold"] = get_runtime_state().runtime_config.spargeattn_cdfthreshold
 
         encoder_hidden_states_img = None
         if attn.add_k_proj is not None:
@@ -271,17 +268,10 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
             get_runtime_state().runtime_config.spargeattn_reorder_sequence
         )
         if use_sparge_attention:
-            order = curve(hidden_states)
-            hidden_states = reorder_sequence(hidden_states, order)
-            _rotary_emb = []
-            for i in range(len(rotary_emb)):
-                emb = []
-                for j in range(hidden_states.shape[0]):
-                    emb.append(rotary_emb[i][order[j]])
-                _rotary_emb.append(torch.stack(emb))
-            rotary_emb = tuple(_rotary_emb)
-        else:
-            hidden_states = hidden_states.flatten(2).transpose(1, 2)
+            order, inverse_order = curve(num_frames, height, width, hidden_states.device)
+            hidden_states = hidden_states[:, :, order]
+            rotary_emb = [freqs[:, order] for freqs in rotary_emb]
+        hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if timestep.ndim == 2:
@@ -308,20 +298,18 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         pad_amount = (sp_world_size - (hidden_states.shape[1] % sp_world_size)) % sp_world_size
         hidden_states = self._chunk_and_pad_sequence(hidden_states, sp_world_rank, sp_world_size, pad_amount, dim=1)
 
-        if ts_seq_len is not None: # (wan2.2 ti2v)
-            temb = self._chunk_and_pad_sequence(temb, sp_world_rank, sp_world_size, pad_amount, dim=1)
-            timestep_proj = self._chunk_and_pad_sequence(timestep_proj, sp_world_rank, sp_world_size, pad_amount, dim=1)
-
-        freqs_cos, freqs_sin = rotary_emb
-
         def get_rotary_emb_chunk(freqs, pad_amount):
             freqs = self._chunk_and_pad_sequence(freqs, sp_world_rank, sp_world_size, pad_amount, dim=1)
             return freqs
 
+        freqs_cos, freqs_sin = rotary_emb
         freqs_cos = get_rotary_emb_chunk(freqs_cos, pad_amount)
         freqs_sin = get_rotary_emb_chunk(freqs_sin, pad_amount)
         rotary_emb = (freqs_cos, freqs_sin)
 
+        if ts_seq_len is not None: # (wan2.2 ti2v)
+            temb = self._chunk_and_pad_sequence(temb, sp_world_rank, sp_world_size, pad_amount, dim=1)
+            timestep_proj = self._chunk_and_pad_sequence(timestep_proj, sp_world_rank, sp_world_size, pad_amount, dim=1)
 
         # 4. Transformer blocks
         if torch.is_grad_enabled() and self.gradient_checkpointing:
@@ -356,7 +344,7 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         hidden_states = self._gather_and_unpad(hidden_states, pad_amount, dim=-2)
 
         if use_sparge_attention:
-            hidden_states = restore_sequence_order(hidden_states, order)
+            hidden_states = hidden_states[:, inverse_order]
 
         hidden_states = hidden_states.reshape(
             batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
