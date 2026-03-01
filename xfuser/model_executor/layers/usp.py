@@ -27,10 +27,11 @@ from xfuser.core.cache_manager.cache_manager import get_cache_manager
 from xfuser.core.distributed.attention_backend import ATTENTION_FUNCTION_REGISTRY
 
 
-def ring_attn(attention_function, query, key, value, dropout_p=0.0, is_causal=False, joint_attn_kwargs=None):
+def ring_attn(attention_function, query, key, value, dropout_p=0.0, is_causal=False, attn_func_kwargs=None, joint_attn_kwargs=None):
     kwargs = {
         "dropout_p": dropout_p,
         "is_causal": is_causal,
+        "attn_func_kwargs": attn_func_kwargs,
         "joint_attn_kwargs": joint_attn_kwargs,
     }
     if parse(torch.__version__).release >= parse("2.6.0").release:
@@ -211,6 +212,7 @@ def concat_joint_tensors_decorator(func):
         is_causal = kwargs.get("is_causal")
         dropout_p = kwargs.get("dropout_p")
         joint_attn_kwargs = kwargs.get("joint_attn_kwargs", None)
+        attn_func_kwargs = kwargs.get("attn_func_kwargs", None)
 
         if joint_attn_kwargs is not None:
             joint_strategy = joint_attn_kwargs.get("joint_strategy", None)
@@ -223,7 +225,10 @@ def concat_joint_tensors_decorator(func):
                 value = _concat_joint_tensor(value, joint_value, joint_strategy, dim=2)
             joint_attn_kwargs["step"] = step + 1 # In place increment step
 
-        return func(query, key, value, dropout_p=dropout_p, is_causal=is_causal)
+        if attn_func_kwargs is None:
+            return func(query, key, value, dropout_p=dropout_p, is_causal=is_causal)
+        else:
+            return func(query, key, value, dropout_p=dropout_p, is_causal=is_causal, **attn_func_kwargs)
     return wrapper
 
 def USP(
@@ -239,6 +244,7 @@ def USP(
         attn_layer=None,
         combine_qkv_a2a: bool | None = None,
         backend=None,
+        **attn_func_kwargs,
     ):
     """
     Unified Sequence Parallelism (USP) attention call, supporting combinations of Ulysses and
@@ -276,14 +282,23 @@ def USP(
         key, value = _update_and_get_kv_cache(key, value, attn_layer)
 
     if get_sequence_parallel_world_size() == 1: # No SP
-        out, _ = attention_function(query, key, value, dropout_p=dropout_p, is_causal=is_causal, joint_attn_kwargs=joint_attn_kwargs)
+        out, _ = attention_function(
+            query, key, value, dropout_p=dropout_p, is_causal=is_causal, attn_func_kwargs=attn_func_kwargs,
+            joint_attn_kwargs=joint_attn_kwargs
+        )
 
     elif get_ulysses_parallel_world_size() == 1: # Ring only
-        out = ring_attn(attention_function, query, key, value, dropout_p=dropout_p, is_causal=is_causal, joint_attn_kwargs=joint_attn_kwargs)
+        out = ring_attn(
+            attention_function,
+            query, key, value, dropout_p=dropout_p, is_causal=is_causal, attn_func_kwargs=attn_func_kwargs,
+            joint_attn_kwargs=joint_attn_kwargs
+        )
 
     else:
         if get_ring_parallel_world_size() == 1: # Ulysses only
-            out, _ = attention_function(query, key, value, dropout_p=dropout_p, is_causal=is_causal, joint_attn_kwargs=joint_attn_kwargs)
+            out, _ = attention_function(
+                query, key, value, dropout_p=dropout_p, is_causal=is_causal, attn_func_kwargs=attn_func_kwargs,
+                joint_attn_kwargs=joint_attn_kwargs)
         else: # USP
             out = ring_attn(attention_function, query, key, value, dropout_p=dropout_p, is_causal=is_causal, joint_attn_kwargs=joint_attn_kwargs)
         out = _ft_c_output_all_to_all(out)
@@ -298,6 +313,7 @@ def attention(
         dropout_p: float = 0.0,
         is_causal: bool = False,
         backend=None,
+        **attn_func_kwargs,
     ):
     """
     Runs attention call without any parallelism.
@@ -311,6 +327,7 @@ def attention(
         value,
         dropout_p=dropout_p,
         is_causal=is_causal,
+        **attn_func_kwargs,
     )
     return out
 

@@ -149,7 +149,10 @@ class xFuserArgs:
     # Hybrid GEMM schedule (FP8 high precision + FP4 low precision)
     use_hybrid_gemm_schedule: bool = False
     num_hybrid_gemm_high_precision_steps: Optional[int] = None
-
+    # Sparge attention
+    spargeattn_reorder_sequence: bool = True
+    spargeattn_simthreshold: float = 0.5
+    spargeattn_cdfthreshold: float = 0.98
 
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser):
@@ -208,6 +211,18 @@ class xFuserArgs:
             type=str,
             default=None,
             help="Attention backend to use. If not specified, the best available backend will be selected automatically.",
+        )
+        runtime_group.add_argument(
+            "--spargeattn_simthreshold",
+            type=float,
+            default=0.5,
+            help="Similarity threshold for sparge attention.",
+        )
+        runtime_group.add_argument(
+            "--spargeattn_cdfthreshold",
+            type=float,
+            default=0.98,
+            help="CDF threshold for sparge attention.",
         )
         # Parallel arguments
         parallel_group = parser.add_argument_group("Parallel Processing Options")
@@ -682,6 +697,17 @@ class xFuserArgs:
             default=False,
             help="Use channels last memory format for the VAE.",
         )
+            "--spargeattn_simthreshold",
+            type=float,
+            default=0.5,
+            help="Similarity threshold for sparge attention.",
+        )
+        parser.add_argument(
+            "--spargeattn_cdfthreshold",
+            type=float,
+            default=0.98,
+            help="CDF threshold for sparge attention.",
+        )
         return parser
 
 
@@ -698,7 +724,6 @@ class xFuserArgs:
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         engine_args = cls(**{arg_name: arg_value for arg_name, arg_value in args.items() if arg_name in attrs})
         return engine_args
-
 
 
     def create_config(
@@ -759,6 +784,9 @@ class xFuserArgs:
             use_fp8_t5_encoder=self.use_fp8_t5_encoder,
             attention_backend=self.attention_backend,
             cross_attention_backend=self.cross_attention_backend,
+            spargeattn_reorder_sequence=self.spargeattn_reorder_sequence,
+            spargeattn_simthreshold=self.spargeattn_simthreshold,
+            spargeattn_cdfthreshold=self.spargeattn_cdfthreshold,
         )
 
         parallel_config = ParallelConfig(

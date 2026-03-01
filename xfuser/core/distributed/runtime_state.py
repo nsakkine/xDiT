@@ -206,7 +206,8 @@ class RuntimeState(metaclass=ABCMeta):
                                  AttentionBackendType.FLASH_4,
                                  AttentionBackendType.AITER_FP8,
                                  AttentionBackendType.AITER_SAGE,
-                                 AttentionBackendType.AITER_SAGE_V2]:
+                                 AttentionBackendType.AITER_SAGE_V2,
+                                 AttentionBackendType.AITER_SPARGE]:
             if self.parallel_config.ring_degree > 1:
                 raise RuntimeError("Selected attention backend does not support ring parallelism.")
         if attention_backend == AttentionBackendType.AITER_FP8:
@@ -228,7 +229,12 @@ class RuntimeState(metaclass=ABCMeta):
         elif attention_backend == AttentionBackendType.SAGE:
             if not env_info["has_sage"]:
                 raise RuntimeError("SageAttention is not available, please install SageAttention.")
-
+        elif attention_backend == AttentionBackendType.AITER_SPARGE:
+            try:
+                from aiter.ops.triton.attention.fav3_sage import fav3_sage_wrapper_func
+                assert inspect.signature(fav3_sage_wrapper_func).parameters.get("block_lut") is not None
+            except (ImportError, AssertionError):
+                raise RuntimeError("AITER Sparge attention is not available, please update AITER") from None
 
 
 class UnetRuntimeState(RuntimeState):

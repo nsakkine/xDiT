@@ -7,6 +7,7 @@ from diffusers.models.transformers.transformer_wan import WanAttention
 from diffusers.models.transformers.transformer_wan import WanTransformer3DModel
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 
+from xfuser.core.distributed.attention_backend import AttentionBackendType
 from xfuser.model_executor.layers.usp import (
     USP,
     attention,
@@ -16,6 +17,11 @@ from xfuser.core.distributed import (
     get_sequence_parallel_rank,
     get_sp_group,
     get_runtime_state,
+)
+from xfuser.core.sparge_attention.utils import (
+    curve,
+    reorder_sequence,
+    restore_sequence_order,
 )
 from xfuser.model_executor.layers.attention_processor import (
     xFuserAttentionProcessorRegister
@@ -77,6 +83,16 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             # We allow specifying a different backend for cross-attention than the main attention backend
             # as some backends may have too much overhead for cross-attention.
             backend = get_runtime_state().get_cross_attention_backend()
+        use_sparge_attention = (
+            backend == AttentionBackendType.AITER_SPARGE
+        )
+        if use_sparge_attention:
+            attn_func_kwargs = {
+                "simthreshold": get_runtime_state().runtime_config.spargeattn_simthreshold,
+                "cdfthreshold": get_runtime_state().runtime_config.spargeattn_cdfthreshold,
+            }
+        else:
+            attn_func_kwargs = {}
 
         encoder_hidden_states_img = None
         if attn.add_k_proj is not None:
@@ -121,12 +137,23 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             key_img = key_img.unflatten(2, (attn.heads, -1))
             value_img = value_img.unflatten(2, (attn.heads, -1))
 
-            hidden_states_img = self.attention_function(query.transpose(1, 2), key_img.transpose(1, 2), value_img.transpose(1, 2), backend=backend).transpose(1, 2)
+            hidden_states_img = self.attention_function(
+                query.transpose(1, 2),
+                key_img.transpose(1, 2),
+                value_img.transpose(1, 2),
+                backend=backend,
+                attn_func_kwargs=attn_func_kwargs,
+            ).transpose(1, 2)
             hidden_states_img = hidden_states_img.flatten(2, 3)
             hidden_states_img = hidden_states_img.type_as(query)
 
-
-        hidden_states = self.attention_function(query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), backend=backend).transpose(1, 2)
+        hidden_states = self.attention_function(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            backend=backend,
+            attn_func_kwargs=attn_func_kwargs,
+        ).transpose(1, 2)
 
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
@@ -239,7 +266,22 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         rotary_emb = self.rope(hidden_states)
 
         hidden_states = self.patch_embedding(hidden_states)
-        hidden_states = hidden_states.flatten(2).transpose(1, 2)
+        use_sparge_attention = (
+            (get_runtime_state().attention_backend == AttentionBackendType.AITER_SPARGE) and
+            get_runtime_state().runtime_config.spargeattn_reorder_sequence
+        )
+        if use_sparge_attention:
+            order = curve(hidden_states)
+            hidden_states = reorder_sequence(hidden_states, order)
+            _rotary_emb = []
+            for i in range(len(rotary_emb)):
+                emb = []
+                for j in range(hidden_states.shape[0]):
+                    emb.append(rotary_emb[i][order[j]])
+                _rotary_emb.append(torch.stack(emb))
+            rotary_emb = tuple(_rotary_emb)
+        else:
+            hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if timestep.ndim == 2:
@@ -290,6 +332,10 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         else:
             for block in self.blocks:
                 hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
+
+
+        if use_sparge_attention:
+            hidden_states = restore_sequence_order(hidden_states, order)
 
         # 5. Output norm, projection & unpatchify
         if temb.ndim == 3:

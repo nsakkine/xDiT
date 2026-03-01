@@ -3,7 +3,9 @@ import torch
 import inspect
 import torch.nn.functional as F
 from enum import Enum
+from typing import Optional
 from xfuser.envs import PACKAGES_CHECKER, environment_variables
+from xfuser.core.sparge_attention.block_mask import get_block_map_meansim
 
 ATTENTION_FUNCTION_REGISTRY = {}
 
@@ -70,7 +72,8 @@ if env_info["has_aiter"]:
     import aiter
     from aiter import flash_attn_func as flash_attn_func_aiter
     try:
-        from aiter.ops.triton.attention.fav3_sage import fav3_sage_wrapper_func
+        from aiter.ops.triton.attention.fav3_sage import fav3_sage_wrapper_func, get_sage_fwd_configs
+        from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
     except ImportError:
         pass # Error is rasied in runtime_state.py if AITER_SAGE is not available.
     try:
@@ -112,6 +115,7 @@ class AttentionBackendType(Enum):
     AITER_FP8 = "AITER FP8"
     AITER_SAGE = "AITER Sage"
     AITER_SAGE_V2 = "AITER Sage V2"
+    AITER_SPARGE = "AITER Sparge"
     NPU = "NPU"
 
 def register_attention_function(backend_type):
@@ -433,4 +437,33 @@ def _sage_attn_call(query, key, value, dropout_p, is_causal):
         is_causal=is_causal,
         return_lse=True
     )
+    return output, softmax_lse
+
+
+@register_attention_function(AttentionBackendType.AITER_SPARGE)
+def _aiter_sparge_attn_call(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    dropout_p: float,
+    is_causal: bool,
+    simthreshold: float,
+    cdfthreshold: float
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    config = get_sage_fwd_configs()
+    BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
+    block_mask = get_block_map_meansim(
+        query, key,
+        BLKQ=BLOCK_M, BLKK=BLOCK_N,
+        is_causal=is_causal,
+        simthreshd1=simthreshold, cdfthreshd=cdfthreshold,
+        attention_sink=False,
+    )
+    block_lut = block_attn_mask_to_ragged_lut(block_mask)
+    output = fav3_sage_wrapper_func(
+            query, key, value,
+            block_lut=block_lut,
+            layout="bhsd",
+    )
+    softmax_lse = None
     return output, softmax_lse
