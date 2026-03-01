@@ -135,7 +135,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
                 query.transpose(1, 2),
                 key_img.transpose(1, 2),
                 value_img.transpose(1, 2),
-                attn_func_kwargs=attn_func_kwargs,
+                **attn_func_kwargs,
             ).transpose(1, 2)
             hidden_states_img = hidden_states_img.flatten(2, 3)
             hidden_states_img = hidden_states_img.type_as(query)
@@ -145,7 +145,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             query.transpose(1, 2),
             key.transpose(1, 2),
             value.transpose(1, 2),
-            attn_func_kwargs=attn_func_kwargs,
+            **attn_func_kwargs,
         ).transpose(1, 2)
 
         hidden_states = hidden_states.flatten(2, 3)
@@ -326,10 +326,6 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
             for block in self.blocks:
                 hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
 
-
-        if use_sparge_attention:
-            hidden_states = restore_sequence_order(hidden_states, order)
-
         # 5. Output norm, projection & unpatchify
         if temb.ndim == 3:
             # batch_size, seq_len, inner_dim (wan 2.2 ti2v)
@@ -351,6 +347,9 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         hidden_states = self.proj_out(hidden_states)
 
         hidden_states = self._gather_and_unpad(hidden_states, pad_amount, dim=-2)
+
+        if use_sparge_attention:
+            hidden_states = restore_sequence_order(hidden_states, order)
 
         hidden_states = hidden_states.reshape(
             batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
