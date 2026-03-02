@@ -87,6 +87,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
                 runtime_state = get_runtime_state()
                 attention_backend = runtime_state._select_attention_backend()
                 attention_function = ATTENTION_FUNCTION_REGISTRY.get(attention_backend)
+                attn_func_kwargs = {}
 
         encoder_hidden_states_img = None
         if attn.add_k_proj is not None:
