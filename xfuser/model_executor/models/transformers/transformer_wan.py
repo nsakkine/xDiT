@@ -74,19 +74,17 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         attention_mask: Optional[torch.Tensor] = None,
         rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        use_sparge_attention = (
-            get_runtime_state().attention_backend == AttentionBackendType.AITER_SPARGE
-        )
+        runtime_state = get_runtime_state()
+        attention_backend = runtime_state.attention_backend
+
         attn_func_kwargs = {}
-        attention_function = self.attention_function
-        if use_sparge_attention:
+        if attention_backend == AttentionBackendType.AITER_SPARGE:
             attn_func_kwargs["simthreshold"] = get_runtime_state().runtime_config.spargeattn_simthreshold
             attn_func_kwargs["cdfthreshold"] = get_runtime_state().runtime_config.spargeattn_cdfthreshold
 
-            if self.use_parallel_attention:
-                runtime_state = get_runtime_state()
-                attention_backend = runtime_state._select_attention_backend()
-                attention_function = ATTENTION_FUNCTION_REGISTRY.get(attention_backend)
+            if not self.use_parallel_attention:
+                _attention_backend = runtime_state._select_attention_backend()
+                runtime_state.set_attention_backend(_attention_backend)
                 attn_func_kwargs = {}
 
         encoder_hidden_states_img = None
@@ -157,6 +155,9 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
 
         hidden_states = attn.to_out[0](hidden_states)
         hidden_states = attn.to_out[1](hidden_states)
+
+        runtime_state.set_attention_backend(attention_backend)
+
         return hidden_states
 
 
