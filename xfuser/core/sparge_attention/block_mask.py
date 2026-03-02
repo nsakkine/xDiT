@@ -148,7 +148,6 @@ def fill_block_map_triton(final_map, num_to_select, sorted_indices):
     return final_map
 
 
-@torch._dynamo.disable()
 def get_block_map_meansim(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -184,7 +183,10 @@ def get_block_map_meansim(
     B, H, Q, K = cdf.shape
     cdfthreshd_ts = cdfthreshd.view(1, H, 1, 1)
     cdfthreshd_ts = cdfthreshd_ts.expand(B, -1, Q, 1).contiguous()
-    num_to_select = torch.searchsorted(cdf, cdfthreshd_ts, right=True).squeeze(-1)
+    # searchsorted(cdf, v, right=True) equivalent using compilable ops (avoids torch.compile graph break)
+    ge = (cdf >= cdfthreshd_ts)
+    idx = ge.long().argmax(dim=-1)
+    num_to_select = torch.where(ge.any(dim=-1), idx, cdf.new_full(idx.shape, K, dtype=torch.long))
     final_map = torch.zeros_like(pooled_score, dtype=torch.bool)
     final_map[~sim_kblocks] = 1
     final_map[~sim_qblocks] = 1
