@@ -199,6 +199,7 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
            rope_max_seq_len,
            pos_embed_seq_len,
         )
+        self.sparge_attention_cache = {}
         for block in self.blocks:
             block.attn1.processor = xFuserWanAttnProcessor()
             block.attn2.processor = xFuserWanAttnProcessor(use_ulysses_parallel_attention=False, is_cross_attention=True)
@@ -265,9 +266,14 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
             get_runtime_state().runtime_config.spargeattn_reorder_sequence
         )
         if use_sparge_attention:
-            order, inverse_order = curve(
-                post_patch_num_frames, post_patch_height, post_patch_width, hidden_states.device
-            )
+            key = (post_patch_num_frames, post_patch_height, post_patch_width)
+            if key in self.sparge_attention_cache:
+                order, inverse_order = self.sparge_attention_cache[key]
+            else:
+                order, inverse_order = curve(
+                    post_patch_num_frames, post_patch_height, post_patch_width, hidden_states.device
+                )
+                self.sparge_attention_cache[key] = (order, inverse_order)
             hidden_states = hidden_states[:, order, ...]
             rotary_emb = tuple(freqs[:, order, ...] for freqs in rotary_emb)
 
