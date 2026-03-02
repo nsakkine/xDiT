@@ -259,15 +259,17 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         rotary_emb = self.rope(hidden_states)
 
         hidden_states = self.patch_embedding(hidden_states)
+        hidden_states = hidden_states.flatten(2).transpose(1, 2)
         use_sparge_attention = (
             (get_runtime_state().attention_backend == AttentionBackendType.AITER_SPARGE) and
             get_runtime_state().runtime_config.spargeattn_reorder_sequence
         )
         if use_sparge_attention:
-            order, inverse_order = curve(num_frames, height, width, hidden_states.device)
-            hidden_states = hidden_states[:, :, order]
-            rotary_emb = [freqs[:, order] for freqs in rotary_emb]
-        hidden_states = hidden_states.flatten(2).transpose(1, 2)
+            order, inverse_order = curve(
+                post_patch_num_frames, post_patch_height, post_patch_width, hidden_states.device
+            )
+            hidden_states = hidden_states[:, order, ...]
+            rotary_emb = tuple(freqs[:, order, ...] for freqs in rotary_emb)
 
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if timestep.ndim == 2:
