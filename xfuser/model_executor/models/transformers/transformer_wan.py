@@ -277,8 +277,8 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
                     post_patch_num_frames, post_patch_height, post_patch_width, hidden_states.device
                 )
                 self.sparge_attention_cache[key] = (order, inverse_order)
-            hidden_states = hidden_states[:, order, ...]
-            rotary_emb = tuple(freqs[:, order, ...] for freqs in rotary_emb)
+            hidden_states = hidden_states[:, order, ...].contiguous()
+            rotary_emb = tuple(freqs[:, order, ...].contiguous() for freqs in rotary_emb)
 
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if timestep.ndim == 2:
@@ -351,7 +351,7 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         hidden_states = self._gather_and_unpad(hidden_states, pad_amount, dim=-2)
 
         if use_sparge_attention:
-            hidden_states = hidden_states[:, inverse_order]
+            hidden_states = hidden_states[:, inverse_order].contiguous()
 
         hidden_states = hidden_states.reshape(
             batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
