@@ -83,8 +83,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             backend == AttentionBackendType.AITER_SPARGE
         )
         attn_func_kwargs = {}
-        attention_function = self.attention_function
-        if use_sparge_attention:
+        if backend == AttentionBackendType.AITER_SPARGE:
             attn_func_kwargs["simthreshold"] = get_runtime_state().runtime_config.spargeattn_simthreshold
             attn_func_kwargs["cdfthreshold"] = get_runtime_state().runtime_config.spargeattn_cdfthreshold
 
@@ -157,6 +156,9 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
 
         hidden_states = attn.to_out[0](hidden_states)
         hidden_states = attn.to_out[1](hidden_states)
+
+        runtime_state.set_attention_backend(attention_backend)
+
         return hidden_states
 
 
