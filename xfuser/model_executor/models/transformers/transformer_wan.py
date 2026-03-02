@@ -7,7 +7,7 @@ from diffusers.models.transformers.transformer_wan import WanAttention
 from diffusers.models.transformers.transformer_wan import WanTransformer3DModel
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 
-from xfuser.core.distributed.attention_backend import AttentionBackendType
+from xfuser.core.distributed.attention_backend import ATTENTION_FUNCTION_REGISTRY, AttentionBackendType
 from xfuser.model_executor.layers.usp import (
     USP,
     attention,
@@ -36,6 +36,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             self.attention_function = USP
         else:
             self.attention_function = attention
+        self.use_parallel_attention = use_parallel_attention
 
     def _get_qkv_projections(self, attn: "WanAttention", hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor):
         # encoder_hidden_states is only passed for cross-attention
@@ -77,9 +78,15 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             get_runtime_state().attention_backend == AttentionBackendType.AITER_SPARGE
         )
         attn_func_kwargs = {}
+        attention_function = self.attention_function
         if use_sparge_attention:
             attn_func_kwargs["simthreshold"] = get_runtime_state().runtime_config.spargeattn_simthreshold
             attn_func_kwargs["cdfthreshold"] = get_runtime_state().runtime_config.spargeattn_cdfthreshold
+
+            if self.use_parallel_attention:
+                runtime_state = get_runtime_state()
+                attention_backend = runtime_state._select_attention_backend()
+                attention_function = ATTENTION_FUNCTION_REGISTRY.get(attention_backend)
 
         encoder_hidden_states_img = None
         if attn.add_k_proj is not None:
@@ -124,7 +131,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             key_img = key_img.unflatten(2, (attn.heads, -1))
             value_img = value_img.unflatten(2, (attn.heads, -1))
 
-            hidden_states_img = self.attention_function(
+            hidden_states_img = attention_function(
                 query.transpose(1, 2),
                 key_img.transpose(1, 2),
                 value_img.transpose(1, 2),
@@ -134,7 +141,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             hidden_states_img = hidden_states_img.type_as(query)
 
 
-        hidden_states = self.attention_function(
+        hidden_states = attention_function(
             query.transpose(1, 2),
             key.transpose(1, 2),
             value.transpose(1, 2),
