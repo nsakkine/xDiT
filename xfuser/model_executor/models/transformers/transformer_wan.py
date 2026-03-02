@@ -130,7 +130,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             key_img = key_img.unflatten(2, (attn.heads, -1))
             value_img = value_img.unflatten(2, (attn.heads, -1))
 
-            hidden_states_img = attention_function(
+            hidden_states_img = self.attention_function(
                 query.transpose(1, 2),
                 key_img.transpose(1, 2),
                 value_img.transpose(1, 2),
@@ -140,7 +140,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             hidden_states_img = hidden_states_img.type_as(query)
 
 
-        hidden_states = attention_function(
+        hidden_states = self.attention_function(
             query.transpose(1, 2),
             key.transpose(1, 2),
             value.transpose(1, 2),
