@@ -282,11 +282,13 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
                 order, inverse_order = curve(
                     linear_to_hilbert, hilbert_to_linear, hidden_states.device
                 )
-                block_neighbor_mask = sliced_gilbert_block_neighbor_mapping(
-                    post_patch_num_frames, post_patch_height, post_patch_width,
-                    256, 128,
-                    (linear_to_hilbert, hilbert_to_linear),
-                ).to(device=hidden_states.device)
+                block_neighbor_mask = torch.from_numpy(
+                    sliced_gilbert_block_neighbor_mapping(
+                        post_patch_num_frames, post_patch_height, post_patch_width,
+                        256, 128,
+                        (linear_to_hilbert, hilbert_to_linear),
+                    )
+                ).to(dtype=torch.bool, device=hidden_states.device)
                 self.sparge_attention_cache[key] = (order, inverse_order, block_neighbor_mask)
             runtime_state.block_neighbor_mask = block_neighbor_mask
             hidden_states = hidden_states[:, order, ...].contiguous()
