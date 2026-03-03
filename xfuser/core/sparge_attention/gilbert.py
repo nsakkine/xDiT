@@ -644,90 +644,73 @@ def sliced_curve(linear_to_hilbert: List[int], hilbert_to_linear: List[int], dev
     return order, inverse_order
 
 
-#@njit
-def sliced_gilbert_block_neighbor_mapping(
+@njit
+def _sliced_gilbert_block_neighbor_mapping(
     t: int, h: int, w: int,
     block_m: int, block_n: int,
-    gilbert_mapping: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    transpose_order: Optional[List[int]] = None
-) -> List[Set[int]]:
-    total_points = t * h * w
-    qblocks = (total_points + block_m - 1) // block_m
-        
-    block_color_map = numpy.zeros((w, h, t, numpy.int64(2)), dtype=int)
-    
-    if gilbert_mapping is None:
-        linear_to_hilbert, _ = sliced_gilbert_mapping(t, h, w, transpose_order)
-    else:
-        linear_to_hilbert, _ = gilbert_mapping
-    
-    for z in range(t):
-        for y in range(h):
-            for x in range(w):
-                # Calculate linear index
-                linear_idx = z * h * w + y * w + x
-                
-                # Get Gilbert curve index
-                hilbert_idx = linear_to_hilbert[linear_idx]
-                
-                # Color
-                block_color_map[x, y, z, 0] = hilbert_idx // block_m
-                block_color_map[x, y, z, 1] = hilbert_idx // block_n
-    
-    # 5. Initialize neighborhood sets
-    block_neighbors = [set() for _ in range(qblocks)]
-    # 6. Traverse 3D space, update neighborhood relationships
-    for x in range(w):
-        for y in range(h):
-            for z in range(t):
-                qb, kb = block_color_map[x, y, z]
-                
-                # Add self to neighborhood
-                block_neighbors[qb].add(kb)
-                
-                # Check 26-neighborhood
-                for dx in [-1, 0, 1]:
-                    nx = x + dx
-                    if nx < 0 or nx >= w:
-                        continue
-                        
-                    for dy in [-1, 0, 1]:
-                        ny = y + dy
-                        if ny < 0 or ny >= h:
-                            continue
-                            
-                        for dz in [-1, 0, 1]:
-                            nz = z + dz
-                            if nz < 0 or nz >= t:
-                                continue
-                            
-                            # Skip self
-                            if dx == 0 and dy == 0 and dz == 0:
-                                continue
-                                
-                            # Get neighbor's block
-                            neighbor_qb, neighbor_kb = block_color_map[nx, ny, nz]
-                            block_neighbors[neighbor_qb].add(neighbor_kb)
-    
-    return block_neighbors
-
-
-def sliced_gilbert_block_neighbor_mask(
-    t: int, h: int, w: int,
-    block_m: int, block_n: int,
-    sliced_gilbert_mapping: Optional[Tuple[List[int], List[int]]] = None,
-    transpose_order: Optional[List[int]] = None
-) -> torch.Tensor:
+    linear_to_hilbert: numpy.ndarray,
+) -> numpy.ndarray:
     """
-    Create a block neighbor mask based on sliced Gilbert curve mapping
+    Numba nopython core: build (qblocks, kblocks) boolean mask of block neighbors.
+    linear_to_hilbert: 1D int64 array of length t*h*w (Gilbert curve index per linear index).
     """
     total_points = t * h * w
     qblocks = (total_points + block_m - 1) // block_m
     kblocks = (total_points + block_n - 1) // block_n
 
-    block_neighbors = sliced_gilbert_block_neighbor_mapping(t, h, w, block_m, block_n, sliced_gilbert_mapping, transpose_order)
-    block_neighbor_mask = torch.zeros((qblocks, kblocks), dtype=torch.bool)
-    for i, neighbors in enumerate(block_neighbors):
-        block_neighbor_mask[i, list(neighbors)] = True
-    
-    return block_neighbor_mask
+    block_color_map = numpy.zeros((w, h, t, 2), dtype=numpy.int64)
+    for z in range(t):
+        for y in range(h):
+            for x in range(w):
+                linear_idx = z * h * w + y * w + x
+                hilbert_idx = linear_to_hilbert[linear_idx]
+                block_color_map[x, y, z, 0] = hilbert_idx // block_m
+                block_color_map[x, y, z, 1] = hilbert_idx // block_n
+
+    mask = numpy.zeros((qblocks, kblocks), dtype=numpy.bool_)
+    for x in range(w):
+        for y in range(h):
+            for z in range(t):
+                qb = block_color_map[x, y, z, 0]
+                kb = block_color_map[x, y, z, 1]
+                mask[qb, kb] = True
+                for dx in range(-1, 2):
+                    nx = x + dx
+                    if nx < 0 or nx >= w:
+                        continue
+                    for dy in range(-1, 2):
+                        ny = y + dy
+                        if ny < 0 or ny >= h:
+                            continue
+                        for dz in range(-1, 2):
+                            nz = z + dz
+                            if nz < 0 or nz >= t:
+                                continue
+                            if dx == 0 and dy == 0 and dz == 0:
+                                continue
+                            neighbor_qb = block_color_map[nx, ny, nz, 0]
+                            neighbor_kb = block_color_map[nx, ny, nz, 1]
+                            mask[neighbor_qb, neighbor_kb] = True
+    return mask
+
+
+def sliced_gilbert_block_neighbor_mapping(
+    t: int, h: int, w: int,
+    block_m: int, block_n: int,
+    gilbert_mapping: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    transpose_order: Optional[List[int]] = None
+) -> numpy.ndarray:
+    """
+    Build block-neighbor mask from Gilbert curve mapping.
+    Resolves optional mapping; returns boolean mask of shape (qblocks, kblocks).
+    """
+    if gilbert_mapping is None:
+        linear_to_hilbert, _ = sliced_gilbert_mapping(t, h, w, transpose_order)
+        arr = numpy.array(linear_to_hilbert, dtype=numpy.int64)
+    else:
+        lth = gilbert_mapping[0]
+        if isinstance(lth, torch.Tensor):
+            arr = lth.cpu().numpy().astype(numpy.int64)
+        else:
+            arr = numpy.asarray(lth, dtype=numpy.int64)
+    return _sliced_gilbert_block_neighbor_mapping(t, h, w, block_m, block_n, arr)
