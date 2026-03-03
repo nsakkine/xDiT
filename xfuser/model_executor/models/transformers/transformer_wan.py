@@ -19,7 +19,7 @@ from xfuser.core.distributed import (
     get_runtime_state,
 )
 from xfuser.core.sparge_attention.gilbert import sliced_curve as curve
-from xfuser.core.sparge_attention.gilbert import sliced_gilbert_block_neighbor_mask
+from xfuser.core.sparge_attention.gilbert import sliced_gilbert_mapping, sliced_gilbert_block_neighbor_mask
 from xfuser.model_executor.layers.attention_processor import (
     xFuserAttentionProcessorRegister
 )
@@ -276,10 +276,17 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
             if key in self.sparge_attention_cache:
                 order, inverse_order, block_neighbor_mask = self.sparge_attention_cache[key]
             else:
-                order, inverse_order = curve(
-                    post_patch_num_frames, post_patch_height, post_patch_width, hidden_states.device
+                linear_to_hilbert, hilbert_to_linear = sliced_gilbert_mapping(
+                    post_patch_num_frames, post_patch_height, post_patch_width
                 )
-                block_neighbor_mask = sliced_gilbert_block_neighbor_mask(post_patch_num_frames, post_patch_height, post_patch_width, 256, 128)
+                order, inverse_order = curve(
+                    linear_to_hilbert, hilbert_to_linear, hidden_states.device
+                )
+                block_neighbor_mask = sliced_gilbert_block_neighbor_mask(
+                    post_patch_num_frames, post_patch_height, post_patch_width,
+                    256, 128
+                    (linear_to_hilbert, hilbert_to_linear),
+                )
                 self.sparge_attention_cache[key] = (order, inverse_order, block_neighbor_mask)
             runtime_state.block_neighbor_mask = block_neighbor_mask
             hidden_states = hidden_states[:, order, ...].contiguous()
