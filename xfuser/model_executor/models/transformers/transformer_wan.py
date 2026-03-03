@@ -86,7 +86,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             attn_func_kwargs["static_block_mask"] = runtime_state.block_neighbor_mask
 
             if not self.use_parallel_attention:
-                _attention_backend = runtime_state._select_attention_backend()
+                _attention_backend = AttentionBackendType.AITER_SAGE
                 runtime_state.set_attention_backend(_attention_backend)
                 attn_func_kwargs = {}
 
@@ -210,7 +210,15 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
             block.attn2.processor = xFuserWanAttnProcessor(use_parallel_attention=False)
 
 
-    def _chunk_and_pad_sequence(self, x: torch.Tensor, sp_world_rank: int, sp_world_size: int, pad_amount: int, dim: int) -> torch.Tensor:
+    def _chunk_and_pad_and_reorder_sequence(
+        self,
+        x: torch.Tensor,
+        sp_world_rank: int,
+        sp_world_size: int,
+        pad_amount: int,
+        dim: int,
+        order: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if pad_amount > 0:
             if dim < 0:
                 dim = x.ndim + dim
@@ -222,16 +230,30 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
                             dtype=x.dtype,
                             device=x.device,
                         )], dim=dim)
-        x = torch.chunk(x,
-                        sp_world_size,
-                        dim=dim)[sp_world_rank]
+            if order is not None:
+                order = torch.cat([order, len(order) + torch.arange(pad_amount, device=order.device)])
+        if order is not None:
+            order = torch.chunk(order, sp_world_size, dim=0)[sp_world_rank]
+            x = x.index_select(dim=dim, index=order)
+        else:
+            x = torch.chunk(x, sp_world_size, dim=dim)[sp_world_rank]
+
         return x
 
-    def _gather_and_unpad(self, x: torch.Tensor, pad_amount: int, dim: int) -> torch.Tensor:
+    def _gather_and_unpad_and_reorder_sequence(
+        self,
+        x: torch.Tensor,
+        pad_amount: int,
+        dim: int,
+        order: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         x = get_sp_group().all_gather(x, dim=dim)
         size = x.size(dim)
-        return x.narrow(dim=dim, start=0, length=size - pad_amount)
+        x = x.narrow(dim=dim, start=0, length=size - pad_amount)
+        if order is not None:
+            x = x.index_select(dim=dim, index=order)
 
+        return x
 
     def forward(
         self,
@@ -267,6 +289,8 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
+        order = None
+        inverse_order = None
         runtime_state = get_runtime_state()
         use_sparge_attention = (
             (get_runtime_state().attention_backend == AttentionBackendType.AITER_SPARGE) and
@@ -294,8 +318,6 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
                 ).to(dtype=torch.bool, device=hidden_states.device)
                 self.sparge_attention_cache[key] = (order, inverse_order, block_neighbor_mask)
             runtime_state.block_neighbor_mask = block_neighbor_mask
-            hidden_states = hidden_states[:, order, ...].contiguous()
-            rotary_emb = tuple(freqs[:, order, ...].contiguous() for freqs in rotary_emb)
         else:
             runtime_state.block_neighbor_mask = None
 
@@ -322,10 +344,14 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
 
         # Part of sequence parallel: given the resolution, we may need to pad the sequence length to match this prior to chunking
         pad_amount = (sp_world_size - (hidden_states.shape[1] % sp_world_size)) % sp_world_size
-        hidden_states = self._chunk_and_pad_sequence(hidden_states, sp_world_rank, sp_world_size, pad_amount, dim=1)
+        hidden_states = self._chunk_and_pad_and_reorder_sequence(
+            hidden_states, sp_world_rank, sp_world_size, pad_amount, dim=1, order=order
+        )
 
         def get_rotary_emb_chunk(freqs, pad_amount):
-            freqs = self._chunk_and_pad_sequence(freqs, sp_world_rank, sp_world_size, pad_amount, dim=1)
+            freqs = self._chunk_and_pad_and_reorder_sequence(
+                freqs, sp_world_rank, sp_world_size, pad_amount, dim=1, order=order
+            )
             return freqs
 
         freqs_cos, freqs_sin = rotary_emb
@@ -334,8 +360,8 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         rotary_emb = (freqs_cos, freqs_sin)
 
         if ts_seq_len is not None: # (wan2.2 ti2v)
-            temb = self._chunk_and_pad_sequence(temb, sp_world_rank, sp_world_size, pad_amount, dim=1)
-            timestep_proj = self._chunk_and_pad_sequence(timestep_proj, sp_world_rank, sp_world_size, pad_amount, dim=1)
+            temb = self._chunk_and_pad_and_reorder_sequence(temb, sp_world_rank, sp_world_size, pad_amount, dim=1)
+            timestep_proj = self._chunk_and_pad_and_reorder_sequence(timestep_proj, sp_world_rank, sp_world_size, pad_amount, dim=1)
 
         # 4. Transformer blocks
         if torch.is_grad_enabled() and self.gradient_checkpointing:
@@ -367,10 +393,9 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
         hidden_states = self.proj_out(hidden_states)
 
-        hidden_states = self._gather_and_unpad(hidden_states, pad_amount, dim=-2)
-
-        if use_sparge_attention:
-            hidden_states = hidden_states[:, inverse_order].contiguous()
+        hidden_states = self._gather_and_unpad_and_reorder_sequence(
+            hidden_states, pad_amount, dim=-2, order=inverse_order
+        )
 
         hidden_states = hidden_states.reshape(
             batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
