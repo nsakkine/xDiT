@@ -468,7 +468,64 @@ def gilbert_xyz2d_r(cur_idx,
 
 
 @njit
-def sliced_gilbert_mapping(t: int, h: int, w: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+def transpose_gilbert_mapping(dims, order=None):
+    """
+    Create mapping between linear indices and Gilbert curve indices, supporting different axis orders
+    
+    Parameters:
+        dims: List or tuple of three dimensions, e.g. [t, h, w]
+        order: Order of axes, default is [0,1,2], representing [t,h,w]
+               Can be specified as [2,1,0] to represent [w,h,t] or other orders
+        
+    Returns:
+        linear_to_hilbert: List of length dims[0]*dims[1]*dims[2], storing Gilbert curve indices corresponding to linear indices
+        hilbert_to_linear: List of length dims[0]*dims[1]*dims[2], storing linear indices corresponding to Gilbert curve indices
+    """
+    if len(dims) != 3:
+        raise ValueError("Dimensions must be three-dimensional")
+    
+    # If no order specified, use default [0,1,2]
+    if order is None:
+        order = [0, 1, 2]
+    
+    if len(order) != 3 or set(order) != {0, 1, 2}:
+        raise ValueError("order must be a permutation of 0,1,2")
+    
+    # Extract original dimensions
+    dims_array = np.array(dims)
+    
+    # Rearrange dimensions according to order
+    t, h, w = dims_array[order]
+    
+    # Calculate total number of points
+    total_points = np.prod(dims)
+    
+    # Initialize mapping arrays
+    linear_to_hilbert = [0] * total_points
+    hilbert_to_linear = [0] * total_points
+        
+    # Calculate Gilbert indices for all points
+    # Create iterator for all coordinates
+    coords_iter = np.ndindex(*dims)
+    
+    for linear_idx, coords in enumerate(coords_iter):
+        # Rearrange coordinates according to order
+        # For example, if order=[2,1,0], then x corresponds to coords[2], y to coords[1], z to coords[0]
+        transposed_coords = [coords[order[2]], coords[order[1]], coords[order[0]]]
+        
+        # Calculate Gilbert curve index
+        x, y, z = transposed_coords
+        hilbert_idx = gilbert_xyz2d(x, y, z, w, h, t)
+        
+        # Set mapping
+        linear_to_hilbert[linear_idx] = hilbert_idx
+        hilbert_to_linear[hilbert_idx] = linear_idx
+    
+    return linear_to_hilbert, hilbert_to_linear
+
+
+@njit
+def sliced_gilbert_mapping(t: int, h: int, w: int, transpose_order: Optional[List[int]] = None) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Create a sliced Gilbert curve mapping, prioritizing scanning in spatial dimensions (h,w),
     then continuous in time dimension (t).
@@ -485,88 +542,92 @@ def sliced_gilbert_mapping(t: int, h: int, w: int, device: torch.device) -> Tupl
     """
     dims = [t, h, w]
 
-    # Standard Gilbert mapping, no transposition
-    total_points = t * h * w
-    
-    # Initialize mapping arrays
-    linear_to_hilbert = [0] * total_points
-    hilbert_to_linear = [0] * total_points
-    
-    print(f"Computing sliced Gilbert curve mapping ({w}×{h}×{t})...")
-    
-    # Calculate Gilbert curve for each time slice
-    current_hilbert_idx = 0
-    last_end_pos = None  # Record end position of previous slice
-    
-    for z in range(t):
-        # Calculate Gilbert curve for current slice
-        slice_points = h * w
-        slice_linear_to_hilbert = [0] * slice_points
-        slice_hilbert_to_linear = [0] * slice_points
+    if transpose_order is None:
+        # Standard Gilbert mapping, no transposition
+        total_points = t * h * w
         
-        # Determine starting position and direction for current slice
-        if last_end_pos is not None:
-            # Based on end position of previous slice, determine starting position and direction
-            end_x, end_y = last_end_pos
-            # Choose closest corner point as starting point
-            if end_x < w/2 and end_y < h/2:
+        # Initialize mapping arrays
+        linear_to_hilbert = [0] * total_points
+        hilbert_to_linear = [0] * total_points
+        
+        print(f"Computing sliced Gilbert curve mapping ({w}×{h}×{t})...")
+        
+        # Calculate Gilbert curve for each time slice
+        current_hilbert_idx = 0
+        last_end_pos = None  # Record end position of previous slice
+        
+        for z in range(t):
+            # Calculate Gilbert curve for current slice
+            slice_points = h * w
+            slice_linear_to_hilbert = [0] * slice_points
+            slice_hilbert_to_linear = [0] * slice_points
+            
+            # Determine starting position and direction for current slice
+            if last_end_pos is not None:
+                # Based on end position of previous slice, determine starting position and direction
+                end_x, end_y = last_end_pos
+                # Choose closest corner point as starting point
+                if end_x < w/2 and end_y < h/2:
+                    start_x, start_y = 0, 0
+                    flip_x, flip_y = False, False
+                elif end_x >= w/2 and end_y < h/2:
+                    start_x, start_y = w-1, 0
+                    flip_x, flip_y = True, False
+                elif end_x < w/2 and end_y >= h/2:
+                    start_x, start_y = 0, h-1
+                    flip_x, flip_y = False, True
+                else:
+                    start_x, start_y = w-1, h-1
+                    flip_x, flip_y = True, True
+            else:
+                # First slice starts from (0,0)
                 start_x, start_y = 0, 0
                 flip_x, flip_y = False, False
-            elif end_x >= w/2 and end_y < h/2:
-                start_x, start_y = w-1, 0
-                flip_x, flip_y = True, False
-            elif end_x < w/2 and end_y >= h/2:
-                start_x, start_y = 0, h-1
-                flip_x, flip_y = False, True
-            else:
-                start_x, start_y = w-1, h-1
-                flip_x, flip_y = True, True
-        else:
-            # First slice starts from (0,0)
-            start_x, start_y = 0, 0
-            flip_x, flip_y = False, False
-        
-        # Calculate Gilbert curve for current slice
-        for y in range(h):
-            for x in range(w):
-                # Calculate actual coordinates (considering flipping)
-                actual_x = w-1-x if flip_x else x
-                actual_y = h-1-y if flip_y else y
-                
-                # Calculate linear index (row-major order: y*w + x)
-                linear_idx = y * w + x
-                
-                # Calculate Gilbert curve index
-                hilbert_idx = gilbert_xyz2d(actual_x, actual_y, 0, w, h, 1)
-                
-                # Set mapping
-                slice_linear_to_hilbert[linear_idx] = hilbert_idx
-                slice_hilbert_to_linear[hilbert_idx] = linear_idx
-        
-        # Record end position of current slice
-        last_end_idx = slice_hilbert_to_linear[slice_points-1]
-        last_end_y = last_end_idx // w
-        last_end_x = last_end_idx % w
-        last_end_pos = (last_end_x, last_end_y)
-        
-        # Add current slice mapping to overall mapping
-        for y in range(h):
-            for x in range(w):
-                # Calculate global linear index
-                global_linear_idx = z * h * w + y * w + x
-                
-                # Calculate local linear index within current slice
-                local_linear_idx = y * w + x
-                
-                # Get Gilbert index within current slice
-                local_hilbert_idx = slice_linear_to_hilbert[local_linear_idx]
-                
-                # Set global mapping
-                linear_to_hilbert[global_linear_idx] = current_hilbert_idx + local_hilbert_idx
-                hilbert_to_linear[current_hilbert_idx + local_hilbert_idx] = global_linear_idx
-        
-        # Update starting index for next slice
-        current_hilbert_idx += slice_points
+            
+            # Calculate Gilbert curve for current slice
+            for y in range(h):
+                for x in range(w):
+                    # Calculate actual coordinates (considering flipping)
+                    actual_x = w-1-x if flip_x else x
+                    actual_y = h-1-y if flip_y else y
+                    
+                    # Calculate linear index (row-major order: y*w + x)
+                    linear_idx = y * w + x
+                    
+                    # Calculate Gilbert curve index
+                    hilbert_idx = gilbert_xyz2d(actual_x, actual_y, 0, w, h, 1)
+                    
+                    # Set mapping
+                    slice_linear_to_hilbert[linear_idx] = hilbert_idx
+                    slice_hilbert_to_linear[hilbert_idx] = linear_idx
+            
+            # Record end position of current slice
+            last_end_idx = slice_hilbert_to_linear[slice_points-1]
+            last_end_y = last_end_idx // w
+            last_end_x = last_end_idx % w
+            last_end_pos = (last_end_x, last_end_y)
+            
+            # Add current slice mapping to overall mapping
+            for y in range(h):
+                for x in range(w):
+                    # Calculate global linear index
+                    global_linear_idx = z * h * w + y * w + x
+                    
+                    # Calculate local linear index within current slice
+                    local_linear_idx = y * w + x
+                    
+                    # Get Gilbert index within current slice
+                    local_hilbert_idx = slice_linear_to_hilbert[local_linear_idx]
+                    
+                    # Set global mapping
+                    linear_to_hilbert[global_linear_idx] = current_hilbert_idx + local_hilbert_idx
+                    hilbert_to_linear[current_hilbert_idx + local_hilbert_idx] = global_linear_idx
+            
+            # Update starting index for next slice
+            current_hilbert_idx += slice_points
+    else:
+        # Use transposed mapping
+        linear_to_hilbert, hilbert_to_linear = transpose_gilbert_mapping(dims, transpose_order)
             
     return linear_to_hilbert, hilbert_to_linear
 
@@ -577,7 +638,7 @@ def sliced_curve(t: int, h: int, w: int, device: torch.device) -> Tuple[torch.Te
     then continuous in time dimension (t).
     Ensures continuous connection between adjacent time slices.
     """
-    linear_to_hilbert, hilbert_to_linear = sliced_gilbert_mapping(t, h, w, device)
+    linear_to_hilbert, hilbert_to_linear = sliced_gilbert_mapping(t, h, w)
     order = torch.from_numpy(linear_to_hilbert).to(device)
     inverse_order = torch.from_numpy(hilbert_to_linear).to(device)
     return order, inverse_order
