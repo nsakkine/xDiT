@@ -552,8 +552,6 @@ def sliced_gilbert_mapping(t: int, h: int, w: int, transpose_order: Optional[Lis
         linear_to_hilbert = [0] * total_points
         hilbert_to_linear = [0] * total_points
         
-        print(f"Computing sliced Gilbert curve mapping ({w}×{h}×{t})...")
-        
         # Calculate Gilbert curve for each time slice
         current_hilbert_idx = 0
         last_end_pos = None  # Record end position of previous slice
