@@ -19,6 +19,7 @@ from xfuser.core.distributed import (
     get_runtime_state,
 )
 from xfuser.core.sparge_attention.gilbert import sliced_curve as curve
+from xfuser.core.sparge_attention.gilbert import sliced_gilbert_block_neighbor_mask
 from xfuser.model_executor.layers.attention_processor import (
     xFuserAttentionProcessorRegister
 )
@@ -86,6 +87,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         if backend == AttentionBackendType.AITER_SPARGE:
             attn_func_kwargs["simthreshold"] = get_runtime_state().runtime_config.spargeattn_simthreshold
             attn_func_kwargs["cdfthreshold"] = get_runtime_state().runtime_config.spargeattn_cdfthreshold
+            attn_func_kwargs["static_block_mask"] = runtime_state.block_neighbor_mask
 
         encoder_hidden_states_img = None
         if attn.add_k_proj is not None:
@@ -264,6 +266,8 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
 
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
+
+        runtime_state = get_runtime_state()
         use_sparge_attention = (
             (get_runtime_state().attention_backend == AttentionBackendType.AITER_SPARGE) and
             get_runtime_state().runtime_config.spargeattn_reorder_sequence
@@ -271,14 +275,18 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         if use_sparge_attention:
             key = (post_patch_num_frames, post_patch_height, post_patch_width)
             if key in self.sparge_attention_cache:
-                order, inverse_order = self.sparge_attention_cache[key]
+                order, inverse_order, block_neighbor_mask = self.sparge_attention_cache[key]
             else:
                 order, inverse_order = curve(
                     post_patch_num_frames, post_patch_height, post_patch_width, hidden_states.device
                 )
-                self.sparge_attention_cache[key] = (order, inverse_order)
+                block_neighbor_mask = sliced_gilbert_block_neighbor_mask(post_patch_num_frames, post_patch_height, post_patch_width, 256, 128)
+                self.sparge_attention_cache[key] = (order, inverse_order, block_neighbor_mask)
+            runtime_state.block_neighbor_mask = block_neighbor_mask
             hidden_states = hidden_states[:, order, ...].contiguous()
             rotary_emb = tuple(freqs[:, order, ...].contiguous() for freqs in rotary_emb)
+        else:
+            runtime_state.block_neighbor_mask = None
 
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if timestep.ndim == 2:

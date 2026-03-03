@@ -448,7 +448,8 @@ def _aiter_sparge_attn_call(
     dropout_p: float,
     is_causal: bool,
     simthreshold: float,
-    cdfthreshold: float
+    cdfthreshold: float,
+    static_block_mask: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     config = get_sage_fwd_configs()
     BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
@@ -459,6 +460,8 @@ def _aiter_sparge_attn_call(
         simthreshd1=simthreshold, cdfthreshd=cdfthreshold,
         attention_sink=False,
     )
+    if static_block_mask is not None:
+        block_mask = block_mask & static_block_mask[None, None, ...]
     block_lut = block_attn_mask_to_ragged_lut(block_mask)
     output = fav3_sage_wrapper_func(
             query, key, value,
