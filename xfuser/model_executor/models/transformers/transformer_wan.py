@@ -2,6 +2,7 @@ import torch
 import math
 from typing import Optional, Union, Dict, Any, Tuple
 
+from aiter.ops.triton.attention.fav3_sage import get_sage_fwd_configs
 from diffusers.models.transformers.transformer_wan import WanAttnProcessor
 from diffusers.models.transformers.transformer_wan import WanAttention
 from diffusers.models.transformers.transformer_wan import WanTransformer3DModel
@@ -282,10 +283,12 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
                 order, inverse_order = curve(
                     linear_to_hilbert, hilbert_to_linear, hidden_states.device
                 )
+                config = get_sage_fwd_configs()
+                block_m, block_n = config["BLOCK_M"], config["BLOCK_N"]
                 block_neighbor_mask = torch.from_numpy(
                     sliced_gilbert_block_neighbor_mapping(
                         post_patch_num_frames, post_patch_height, post_patch_width,
-                        256, 128,
+                        block_m, block_n,
                         (linear_to_hilbert, hilbert_to_linear),
                     )
                 ).to(dtype=torch.bool, device=hidden_states.device)

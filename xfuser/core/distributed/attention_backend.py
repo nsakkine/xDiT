@@ -401,7 +401,7 @@ def _aiter_sparge_attn_call(
         attention_sink=False,
     )
     if static_block_mask is not None:
-        block_mask = block_mask & static_block_mask[None, None, ...]
+        block_mask = block_mask | static_block_mask[None, None, ...]
     block_lut = block_attn_mask_to_ragged_lut(block_mask)
     output = fav3_sage_wrapper_func(
             query, key, value,
