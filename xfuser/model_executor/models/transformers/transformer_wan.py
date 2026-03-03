@@ -18,7 +18,7 @@ from xfuser.core.distributed import (
     get_sp_group,
     get_runtime_state,
 )
-from xfuser.core.sparge_attention.gilbert import curve
+from xfuser.core.sparge_attention.gilbert import sliced_curve as curve
 from xfuser.model_executor.layers.attention_processor import (
     xFuserAttentionProcessorRegister
 )
