@@ -5,7 +5,8 @@
 import numpy
 from numba import njit
 import torch
-from typing import Tuple
+from typing import Optional, Tuple, List
+
 
 
 @njit
@@ -492,13 +493,13 @@ def transpose_gilbert_mapping(dims, order=None):
         raise ValueError("order must be a permutation of 0,1,2")
     
     # Extract original dimensions
-    dims_array = np.array(dims)
+    dims_array = numpy.array(dims)
     
     # Rearrange dimensions according to order
     t, h, w = dims_array[order]
     
     # Calculate total number of points
-    total_points = np.prod(dims)
+    total_points = numpy.prod(dims)
     
     # Initialize mapping arrays
     linear_to_hilbert = [0] * total_points
@@ -506,7 +507,7 @@ def transpose_gilbert_mapping(dims, order=None):
         
     # Calculate Gilbert indices for all points
     # Create iterator for all coordinates
-    coords_iter = np.ndindex(*dims)
+    coords_iter = numpy.ndindex(*dims)
     
     for linear_idx, coords in enumerate(coords_iter):
         # Rearrange coordinates according to order
