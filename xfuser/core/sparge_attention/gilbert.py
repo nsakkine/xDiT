@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: BSD-2-Clause
 # Copyright (c) 2018 Jakub Červený
+# Copyright (c) 2024 abetusk
 
 import numpy
 from numba import njit
@@ -201,4 +202,382 @@ def curve(depth: int, height: int, width: int, device: torch.device) -> Tuple[to
     inverse_order = coords[:, 2] * height * width + coords[:, 1] * width + coords[:, 0]
     inverse_order = torch.from_numpy(inverse_order).to(device=device)
     order = torch.argsort(inverse_order)
+    return order, inverse_order
+
+
+def gilbert_xyz2d(x, y, z, width, height, depth):
+    """
+    Generalized Hilbert ('Gilbert') space-filling curve for arbitrary-sized
+    3D rectangular grids. Generates discrete 3D coordinates to fill a cuboid
+    of size (width x height x depth). Even sizes are recommended in 3D.
+    """
+
+    if width >= height and width >= depth:
+       return gilbert_xyz2d_r(0,x,y,z,
+                              0, 0, 0,
+                              width, 0, 0,
+                              0, height, 0,
+                              0, 0, depth)
+
+    elif height >= width and height >= depth:
+       return gilbert_xyz2d_r(0,x,y,z,
+                              0, 0, 0,
+                              0, height, 0,
+                              width, 0, 0,
+                              0, 0, depth)
+
+    else: # depth >= width and depth >= height
+       return gilbert_xyz2d_r(0,x,y,z,
+                              0, 0, 0,
+                              0, 0, depth,
+                              width, 0, 0,
+                              0, height, 0)
+
+
+@njit
+def in_bounds(x, y, z, x_s, y_s, z_s, ax, ay, az, bx, by, bz, cx, cy, cz):
+
+    dx = ax + bx + cx
+    dy = ay + by + cy
+    dz = az + bz + cz
+
+    if dx < 0:
+        if (x > x_s) or (x <= (x_s + dx)): return False
+    else:
+        if (x < x_s) or (x >= (x_s + dx)): return False
+
+    if dy < 0:
+        if (y > y_s) or (y <= (y_s + dy)): return False
+    else:
+        if (y < y_s) or (y >= (y_s + dy)): return False
+
+    if dz <0:
+        if (z > z_s) or (z <= (z_s + dz)): return False
+    else:
+        if (z < z_s) or (z >= (z_s + dz)): return False
+
+    return True
+
+
+@njit
+def gilbert_xyz2d_r(cur_idx,
+                    x_dst,y_dst,z_dst,
+                    x, y, z,
+                    ax, ay, az,
+                    bx, by, bz,
+                    cx, cy, cz):
+
+    w = abs(ax + ay + az)
+    h = abs(bx + by + bz)
+    d = abs(cx + cy + cz)
+
+    (dax, day, daz) = (sgn(ax), sgn(ay), sgn(az)) # unit major direction ("right")
+    (dbx, dby, dbz) = (sgn(bx), sgn(by), sgn(bz)) # unit ortho direction ("forward")
+    (dcx, dcy, dcz) = (sgn(cx), sgn(cy), sgn(cz)) # unit ortho direction ("up")
+
+    # trivial row/column fills
+    if h == 1 and d == 1:
+        return cur_idx + (dax*(x_dst - x)) + (day*(y_dst - y)) + (daz*(z_dst - z))
+
+    if w == 1 and d == 1:
+        return cur_idx + (dbx*(x_dst - x)) + (dby*(y_dst - y)) + (dbz*(z_dst - z))
+
+    if w == 1 and h == 1:
+        return cur_idx + (dcx*(x_dst - x)) + (dcy*(y_dst - y)) + (dcz*(z_dst - z))
+
+    (ax2, ay2, az2) = (ax//2, ay//2, az//2)
+    (bx2, by2, bz2) = (bx//2, by//2, bz//2)
+    (cx2, cy2, cz2) = (cx//2, cy//2, cz//2)
+
+    w2 = abs(ax2 + ay2 + az2)
+    h2 = abs(bx2 + by2 + bz2)
+    d2 = abs(cx2 + cy2 + cz2)
+
+    # prefer even steps
+    if (w2 % 2) and (w > 2):
+       (ax2, ay2, az2) = (ax2 + dax, ay2 + day, az2 + daz)
+
+    if (h2 % 2) and (h > 2):
+       (bx2, by2, bz2) = (bx2 + dbx, by2 + dby, bz2 + dbz)
+
+    if (d2 % 2) and (d > 2):
+       (cx2, cy2, cz2) = (cx2 + dcx, cy2 + dcy, cz2 + dcz)
+
+    # wide case, split in w only
+    if (2*w > 3*h) and (2*w > 3*d):
+        if in_bounds(x_dst,y_dst,z_dst,
+                     x,y,z,
+                     ax2,ay2,az2,
+                     bx,by,bz,
+                     cx,cy,cz):
+            return gilbert_xyz2d_r(cur_idx,
+                                   x_dst,y_dst,z_dst,
+                                   x, y, z,
+                                   ax2, ay2, az2,
+                                   bx, by, bz,
+                                   cx, cy, cz)
+        cur_idx += abs( (ax2 + ay2 + az2)*(bx + by + bz)*(cx + cy + cz) )
+
+        return gilbert_xyz2d_r(cur_idx,
+                               x_dst,y_dst,z_dst,
+                               x+ax2, y+ay2, z+az2,
+                               ax-ax2, ay-ay2, az-az2,
+                               bx, by, bz,
+                               cx, cy, cz)
+
+    # do not split in d
+    elif 3*h > 4*d:
+        if in_bounds(x_dst,y_dst,z_dst,
+                     x,y,z,
+                     bx2,by2,bz2,
+                     cx,cy,cz,
+                     ax2,ay2,az2):
+            return gilbert_xyz2d_r(cur_idx,
+                                   x_dst,y_dst,z_dst,
+                                   x, y, z,
+                                   bx2, by2, bz2,
+                                   cx, cy, cz,
+                                   ax2, ay2, az2)
+        cur_idx += abs( (bx2 + by2 + bz2)*(cx + cy + cz)*(ax2 + ay2 + az2) )
+
+        if in_bounds(x_dst,y_dst,z_dst,
+                     x+bx2,y+by2,z+bz2,
+                     ax,ay,az,
+                     bx-bx2,by-by2,bz-bz2,
+                     cx,cy,cz):
+            return gilbert_xyz2d_r(cur_idx,
+                                   x_dst,y_dst,z_dst,
+                                   x+bx2, y+by2, z+bz2,
+                                   ax, ay, az,
+                                   bx-bx2, by-by2, bz-bz2,
+                                   cx, cy, cz)
+        cur_idx += abs( (ax + ay + az)*((bx - bx2) + (by - by2) + (bz - bz2))*(cx + cy + cz) )
+
+        return gilbert_xyz2d_r(cur_idx,
+                               x_dst,y_dst,z_dst,
+                               x+(ax-dax)+(bx2-dbx),
+                               y+(ay-day)+(by2-dby),
+                               z+(az-daz)+(bz2-dbz),
+                               -bx2, -by2, -bz2,
+                               cx, cy, cz,
+                               -(ax-ax2), -(ay-ay2), -(az-az2))
+
+    # do not split in h
+    elif 3*d > 4*h:
+        if in_bounds(x_dst,y_dst,z_dst,
+                     x,y,z,
+                     cx2,cy2,cz2,
+                     ax2,ay2,az2, bx,by,bz):
+            return gilbert_xyz2d_r(cur_idx,
+                                   x_dst,y_dst,z_dst,
+                                   x, y, z,
+                                   cx2, cy2, cz2,
+                                   ax2, ay2, az2,
+                                   bx, by, bz)
+        cur_idx += abs( (cx2 + cy2 + cz2)*(ax2 + ay2 + az2)*(bx + by + bz) )
+
+        if in_bounds(x_dst,y_dst,z_dst,
+                     x+cx2,y+cy2,z+cz2,
+                     ax,ay,az, bx,by,bz,
+                     cx-cx2,cy-cy2,cz-cz2):
+            return gilbert_xyz2d_r(cur_idx,
+                                   x_dst,y_dst,z_dst,
+                                   x+cx2, y+cy2, z+cz2,
+                                   ax, ay, az,
+                                   bx, by, bz,
+                                   cx-cx2, cy-cy2, cz-cz2)
+        cur_idx += abs( (ax + ay + az)*(bx + by + bz)*((cx - cx2) + (cy - cy2) + (cz - cz2)) )
+
+        return gilbert_xyz2d_r(cur_idx,
+                               x_dst,y_dst,z_dst,
+                               x+(ax-dax)+(cx2-dcx),
+                               y+(ay-day)+(cy2-dcy),
+                               z+(az-daz)+(cz2-dcz),
+                               -cx2, -cy2, -cz2,
+                               -(ax-ax2), -(ay-ay2), -(az-az2),
+                               bx, by, bz)
+
+    # regular case, split in all w/h/d
+    if in_bounds(x_dst,y_dst,z_dst,
+                 x,y,z,
+                 bx2,by2,bz2,
+                 cx2,cy2,cz2,
+                 ax2,ay2,az2):
+        return gilbert_xyz2d_r(cur_idx,x_dst,y_dst,z_dst,
+                              x, y, z,
+                              bx2, by2, bz2,
+                              cx2, cy2, cz2,
+                              ax2, ay2, az2)
+    cur_idx += abs( (bx2 + by2 + bz2)*(cx2 + cy2 + cz2)*(ax2 + ay2 + az2) )
+
+    if in_bounds(x_dst,y_dst,z_dst,
+                 x+bx2, y+by2, z+bz2,
+                 cx, cy, cz,
+                 ax2, ay2, az2,
+                 bx-bx2, by-by2, bz-bz2):
+        return gilbert_xyz2d_r(cur_idx,
+                              x_dst,y_dst,z_dst,
+                              x+bx2, y+by2, z+bz2,
+                              cx, cy, cz,
+                              ax2, ay2, az2,
+                              bx-bx2, by-by2, bz-bz2)
+    cur_idx += abs( (cx + cy + cz)*(ax2 + ay2 + az2)*((bx - bx2) + (by - by2) + (bz - bz2)) )
+
+    if in_bounds(x_dst,y_dst,z_dst,
+                 x+(bx2-dbx)+(cx-dcx),
+                 y+(by2-dby)+(cy-dcy),
+                 z+(bz2-dbz)+(cz-dcz),
+                 ax, ay, az,
+                 -bx2, -by2, -bz2,
+                 -(cx-cx2), -(cy-cy2), -(cz-cz2)):
+        return gilbert_xyz2d_r(cur_idx,
+                               x_dst,y_dst,z_dst,
+                               x+(bx2-dbx)+(cx-dcx),
+                               y+(by2-dby)+(cy-dcy),
+                               z+(bz2-dbz)+(cz-dcz),
+                               ax, ay, az,
+                               -bx2, -by2, -bz2,
+                               -(cx-cx2), -(cy-cy2), -(cz-cz2))
+    cur_idx += abs( (ax + ay + az)*(-bx2 - by2 - bz2)*(-(cx - cx2) - (cy - cy2) - (cz - cz2)) )
+
+    if in_bounds(x_dst,y_dst,z_dst,
+                 x+(ax-dax)+bx2+(cx-dcx),
+                 y+(ay-day)+by2+(cy-dcy),
+                 z+(az-daz)+bz2+(cz-dcz),
+                 -cx, -cy, -cz,
+                 -(ax-ax2), -(ay-ay2), -(az-az2),
+                 bx-bx2, by-by2, bz-bz2):
+        return gilbert_xyz2d_r(cur_idx,
+                               x_dst,y_dst,z_dst,
+                               x+(ax-dax)+bx2+(cx-dcx),
+                               y+(ay-day)+by2+(cy-dcy),
+                               z+(az-daz)+bz2+(cz-dcz),
+                               -cx, -cy, -cz,
+                               -(ax-ax2), -(ay-ay2), -(az-az2),
+                               bx-bx2, by-by2, bz-bz2)
+    cur_idx += abs( (-cx - cy - cz)*(-(ax - ax2) - (ay - ay2) - (az - az2))*((bx - bx2) + (by - by2) + (bz - bz2)) )
+
+    return gilbert_xyz2d_r(cur_idx,
+                           x_dst,y_dst,z_dst,
+                           x+(ax-dax)+(bx2-dbx),
+                           y+(ay-day)+(by2-dby),
+                           z+(az-daz)+(bz2-dbz),
+                           -bx2, -by2, -bz2,
+                           cx2, cy2, cz2,
+                           -(ax-ax2), -(ay-ay2), -(az-az2))
+
+
+@njit
+def sliced_gilbert_mapping(t: int, h: int, w: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Create a sliced Gilbert curve mapping, prioritizing scanning in spatial dimensions (h,w),
+    then continuous in time dimension (t).
+    Ensures continuous connection between adjacent time slices.
+    
+    Parameters:
+        t: Size of the first dimension
+        h: Size of the second dimension
+        w: Size of the third dimension
+        
+    Returns:
+        linear_to_hilbert: List of length t*h*w, storing Gilbert curve indices corresponding to linear indices
+        hilbert_order: List of length t*h*w, storing linear indices corresponding to Gilbert curve indices
+    """
+    dims = [t, h, w]
+
+    # Standard Gilbert mapping, no transposition
+    total_points = t * h * w
+    
+    # Initialize mapping arrays
+    linear_to_hilbert = [0] * total_points
+    hilbert_to_linear = [0] * total_points
+    
+    print(f"Computing sliced Gilbert curve mapping ({w}×{h}×{t})...")
+    
+    # Calculate Gilbert curve for each time slice
+    current_hilbert_idx = 0
+    last_end_pos = None  # Record end position of previous slice
+    
+    for z in range(t):
+        # Calculate Gilbert curve for current slice
+        slice_points = h * w
+        slice_linear_to_hilbert = [0] * slice_points
+        slice_hilbert_to_linear = [0] * slice_points
+        
+        # Determine starting position and direction for current slice
+        if last_end_pos is not None:
+            # Based on end position of previous slice, determine starting position and direction
+            end_x, end_y = last_end_pos
+            # Choose closest corner point as starting point
+            if end_x < w/2 and end_y < h/2:
+                start_x, start_y = 0, 0
+                flip_x, flip_y = False, False
+            elif end_x >= w/2 and end_y < h/2:
+                start_x, start_y = w-1, 0
+                flip_x, flip_y = True, False
+            elif end_x < w/2 and end_y >= h/2:
+                start_x, start_y = 0, h-1
+                flip_x, flip_y = False, True
+            else:
+                start_x, start_y = w-1, h-1
+                flip_x, flip_y = True, True
+        else:
+            # First slice starts from (0,0)
+            start_x, start_y = 0, 0
+            flip_x, flip_y = False, False
+        
+        # Calculate Gilbert curve for current slice
+        for y in range(h):
+            for x in range(w):
+                # Calculate actual coordinates (considering flipping)
+                actual_x = w-1-x if flip_x else x
+                actual_y = h-1-y if flip_y else y
+                
+                # Calculate linear index (row-major order: y*w + x)
+                linear_idx = y * w + x
+                
+                # Calculate Gilbert curve index
+                hilbert_idx = gilbert_xyz2d(actual_x, actual_y, 0, w, h, 1)
+                
+                # Set mapping
+                slice_linear_to_hilbert[linear_idx] = hilbert_idx
+                slice_hilbert_to_linear[hilbert_idx] = linear_idx
+        
+        # Record end position of current slice
+        last_end_idx = slice_hilbert_to_linear[slice_points-1]
+        last_end_y = last_end_idx // w
+        last_end_x = last_end_idx % w
+        last_end_pos = (last_end_x, last_end_y)
+        
+        # Add current slice mapping to overall mapping
+        for y in range(h):
+            for x in range(w):
+                # Calculate global linear index
+                global_linear_idx = z * h * w + y * w + x
+                
+                # Calculate local linear index within current slice
+                local_linear_idx = y * w + x
+                
+                # Get Gilbert index within current slice
+                local_hilbert_idx = slice_linear_to_hilbert[local_linear_idx]
+                
+                # Set global mapping
+                linear_to_hilbert[global_linear_idx] = current_hilbert_idx + local_hilbert_idx
+                hilbert_to_linear[current_hilbert_idx + local_hilbert_idx] = global_linear_idx
+        
+        # Update starting index for next slice
+        current_hilbert_idx += slice_points
+            
+    return linear_to_hilbert, hilbert_to_linear
+
+
+def sliced_curve(t: int, h: int, w: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Create a sliced curve mapping, prioritizing scanning in spatial dimensions (h,w),
+    then continuous in time dimension (t).
+    Ensures continuous connection between adjacent time slices.
+    """
+    linear_to_hilbert, hilbert_to_linear = sliced_gilbert_mapping(t, h, w, device)
+    order = torch.from_numpy(linear_to_hilbert).to(device)
+    inverse_order = torch.from_numpy(hilbert_to_linear).to(device)
     return order, inverse_order
