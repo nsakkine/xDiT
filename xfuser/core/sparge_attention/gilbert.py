@@ -206,6 +206,7 @@ def curve(depth: int, height: int, width: int, device: torch.device) -> Tuple[to
     return order, inverse_order
 
 
+@njit
 def gilbert_xyz2d(x, y, z, width, height, depth):
     """
     Generalized Hilbert ('Gilbert') space-filling curve for arbitrary-sized
