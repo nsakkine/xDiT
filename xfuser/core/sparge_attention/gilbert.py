@@ -642,3 +642,113 @@ def sliced_curve(t: int, h: int, w: int, device: torch.device) -> Tuple[torch.Te
     order = torch.from_numpy(linear_to_hilbert).to(device)
     inverse_order = torch.from_numpy(hilbert_to_linear).to(device)
     return order, inverse_order
+
+
+@njit
+def sliced_gilbert_block_neighbor_mapping(
+    t: int, h: int, w: int,
+    block_m: int, block_n: int,
+    sliced_gilbert_mapping: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    transpose_order: Optional[List[int]] = None
+) -> torch.Tensor:
+    """
+    Calculate block neighborhood relationships based on sliced Gilbert curve mapping
+    
+    Parameters:
+        t: Size of time dimension
+        h: Size of height dimension
+        w: Size of width dimension
+        block_size: Size of each block, default 128
+        transpose_order: Axis order, default is None (using standard order [0,1,2])
+        
+    Returns:
+        block_neighbor_tensor: Boolean tensor of shape (total_blocks, total_blocks),
+                             representing neighborhood relationships between blocks
+    """
+    # 1. Calculate total number of blocks
+    total_points = t * h * w
+    qblocks = (total_points + block_m - 1) // block_m
+        
+    # 2. Create block coloring map
+    block_color_map = numpy.zeros((w, h, t, 2), dtype=int)
+    
+    # 3. Get sliced Gilbert mapping
+    if sliced_gilbert_mapping is None:
+        linear_to_hilbert, _ = sliced_gilbert_mapping(t, h, w, transpose_order)
+    else:
+        linear_to_hilbert, _ = sliced_gilbert_mapping
+    
+    # 4. Color each point according to mapping
+    for z in range(t):
+        for y in range(h):
+            for x in range(w):
+                # Calculate linear index
+                linear_idx = z * h * w + y * w + x
+                
+                # Get Gilbert curve index
+                hilbert_idx = linear_to_hilbert[linear_idx]
+                
+                # Color
+                block_color_map[x, y, z, 0] = hilbert_idx // block_m
+                block_color_map[x, y, z, 1] = hilbert_idx // block_n
+    
+    # 5. Initialize neighborhood sets
+    block_neighbors = [set() for _ in range(qblocks)]
+    # 6. Traverse 3D space, update neighborhood relationships
+    for x in range(w):
+        for y in range(h):
+            for z in range(t):
+                qb, kb = block_color_map[x, y, z]
+                
+                # Add self to neighborhood
+                block_neighbors[qb].add(qb)
+                
+                # Check 26-neighborhood
+                for dx in [-1, 0, 1]:
+                    nx = x + dx
+                    if nx < 0 or nx >= w:
+                        continue
+                        
+                    for dy in [-1, 0, 1]:
+                        ny = y + dy
+                        if ny < 0 or ny >= h:
+                            continue
+                            
+                        for dz in [-1, 0, 1]:
+                            nz = z + dz
+                            if nz < 0 or nz >= t:
+                                continue
+                            
+                            # Skip self
+                            if dx == 0 and dy == 0 and dz == 0:
+                                continue
+                                
+                            # Get neighbor's block
+                            neighbor_qb, neighbor_kb = block_color_map[nx, ny, nz]
+                            
+                            # Add to current block's neighborhood
+                            if qb != neighbor_qb:
+                                block_neighbors[qb].add(neighbor_kb)
+    
+    return block_neighbors
+
+
+def sliced_gilbert_block_neighbor_mask(
+    t: int, h: int, w: int,
+    block_m: int, block_n: int,
+    sliced_gilbert_mapping: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    transpose_order: Optional[List[int]] = None
+) -> torch.Tensor:
+    """
+    Create a block neighbor mask based on sliced Gilbert curve mapping
+    """
+    total_points = t * h * w
+    qblocks = (total_points + block_m - 1) // block_m
+    kblocks = (total_points + block_n - 1) // block_n
+
+    block_neighbors = sliced_gilbert_block_neighbor_mapping(t, h, w, block_m, block_n, sliced_gilbert_mapping, transpose_order)
+    block_neighbor_mask = torch.zeros((qblocks, kblocks), dtype=torch.bool)
+    for i, neighbors in enumerate(block_neighbors):
+        block_neighbor_mask[i, list(neighbors)] = True
+    
+    return block_neighbor_mask
