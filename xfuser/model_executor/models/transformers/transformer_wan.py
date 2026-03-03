@@ -285,7 +285,7 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
                 )
                 block_neighbor_mask = sliced_gilbert_block_neighbor_mask(
                     post_patch_num_frames, post_patch_height, post_patch_width,
-                    256, 128
+                    256, 128,
                     (linear_to_hilbert, hilbert_to_linear),
                 )
                 self.sparge_attention_cache[key] = (order, inverse_order, block_neighbor_mask)
