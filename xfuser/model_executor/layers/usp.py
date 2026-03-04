@@ -136,7 +136,7 @@ def _ft_c_input_all_to_all_with_plan(x, head_partition_plan):
             reorder.append(g)
 
     reorder_t = torch.tensor(reorder, device=x.device, dtype=torch.long)
-    x = x[:, reorder_t, :, :].contiguous()
+    x = x[:, reorder_t, :, :]
 
     x = x.permute(1, 0, 2, 3).contiguous()
     element_size = b * s * d
@@ -153,7 +153,7 @@ def _ft_c_input_all_to_all_with_plan(x, head_partition_plan):
     x_out = _maybe_wait(x_out)
 
     num_heads_recv = len(head_partition_plan[rank])
-    x_out = x_out.reshape(num_heads_recv, b, -1, d).permute(1, 0, 2, 3)
+    x_out = x_out.reshape(num_heads_recv, b, -1, d).permute(1, 0, 2, 3).contiguous()
 
     return x_out
 
@@ -251,8 +251,8 @@ def _ft_c_output_all_to_all_with_plan(x, head_partition_plan):
             inv_perm[g] = recv_idx
             recv_idx += 1
 
-    x_out = x_out[inv_perm, ...]
-    x_out = x_out.permute(1, 0, 2, 3)
+    x_out = x_out[inv_perm, ...].permute(1, 0, 2, 3).contiguous()
+
     return x_out
 
 
