@@ -639,8 +639,8 @@ def sliced_curve(linear_to_hilbert: List[int], hilbert_to_linear: List[int], dev
     then continuous in time dimension (t).
     Ensures continuous connection between adjacent time slices.
     """
-    order = torch.from_numpy(linear_to_hilbert).to(device)
-    inverse_order = torch.from_numpy(hilbert_to_linear).to(device)
+    order = torch.tensor(linear_to_hilbert, device=device)
+    inverse_order = torch.tensor(hilbert_to_linear, device=device)
     return order, inverse_order
 
 
