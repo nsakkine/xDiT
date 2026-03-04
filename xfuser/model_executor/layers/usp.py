@@ -122,27 +122,26 @@ def _ft_c_input_all_to_all_with_plan(x, head_partition_plan):
     Hp = h
 
     send_counts = [
-        len([g for g in head_partition_plan[j] if rank * Hp <= g < (rank + 1) * Hp])
+        len(head_partition_plan[j])
         for j in range(world_size)
     ]
     recv_counts = [
-        len([g for g in head_partition_plan[rank] if j * Hp <= g < (j + 1) * Hp])
+        len(head_partition_plan[rank])
         for j in range(world_size)
     ]
 
     reorder = []
     for j in range(world_size):
         for g in head_partition_plan[j]:
-            if rank * Hp <= g < (rank + 1) * Hp:
-                reorder.append(g - rank * Hp)
+            reorder.append(g)
 
     reorder_t = torch.tensor(reorder, device=x.device, dtype=torch.long)
     x = x[:, reorder_t, :, :].contiguous()
 
     x = x.permute(1, 0, 2, 3).contiguous()
     element_size = b * s * d
-    output_split_sizes = [send_counts[j] * element_size for j in range(world_size)]
-    input_split_sizes = [recv_counts[j] * element_size for j in range(world_size)]
+    input_split_sizes = [send_counts[j] * element_size for j in range(world_size)]
+    output_split_sizes = [recv_counts[j] * element_size for j in range(world_size)]
 
     x_flat = x.reshape(-1)
     x_out = ft_c.all_to_all_single(
@@ -154,7 +153,8 @@ def _ft_c_input_all_to_all_with_plan(x, head_partition_plan):
     x_out = _maybe_wait(x_out)
 
     num_heads_recv = len(head_partition_plan[rank])
-    x_out = x_out.reshape(num_heads_recv, b, s, d).permute(1, 0, 2, 3)
+    x_out = x_out.reshape(num_heads_recv, b, -1, d).permute(1, 0, 2, 3)
+
     return x_out
 
 
@@ -229,10 +229,10 @@ def _ft_c_output_all_to_all_with_plan(x, head_partition_plan):
     H = sum(len(head_partition_plan[j]) for j in range(world_size))
 
     element_size = b * d
-    output_split_sizes = [sp * h_local * element_size for _ in range(world_size)]
-    input_split_sizes = [sp * len(head_partition_plan[j]) * element_size for j in range(world_size)]
+    input_split_sizes = [sp * h_local * element_size for _ in range(world_size)]
+    output_split_sizes = [sp * len(head_partition_plan[j]) * element_size for j in range(world_size)]
 
-    x = x.permute(2, 0, 1, 3).contiguous()
+    x = x.permute(1, 0, 2, 3).contiguous()
     x_flat = x.reshape(-1)
     x_out = ft_c.all_to_all_single(
         x_flat,
@@ -242,7 +242,7 @@ def _ft_c_output_all_to_all_with_plan(x, head_partition_plan):
     )
     x_out = _maybe_wait(x_out)
 
-    x_out = x_out.reshape(sp, b, H, d)
+    x_out = x_out.reshape(H, b, sp, d)
 
     inv_perm = torch.empty(H, dtype=torch.long, device=x.device)
     recv_idx = 0
@@ -251,8 +251,8 @@ def _ft_c_output_all_to_all_with_plan(x, head_partition_plan):
             inv_perm[g] = recv_idx
             recv_idx += 1
 
-    x_out = x_out[:, :, inv_perm, :]
-    x_out = x_out.permute(1, 2, 0, 3)
+    x_out = x_out[inv_perm, ...]
+    x_out = x_out.permute(1, 0, 2, 3)
     return x_out
 
 
@@ -453,7 +453,6 @@ def USP(
                 gpu_rank = torch.argmin(n_dense_blocks_per_gpu).item()
                 head_partition_plan[gpu_rank] = head_partition_plan.get(gpu_rank, []) + [head_idx.item()]
                 n_dense_blocks_per_gpu[gpu_rank] += n_dense_blocks[head_idx]
-
 
         if head_partition_plan is not None and any(head_partition_plan):
             if combine_qkv_a2a and query.shape == key.shape == value.shape:
