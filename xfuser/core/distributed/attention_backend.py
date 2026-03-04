@@ -363,9 +363,8 @@ def npu_flash_attn_call(query, key, value, dropout_p, is_causal):
 @register_attention_function(AttentionBackendType.AITER_SAGE)
 def _aiter_sage_attn_call(query, key, value, dropout_p, is_causal):
     # Pass layout="bhsd" to avoid permutation
-    softmax_lse = None
-    attn_fn = functools.partial(fav3_sage_wrapper_func, layout="bhsd")
-    output = attn_fn(query, key, value)
+    attn_fn = functools.partial(fav3_sage_wrapper_func, layout="bhsd", return_lse=True)
+    output, softmax_lse = attn_fn(query, key, value)
     return output, softmax_lse
 
 @register_attention_function(AttentionBackendType.AITER_SAGE_V2)
@@ -400,13 +399,13 @@ def _aiter_sparge_attn_call(
         simthreshd1=simthreshold, cdfthreshd=cdfthreshold,
         attention_sink=False,
     )
-    if static_block_mask is not None:
+    if static_block_mask is not None:        
         block_mask = block_mask | static_block_mask[None, None, ...]
     block_lut = block_attn_mask_to_ragged_lut(block_mask)
-    output = fav3_sage_wrapper_func(
+    output, softmax_lse = fav3_sage_wrapper_func(
             query, key, value,
             block_lut=block_lut,
             layout="bhsd",
+            return_lse=True,
     )
-    softmax_lse = None
     return output, softmax_lse

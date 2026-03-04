@@ -145,6 +145,7 @@ class xFuserArgs:
     hybrid_attn_schedule: Optional[str] = None
     # Sparge attention
     spargeattn_reorder_sequence: bool = True
+    spargeattn_use_static_block_mask: bool = True
     spargeattn_simthreshold: float = 0.5
     spargeattn_cdfthreshold: float = 0.98
 
@@ -747,6 +748,7 @@ class xFuserArgs:
             use_fp8_t5_encoder=self.use_fp8_t5_encoder,
             attention_backend=self.attention_backend,
             spargeattn_reorder_sequence=self.spargeattn_reorder_sequence,
+            spargeattn_use_static_block_mask=self.spargeattn_use_static_block_mask,
             spargeattn_simthreshold=self.spargeattn_simthreshold,
             spargeattn_cdfthreshold=self.spargeattn_cdfthreshold,
         )
