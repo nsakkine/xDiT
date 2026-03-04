@@ -393,8 +393,6 @@ def USP(
 
             config = get_sage_fwd_configs()
             block_m, block_n = config["BLOCK_M"], config["BLOCK_N"]
-            nq = (query.shape[-2] + block_m - 1) // block_m
-            nk = (key.shape[-2] + block_n - 1) // block_n
             pooled_query, query_sim_blocks = get_pool_sim_triton_simmean(query, block_m, simthreshd1)
             pooled_key, key_sim_blocks = get_pool_sim_triton_simmean(key, block_n, simthreshd1)
 
@@ -403,6 +401,8 @@ def USP(
             query_sim_blocks = _ft_c_input_all_to_all(query_sim_blocks)
             key_sim_blocks = _ft_c_input_all_to_all(key_sim_blocks)
 
+            nq = (pooled_query.shape[-2] + block_m - 1) // block_m
+            nk = (pooled_key.shape[-2] + block_n - 1) // block_n
             sim_kblocks = key_sim_blocks.unsqueeze(-2).expand(-1, -1, nq, -1)  # faster than repeat
             sim_qblocks = query_sim_blocks.unsqueeze(-1).expand(-1, -1, -1, nk)
             pooled_score = pooled_query @ pooled_key.transpose(-1, -2) * pooled_query.shape[-1] ** -0.5
