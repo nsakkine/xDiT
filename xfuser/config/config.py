@@ -65,6 +65,7 @@ class RuntimeConfig:
     attention_backend: Optional[str] = None
     cross_attention_backend: Optional[str] = None
     spargeattn_reorder_sequence: bool = True
+    spargeattn_use_static_block_mask: bool = True
     spargeattn_simthreshold: float = 0.5
     spargeattn_cdfthreshold: float = 0.98
 

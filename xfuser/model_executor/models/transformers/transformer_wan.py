@@ -272,7 +272,6 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         else:
             lora_scale = 1.0
 
-
         get_runtime_state().increment_step_counter()
 
         sp_world_rank = get_sequence_parallel_rank()
@@ -290,37 +289,43 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
+        runtime_state = get_runtime_state()
         order = None
         inverse_order = None
-        runtime_state = get_runtime_state()
+        block_neighbor_mask = None
         use_sparge_attention = (
-            (get_runtime_state().attention_backend == AttentionBackendType.AITER_SPARGE) and
-            get_runtime_state().runtime_config.spargeattn_reorder_sequence
+            (get_runtime_state().attention_backend == AttentionBackendType.AITER_SPARGE)
         )
         if use_sparge_attention:
             key = (post_patch_num_frames, post_patch_height, post_patch_width)
             if key in self.sparge_attention_cache:
                 order, inverse_order, block_neighbor_mask = self.sparge_attention_cache[key]
             else:
-                linear_to_hilbert, hilbert_to_linear = sliced_gilbert_mapping(
-                    post_patch_num_frames, post_patch_height, post_patch_width
-                )
-                order, inverse_order = curve(
-                    linear_to_hilbert, hilbert_to_linear, hidden_states.device
-                )
-                config = get_sage_fwd_configs()
-                block_m, block_n = config["BLOCK_M"], config["BLOCK_N"]
-                block_neighbor_mask = torch.from_numpy(
-                    sliced_gilbert_block_neighbor_mapping(
-                        post_patch_num_frames, post_patch_height, post_patch_width,
-                        block_m, block_n,
-                        (linear_to_hilbert, hilbert_to_linear),
+                if runtime_state.runtime_config.spargeattn_reorder_sequence:
+                    linear_to_hilbert, hilbert_to_linear = sliced_gilbert_mapping(
+                        post_patch_num_frames, post_patch_height, post_patch_width
                     )
-                ).to(dtype=torch.bool, device=hidden_states.device)
+                    order, inverse_order = curve(
+                        linear_to_hilbert, hilbert_to_linear, hidden_states.device
+                    )
+                else:
+                    linear_to_hilbert = hilbert_to_linear = list(
+                        range(
+                            post_patch_num_frames * post_patch_height * post_patch_width
+                        )
+                    )
+                if runtime_state.runtime_config.spargeattn_use_static_block_mask:
+                    config = get_sage_fwd_configs()
+                    block_m, block_n = config["BLOCK_M"], config["BLOCK_N"]
+                    block_neighbor_mask = torch.from_numpy(
+                        sliced_gilbert_block_neighbor_mapping(
+                            post_patch_num_frames, post_patch_height, post_patch_width,
+                            block_m, block_n,
+                            (linear_to_hilbert, hilbert_to_linear),
+                        )
+                    ).to(dtype=torch.bool, device=hidden_states.device)
                 self.sparge_attention_cache[key] = (order, inverse_order, block_neighbor_mask)
             runtime_state.block_neighbor_mask = block_neighbor_mask
-        else:
-            runtime_state.block_neighbor_mask = None
 
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if timestep.ndim == 2:

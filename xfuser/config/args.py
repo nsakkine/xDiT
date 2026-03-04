@@ -151,6 +151,7 @@ class xFuserArgs:
     num_hybrid_gemm_high_precision_steps: Optional[int] = None
     # Sparge attention
     spargeattn_reorder_sequence: bool = True
+    spargeattn_use_static_block_mask: bool = True
     spargeattn_simthreshold: float = 0.5
     spargeattn_cdfthreshold: float = 0.98
 
@@ -785,6 +786,7 @@ class xFuserArgs:
             attention_backend=self.attention_backend,
             cross_attention_backend=self.cross_attention_backend,
             spargeattn_reorder_sequence=self.spargeattn_reorder_sequence,
+            spargeattn_use_static_block_mask=self.spargeattn_use_static_block_mask,
             spargeattn_simthreshold=self.spargeattn_simthreshold,
             spargeattn_cdfthreshold=self.spargeattn_cdfthreshold,
         )
