@@ -388,14 +388,13 @@ def USP(
     if get_ulysses_parallel_world_size() > 1:
         head_partition_plan = None
         if ("simthreshold" in attn_func_kwargs) and ("cdfthreshold" in attn_func_kwargs):
-            Headnum = get_ulysses_parallel_world_size() * query.size(1)
-            simthreshd1 = hyperparameter_check(attn_func_kwargs.get("simthreshold"), Headnum, pooled_query.device)
-            cdfthreshd = hyperparameter_check(attn_func_kwargs.get("cdfthreshold"), Headnum, pooled_query.device)
+            Headnum = query.size(1)
+            simthreshd1 = hyperparameter_check(attn_func_kwargs.get("simthreshold"), Headnum, query.device)
 
             config = get_sage_fwd_configs()
             block_m, block_n = config["BLOCK_M"], config["BLOCK_N"]
-            nq = (pooled_query.shape[-2] + block_m - 1) // block_m
-            nk = (pooled_key.shape[-2] + block_n - 1) // block_n
+            nq = (query.shape[-2] + block_m - 1) // block_m
+            nk = (key.shape[-2] + block_n - 1) // block_n
             pooled_query, query_sim_blocks = get_pool_sim_triton_simmean(query, block_m, simthreshd1)
             pooled_key, key_sim_blocks = get_pool_sim_triton_simmean(key, block_n, simthreshd1)
 
@@ -419,6 +418,7 @@ def USP(
             sorted_score = torch.sort(pooled_score, dim=-1, descending=True)
             cdf = torch.cumsum(sorted_score.values, dim=-1)
             B, H, Q, K = cdf.shape
+            cdfthreshd = hyperparameter_check(attn_func_kwargs.get("cdfthreshold"), H, query.device)
             cdfthreshd_ts = cdfthreshd.view(1, H, 1, 1)
             cdfthreshd_ts = cdfthreshd_ts.expand(B, -1, Q, 1).contiguous()
             # searchsorted(cdf, v, right=True) equivalent using compilable ops (avoids torch.compile graph break)
