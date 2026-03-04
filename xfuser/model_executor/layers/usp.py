@@ -437,9 +437,14 @@ def USP(
             if is_causal:
                 final_map = final_map * causal_mask[None, None, ...]
 
-            n_dense_blocks = final_map.sum(dim=-1).sum(dim=-1).sum(dim=0)
-            n_dense_blocks = ft_c.all_gather(n_dense_blocks, dim=0, group=PROCESS_GROUP.ULYSSES_PG)
-            _maybe_wait(n_dense_blocks)
+            n_dense_blocks = final_map.sum(dim=-1).sum(dim=-1).sum(dim=0).contiguous()
+            output = torch.empty(
+                get_ulysses_parallel_world_size() * n_dense_blocks.numel(),
+                dtype=n_dense_blocks.dtype,
+                device=n_dense_blocks.device,
+            )
+            torch.distributed.all_gather_into_tensor(output, n_dense_blocks, group=PROCESS_GROUP.ULYSSES_PG)
+            n_dense_blocks = output
 
             head_partition_plan = {}
             n_dense_blocks_per_gpu = torch.zeros(get_ulysses_parallel_world_size(), device=query.device)
