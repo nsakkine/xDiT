@@ -244,7 +244,7 @@ def _ft_c_output_all_to_all_with_plan(x, head_partition_plan):
 
     x_out = x_out.reshape(H, b, sp, d)
 
-    inv_perm = torch.empty(H, dtype=torch.long, device=x.device)
+    inv_perm = torch.empty(H, dtype=torch.long, device=x_out.device)
     recv_idx = 0
     for j in range(world_size):
         for g in head_partition_plan[j]:
@@ -441,12 +441,12 @@ def USP(
             torch.distributed.all_gather_into_tensor(output, n_dense_blocks, group=PROCESS_GROUP.ULYSSES_PG)
             n_dense_blocks = output
 
-            head_partition_plan = {}
+            head_partition_plan = {j: [] for j in range(get_ulysses_parallel_world_size())}
             n_dense_blocks_per_gpu = torch.zeros(get_ulysses_parallel_world_size(), device=query.device)
-            dense_blocks_order = torch.argsort(n_dense_blocks, descending=True)
+            _, dense_blocks_order = torch.sort(n_dense_blocks, descending=True, stable=True)
             for head_idx in dense_blocks_order:
                 gpu_rank = torch.argmin(n_dense_blocks_per_gpu).item()
-                head_partition_plan[gpu_rank] = head_partition_plan.get(gpu_rank, []) + [head_idx.item()]
+                head_partition_plan[gpu_rank] = head_partition_plan[gpu_rank] + [head_idx.item()]
                 n_dense_blocks_per_gpu[gpu_rank] += n_dense_blocks[head_idx]
 
         if head_partition_plan is not None and any(head_partition_plan):
