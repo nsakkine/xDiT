@@ -92,7 +92,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         if use_sparge_attention:
             attn_func_kwargs["simthreshold"] = get_runtime_state().runtime_config.spargeattn_simthreshold
             attn_func_kwargs["cdfthreshold"] = get_runtime_state().runtime_config.spargeattn_cdfthreshold
-            attn_func_kwargs["static_block_mask"] = runtime_state.block_neighbor_mask
+            attn_func_kwargs["static_block_mask"] = get_runtime_state().block_neighbor_mask
 
         encoder_hidden_states_img = None
         if attn.add_k_proj is not None:
