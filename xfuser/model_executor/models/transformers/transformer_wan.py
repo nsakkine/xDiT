@@ -164,8 +164,6 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         hidden_states = attn.to_out[0](hidden_states)
         hidden_states = attn.to_out[1](hidden_states)
 
-        runtime_state.set_attention_backend(attention_backend)
-
         return hidden_states
 
 
