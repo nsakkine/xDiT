@@ -698,6 +698,7 @@ class xFuserArgs:
             default=False,
             help="Use channels last memory format for the VAE.",
         )
+        parser.add_argument(
             "--spargeattn_simthreshold",
             type=float,
             default=0.5,

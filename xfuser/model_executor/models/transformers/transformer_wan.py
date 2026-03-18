@@ -81,11 +81,15 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             # We allow specifying a different backend for cross-attention than the main attention backend
             # as some backends may have too much overhead for cross-attention.
             backend = get_runtime_state().get_cross_attention_backend()
-        use_sparge_attention = (
-            backend == AttentionBackendType.AITER_SPARGE
-        )
+            use_sparge_attention = (
+                backend == AttentionBackendType.AITER_SPARGE
+            )
+        else:
+            use_sparge_attention = (
+                get_runtime_state().attention_backend == AttentionBackendType.AITER_SPARGE
+            )
         attn_func_kwargs = {}
-        if backend == AttentionBackendType.AITER_SPARGE:
+        if use_sparge_attention:
             attn_func_kwargs["simthreshold"] = get_runtime_state().runtime_config.spargeattn_simthreshold
             attn_func_kwargs["cdfthreshold"] = get_runtime_state().runtime_config.spargeattn_cdfthreshold
             attn_func_kwargs["static_block_mask"] = runtime_state.block_neighbor_mask
