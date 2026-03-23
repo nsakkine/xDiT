@@ -392,7 +392,7 @@ def USP(
 
     if get_ulysses_parallel_world_size() > 1:
         head_partition_plan = None
-        if ("simthreshold" in attn_func_kwargs) and ("cdfthreshold" in attn_func_kwargs):
+        if False and ("simthreshold" in attn_func_kwargs) and ("cdfthreshold" in attn_func_kwargs):
             Headnum = query.size(1)
             simthreshd1 = hyperparameter_check(attn_func_kwargs.get("simthreshold"), Headnum, query.device)
 
