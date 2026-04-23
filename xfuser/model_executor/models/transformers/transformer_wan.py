@@ -82,11 +82,13 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             # as some backends may have too much overhead for cross-attention.
             backend = get_runtime_state().get_cross_attention_backend()
             use_sparge_attention = (
-                backend == AttentionBackendType.AITER_SPARGE
+                backend == AttentionBackendType.AITER_SPARGE or
+                backend == AttentionBackendType.AITER_SPARGE_V2
             )
         else:
             use_sparge_attention = (
-                get_runtime_state().attention_backend == AttentionBackendType.AITER_SPARGE
+                get_runtime_state().attention_backend == AttentionBackendType.AITER_SPARGE or
+                get_runtime_state().attention_backend == AttentionBackendType.AITER_SPARGE_V2
             )
         attn_func_kwargs = {}
         if use_sparge_attention:
@@ -296,7 +298,8 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         inverse_order = None
         block_neighbor_mask = None
         use_sparge_attention = (
-            (get_runtime_state().attention_backend == AttentionBackendType.AITER_SPARGE)
+            (get_runtime_state().attention_backend == AttentionBackendType.AITER_SPARGE) or
+            (get_runtime_state().attention_backend == AttentionBackendType.AITER_SPARGE_V2)
         )
         if use_sparge_attention:
             key = (post_patch_num_frames, post_patch_height, post_patch_width)

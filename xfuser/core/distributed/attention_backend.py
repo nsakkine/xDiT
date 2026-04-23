@@ -79,6 +79,7 @@ if env_info["has_aiter"]:
     try:
         from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
             fav3_sage_mxfp4_wrapper,
+            get_sage_fwd_configs_mxfp4,
         )
     except ImportError:
         pass # Error is rasied in runtime_state.py if AITER_SAGE_V2 is not available.
@@ -116,6 +117,7 @@ class AttentionBackendType(Enum):
     AITER_SAGE = "AITER Sage"
     AITER_SAGE_V2 = "AITER Sage V2"
     AITER_SPARGE = "AITER Sparge"
+    AITER_SPARGE_V2 = "AITER Sparge V2"
     NPU = "NPU"
 
 def register_attention_function(backend_type):
@@ -459,7 +461,7 @@ def _aiter_sparge_attn_call(
         simthreshd1=simthreshold, cdfthreshd=cdfthreshold,
         attention_sink=False,
     )
-    if static_block_mask is not None:        
+    if static_block_mask is not None:
         block_mask = block_mask | static_block_mask[None, None, ...]
     block_lut = block_attn_mask_to_ragged_lut(block_mask)
     output, softmax_lse = fav3_sage_wrapper_func(
@@ -467,5 +469,43 @@ def _aiter_sparge_attn_call(
             block_lut=block_lut,
             layout="bhsd",
             return_lse=True,
+    )
+    return output, softmax_lse
+
+
+@register_attention_function(AttentionBackendType.AITER_SPARGE_V2)
+def _aiter_sparge_v2_attn_call(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    dropout_p: float,
+    is_causal: bool,
+    simthreshold: float,
+    cdfthreshold: float,
+    static_block_mask: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
+    config = get_sage_fwd_configs_mxfp4()
+    BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
+    block_mask = get_block_map_meansim(
+        query, key,
+        BLKQ=BLOCK_M, BLKK=BLOCK_N,
+        is_causal=is_causal,
+        simthreshd1=simthreshold, cdfthreshd=cdfthreshold,
+        attention_sink=False,
+    )
+    if static_block_mask is not None:
+        block_mask = block_mask | static_block_mask[None, None, ...]
+    block_lut = block_attn_mask_to_ragged_lut(block_mask)
+    softmax_lse = None
+    output = fav3_sage_mxfp4_wrapper(
+        query, key, value,
+        causal=is_causal,
+        block_lut=block_lut,
+        layout="bhsd",
+        hadamard_rotation=True,
+        R=HADAMARD_MATRIX[query.device],
     )
     return output, softmax_lse
