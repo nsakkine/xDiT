@@ -1,4 +1,5 @@
 from abc import ABCMeta
+import inspect
 import random
 from typing import List, Optional
 
@@ -254,6 +255,22 @@ class RuntimeState(metaclass=ABCMeta):
         elif attention_backend == AttentionBackendType.SAGE:
             if not env_info["has_sage"]:
                 raise RuntimeError("SageAttention is not available, please install SageAttention.")
+        elif attention_backend == AttentionBackendType.AITER_SPARGE:
+            msg = "AITER Sparge attention is not available, please update AITER"
+            try:
+                from aiter.ops.triton.attention.fav3_sage import fav3_sage_wrapper_func
+                if inspect.signature(fav3_sage_wrapper_func).parameters.get("block_lut") is None:
+                    raise RuntimeError(msg) from None
+            except ImportError:
+                raise RuntimeError(msg) from None
+        elif attention_backend == AttentionBackendType.AITER_SPARGE_V2:
+            msg = "AITER Sparge V2 attention is not available, please update AITER"
+            try:
+                from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import fav3_sage_mxfp4_wrapper
+                if inspect.signature(fav3_sage_mxfp4_wrapper).parameters.get("block_lut") is None:
+                    raise RuntimeError(msg) from None
+            except ImportError:
+                raise RuntimeError(msg) from None
         elif attention_backend == AttentionBackendType.FLEX_BLOCK_ATTN:
             if not env_info["has_flex_block_attn"]:
                 raise RuntimeError("Flex Block Attention is not available, please install Flex Block Attention.")

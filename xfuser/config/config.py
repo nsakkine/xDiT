@@ -64,6 +64,10 @@ class RuntimeConfig:
     use_fbcache: bool = False
     attention_backend: Optional[str] = None
     cross_attention_backend: Optional[str] = None
+    spargeattn_reorder_sequence: bool = True
+    use_spargeattn_static_block_mask: bool = True
+    spargeattn_simthreshold: float = 0.3
+    spargeattn_cdfthreshold: float = 0.92
 
     def __post_init__(self):
         check_packages()
