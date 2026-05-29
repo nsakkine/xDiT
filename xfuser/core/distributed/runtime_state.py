@@ -216,6 +216,10 @@ class RuntimeState(metaclass=ABCMeta):
                                  AttentionBackendType.AITER_SPARGE,
                                  AttentionBackendType.AITER_SAGE_V2,
                                  AttentionBackendType.AITER_SPARSE_SAGE_V2,
+                                 AttentionBackendType.AITER_SPARGE_ASM,
+                                 AttentionBackendType.AITER_SPARGE_ASM_V2,
+                                 AttentionBackendType.AITER_SPARGE_ASM_FP8,
+                                 AttentionBackendType.AITER_SPARGE,
                                  AttentionBackendType.AITER_SPARGE_V2,
                                  AttentionBackendType.AITER_FLYDSL,
                                  AttentionBackendType.FLEX_BLOCK_ATTN,
@@ -295,6 +299,16 @@ class RuntimeState(metaclass=ABCMeta):
         elif attention_backend == AttentionBackendType.SAGE:
             if not env_info["has_sage"]:
                 raise RuntimeError("SageAttention is not available, please install SageAttention.")
+        elif attention_backend == AttentionBackendType.AITER_SPARGE_ASM:
+            try:
+                from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
+                from aiter.ops.mha import flash_attn_i8fp8_sparse_pertensor_func
+            except ImportError:
+                raise RuntimeError(
+                    "AITER Sparge ASM attention is not available; this backend "
+                    "needs the hand-written gfx950 .co (fwd_hd128_i8fp8_sparse.co) "
+                    "and aiter.ops.mha.flash_attn_i8fp8_sparse_pertensor_func."
+                ) from None
         elif attention_backend == AttentionBackendType.AITER_SPARGE:
             msg = "AITER Sparge attention is not available, please update AITER"
             try:
