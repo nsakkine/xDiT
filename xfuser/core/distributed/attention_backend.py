@@ -404,50 +404,6 @@ if env_info["has_aiter"]:
     except ImportError:
         pass
 
-    try:
-        from aiter.ops.mha import flash_attn_i8fp8_sparse_pertensor_func as _aiter_asm_sparge_attn_impl
-        from torch.library import custom_op, register_fake
-
-        @custom_op("xfuser::aiter_asm_sparge_attn_kernel", mutates_args=())
-        def _aiter_asm_sparge_attn_kernel(
-            q_int8: torch.Tensor,
-            k_int8: torch.Tensor,
-            v_fp8: torch.Tensor,
-            q_descale: torch.Tensor,
-            k_descale: torch.Tensor,
-            v_descale: torch.Tensor,
-            kv_block_indices: torch.Tensor,
-            lut_start: torch.Tensor,
-            lut_count: torch.Tensor,
-            softmax_scale: float,
-        ) -> torch.Tensor:
-            return _aiter_asm_sparge_attn_impl(
-                q_int8, k_int8, v_fp8,
-                q_descale, k_descale, v_descale,
-                kv_block_indices, lut_start, lut_count,
-                softmax_scale=softmax_scale,
-            )
-
-        @register_fake("xfuser::aiter_asm_sparge_attn_kernel")
-        def _aiter_asm_sparge_attn_kernel_fake(
-            q_int8: torch.Tensor,
-            k_int8: torch.Tensor,
-            v_fp8: torch.Tensor,
-            q_descale: torch.Tensor,
-            k_descale: torch.Tensor,
-            v_descale: torch.Tensor,
-            kv_block_indices: torch.Tensor,
-            lut_start: torch.Tensor,
-            lut_count: torch.Tensor,
-            softmax_scale: float,
-        ) -> torch.Tensor:
-            # Output is bf16 with the same (b, sq, hq) as q_int8 and v's d.
-            b, sq, hq, _ = q_int8.shape
-            head_dim_v = v_fp8.shape[-1]
-            return q_int8.new_empty((b, sq, hq, head_dim_v), dtype=torch.bfloat16)
-
-    except ImportError:
-        pass
 if env_info["has_flash_attn"]:
     from flash_attn import flash_attn_func as flash_attn_func_2
 if env_info["has_flash_attn_3"]:
@@ -1146,12 +1102,7 @@ def _aiter_sparge_asm_attn_call(query, key, value, dropout_p, is_causal, attenti
     kv_block_indices, lut_start, lut_count = block_lut
 
     softmax_scale = q_bshd.shape[-1] ** -0.5
-    # Route through xfuser::aiter_asm_sparge_attn_kernel (defined above) so
-    # the inductor functionalization pass sees a clean Tensor->Tensor schema
-    # with mutates_args=(); calling flash_attn_i8fp8_sparse_pertensor_func
-    # directly bottoms out in aiter::fmha_v3_fwd_sparse, whose Tensor(aN!)
-    # alias annotations crash compile.
-    out_bshd = torch.ops.xfuser.aiter_asm_sparge_attn_kernel(
+    out_bshd = flash_attn_i8fp8_sparse_pertensor_func(
         q_int8, k_int8, v_fp8,
         q_descale.contiguous(),
         k_descale.contiguous(),
@@ -1159,7 +1110,7 @@ def _aiter_sparge_asm_attn_call(query, key, value, dropout_p, is_causal, attenti
         kv_block_indices.to(torch.int32).contiguous(),
         lut_start.to(torch.int32).contiguous(),
         lut_count.to(torch.int32).contiguous(),
-        float(softmax_scale),
+        softmax_scale=float(softmax_scale),
     )
     output = out_bshd.permute(0, 2, 1, 3)
     return restore_sparge_output(output, state), None
