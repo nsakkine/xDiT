@@ -372,6 +372,10 @@ if env_info["has_aiter"]:
         from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_mxfp4
     except ImportError:
         pass # Error is raised in runtime_state.py if AITER_SPARGE_ASM_V2 is not available.
+    try:
+        from aiter.ops.mha import flash_attn_fp8_sparse_pertensor_func
+    except ImportError:
+        pass # Error is raised in runtime_state.py if AITER_SPARGE_ASM_FP8 is not available.
 
     AITER_FP8_STATIC_SCALE_WITH_DESCALE, AITER_FP8_STATIC_SCALE_NO_DESCALE, AITER_SAGE_V2_BLOCK_R = _setup_aiter_environment_variables()
     AITER_HAS_ROUND_MODE, HOW_V3_BF16_CVT = _check_aiter_round_mode()
@@ -461,6 +465,7 @@ class AttentionBackendType(Enum):
     AITER_SPARGE = "AITER Sparge"
     AITER_SPARGE_ASM = "AITER Sparge ASM"
     AITER_SPARGE_ASM_V2 = "AITER Sparge ASM V2 (mxfp4)"
+    AITER_SPARGE_ASM_FP8 = "AITER Sparge ASM FP8"
     AITER_SPARGE_V2 = "AITER Sparge V2"
     FLEX_BLOCK_SPARGE = "Flex Block Sparge"
     AITER_FLYDSL = "AITER FlyDSL"
@@ -1131,6 +1136,79 @@ def _aiter_sparge_asm_attn_call(query, key, value, dropout_p, is_causal, attenti
     softmax_scale = q_bshd.shape[-1] ** -0.5
     out_bshd = flash_attn_i8fp8_sparse_pertensor_func(
         q_int8, k_int8, v_fp8,
+        q_descale.contiguous(),
+        k_descale.contiguous(),
+        v_descale.contiguous(),
+        kv_block_indices.to(torch.int32).contiguous(),
+        lut_start.to(torch.int32).contiguous(),
+        lut_count.to(torch.int32).contiguous(),
+        softmax_scale=float(softmax_scale),
+    )
+    output = out_bshd.permute(0, 2, 1, 3)
+    return restore_sparge_output(output, state), None
+
+
+def _asm_sparge_fp8_quantize(q_bshd: torch.Tensor, k_bshd: torch.Tensor, v_bshd: torch.Tensor):
+    """Per-tensor fp8 (e4m3) quantization of Q, K and V (all-fp8 ASM path)."""
+    quant_dtype = aiter.dtypes.fp8
+    dtype_max = torch.finfo(quant_dtype).max
+    q_fp8, q_descale = aiter.per_tensor_quant(
+        q_bshd, scale=torch.abs(q_bshd).max(), quant_dtype=quant_dtype, dtypeMax=dtype_max,
+    )
+    k_fp8, k_descale = aiter.per_tensor_quant(
+        k_bshd, scale=torch.abs(k_bshd).max(), quant_dtype=quant_dtype, dtypeMax=dtype_max,
+    )
+    v_fp8, v_descale = aiter.per_tensor_quant(
+        v_bshd, scale=torch.abs(v_bshd).max(), quant_dtype=quant_dtype, dtypeMax=dtype_max,
+    )
+    if q_descale.dim() == 0:
+        q_descale = q_descale.reshape(1)
+    if k_descale.dim() == 0:
+        k_descale = k_descale.reshape(1)
+    if v_descale.dim() == 0:
+        v_descale = v_descale.reshape(1)
+    return (
+        q_fp8, k_fp8, v_fp8,
+        q_descale.to(torch.float32), k_descale.to(torch.float32), v_descale.to(torch.float32),
+    )
+
+
+@register_attention_function(AttentionBackendType.AITER_SPARGE_ASM_FP8)
+def _aiter_sparge_asm_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Block-sparse all-fp8 (E4M3 Q/K/V) ASM attention.
+
+    Sibling of ``_aiter_sparge_asm_attn_call`` (i8fp8): identical sparse LUT
+    machinery, but Q/K are fp8 instead of int8. Routes through
+    ``flash_attn_fp8_sparse_pertensor_func`` -> ``fmha_v3_fwd_fp8_sparse`` ->
+    the hand-written ``fwd_hd128_fp8_sparse.co``.
+    """
+    config = {
+        "BLOCK_M": _AITER_SPARGE_ASM_BLOCK_M,
+        "BLOCK_N": _AITER_SPARGE_ASM_BLOCK_N,
+    }
+    q, k, v, state, block_mask, num_heads = _build_sparge_block_mask(
+        query, key, value, is_causal, attention_kwargs, config,
+    )
+
+    q_bshd = q.permute(0, 2, 1, 3).contiguous()
+    k_bshd = k.permute(0, 2, 1, 3).contiguous()
+    v_bshd = v.permute(0, 2, 1, 3).contiguous()
+
+    q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale = _asm_sparge_fp8_quantize(
+        q_bshd, k_bshd, v_bshd,
+    )
+
+    block_lut = block_attn_mask_to_ragged_lut(
+        block_mask,
+        num_heads=num_heads,
+        return_none_if_dense=False,
+        BLOCK_KB=_AITER_SPARGE_ASM_BLOCK_N,
+    )
+    kv_block_indices, lut_start, lut_count = block_lut
+
+    softmax_scale = q_bshd.shape[-1] ** -0.5
+    out_bshd = flash_attn_fp8_sparse_pertensor_func(
+        q_fp8, k_fp8, v_fp8,
         q_descale.contiguous(),
         k_descale.contiguous(),
         v_descale.contiguous(),
