@@ -1149,28 +1149,25 @@ def _aiter_sparge_asm_attn_call(query, key, value, dropout_p, is_causal, attenti
 
 
 def _asm_sparge_fp8_quantize(q_bshd: torch.Tensor, k_bshd: torch.Tensor, v_bshd: torch.Tensor):
-    """Per-tensor fp8 (e4m3) quantization of Q, K and V (all-fp8 ASM path)."""
+    """Per-tensor fp8 (E4M3) quantization of Q, K, V for the all-fp8 sparse path.
+    Mirrors the dense AITER_FP8 quant: dynamic per_tensor_quant already returns
+    fp32 [1] descales, so they're used as-is (no extra casts/reshapes)."""
     quant_dtype = aiter.dtypes.fp8
     dtype_max = torch.finfo(quant_dtype).max
+    # Hadamard-rotate Q,K before quant: QK-preserving (kernel unchanged); V not rotated.
+    R = FP8_HADAMARD_MATRIX[q_bshd.device]
+    q_bshd = _fp8_hadamard_rotate(q_bshd, R).contiguous()
+    k_bshd = _fp8_hadamard_rotate(k_bshd, R).contiguous()
     q_fp8, q_descale = aiter.per_tensor_quant(
-        q_bshd, scale=torch.abs(q_bshd).max(), quant_dtype=quant_dtype, dtypeMax=dtype_max,
+        q_bshd, scale=None, quant_dtype=quant_dtype, dtypeMax=dtype_max,
     )
     k_fp8, k_descale = aiter.per_tensor_quant(
-        k_bshd, scale=torch.abs(k_bshd).max(), quant_dtype=quant_dtype, dtypeMax=dtype_max,
+        k_bshd, scale=None, quant_dtype=quant_dtype, dtypeMax=dtype_max,
     )
     v_fp8, v_descale = aiter.per_tensor_quant(
-        v_bshd, scale=torch.abs(v_bshd).max(), quant_dtype=quant_dtype, dtypeMax=dtype_max,
+        v_bshd, scale=None, quant_dtype=quant_dtype, dtypeMax=dtype_max,
     )
-    if q_descale.dim() == 0:
-        q_descale = q_descale.reshape(1)
-    if k_descale.dim() == 0:
-        k_descale = k_descale.reshape(1)
-    if v_descale.dim() == 0:
-        v_descale = v_descale.reshape(1)
-    return (
-        q_fp8, k_fp8, v_fp8,
-        q_descale.to(torch.float32), k_descale.to(torch.float32), v_descale.to(torch.float32),
-    )
+    return q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale
 
 
 @register_attention_function(AttentionBackendType.AITER_SPARGE_ASM_FP8)
