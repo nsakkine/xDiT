@@ -126,7 +126,7 @@ class RuntimeState(metaclass=ABCMeta):
         self._check_if_backend_compatible_with_current_configuration(attention_backend)
         self.attention_backend = attention_backend
         logger.warning("Using {} as attention backend.".format(self.attention_backend.name))
-        if attention_backend in [AttentionBackendType.FLASH_3_FP8, AttentionBackendType.AITER_FP8, AttentionBackendType.NVTE_FP8, AttentionBackendType.FLASH_4_FP4, AttentionBackendType.AITER_MLA]:
+        if attention_backend in [AttentionBackendType.FLASH_3_FP8, AttentionBackendType.AITER_FP8, AttentionBackendType.NVTE_FP8, AttentionBackendType.FLASH_4_FP4, AttentionBackendType.AITER_MLA, AttentionBackendType.AITER_MXFP4]:
             logger.warning("Low-precision attention backend is enabled. This may cause poor quality outputs, consider using hybrid attention if possible.")
 
 
@@ -222,6 +222,7 @@ class RuntimeState(metaclass=ABCMeta):
                                  AttentionBackendType.AITER_SPARGE,
                                  AttentionBackendType.AITER_SPARGE_V2,
                                  AttentionBackendType.AITER_I8FP8,
+                                 AttentionBackendType.AITER_MXFP4,
                                  AttentionBackendType.AITER_FLYDSL,
                                  AttentionBackendType.FLEX_BLOCK_ATTN,
                                  AttentionBackendType.FLEX_BLOCK_SPARGE]:
@@ -343,6 +344,19 @@ class RuntimeState(metaclass=ABCMeta):
                     "needs the dense gfx950 .co (fwd_hd128_i8fp8.co) and "
                     "aiter.ops.mha.flash_attn_i8fp8_pertensor_func (the dense "
                     "sibling of flash_attn_i8fp8_sparse_pertensor_func)."
+                ) from None
+        elif attention_backend == AttentionBackendType.AITER_MXFP4:
+            try:
+                from aiter.ops.mha import flash_attn_mxfp4_pertensor_func
+                from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_mxfp4
+            except ImportError:
+                raise RuntimeError(
+                    "AITER mxfp4 ASM attention is not available; this backend "
+                    "needs the dense gfx950 .co (fwd_hd128_mxfp4.co) and "
+                    "aiter.ops.mha.flash_attn_mxfp4_pertensor_func (the dense "
+                    "sibling of flash_attn_mxfp4_sparse_pertensor_func) plus "
+                    "aiter.ops.triton.quant.sage_attention_quant_wrappers."
+                    "sage_quant_mxfp4."
                 ) from None
         elif attention_backend == AttentionBackendType.AITER_SPARGE:
             msg = "AITER Sparge attention is not available, please update AITER"

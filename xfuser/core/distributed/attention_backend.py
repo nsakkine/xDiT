@@ -373,6 +373,11 @@ if env_info["has_aiter"]:
     except ImportError:
         pass # Error is raised in runtime_state.py if AITER_SPARGE_ASM_V2 is not available.
     try:
+        from aiter.ops.mha import flash_attn_mxfp4_pertensor_func
+        from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_mxfp4
+    except ImportError:
+        pass # Error is raised in runtime_state.py if AITER_MXFP4 is not available.
+    try:
         from aiter.ops.mha import flash_attn_fp8_sparse_pertensor_func
     except ImportError:
         pass # Error is raised in runtime_state.py if AITER_SPARGE_ASM_FP8 is not available.
@@ -457,6 +462,7 @@ class AttentionBackendType(Enum):
     AITER = "AITER"
     AITER_FP8 = "AITER FP8"
     AITER_I8FP8 = "AITER i8fp8 ASM"
+    AITER_MXFP4 = "AITER mxfp4 ASM"
     AITER_MLA = "AITER MLA"
     AITER_SAGE = "AITER Sage"
     AITER_SPARSE_SAGE = "AITER Sparse Sage"
@@ -755,6 +761,65 @@ def _aiter_i8fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kw
         causal=is_causal,
         softmax_scale=float(softmax_scale),
     )
+    return torch.permute(out_bshd, [0, 2, 1, 3]), None
+
+
+@register_attention_function(AttentionBackendType.AITER_MXFP4)
+def _aiter_mxfp4_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    q_bshd = torch.permute(query, [0, 2, 1, 3]).contiguous()
+    k_bshd = torch.permute(key,   [0, 2, 1, 3]).contiguous()
+    v_bshd = torch.permute(value, [0, 2, 1, 3]).contiguous()
+
+    # WORKAROUND: the dense mxfp4 .co is only numerically correct when the Q and
+    # KV sequence lengths are multiples of the 128-wide kernel tile. A partial
+    # last tile (seqlen % 128 != 0) hits a buggy masked-tail path and returns
+    # garbage (cosine ~0 vs reference). Pad Q/K/V up to the next multiple of 128
+    # so only the (correct) no-mask path runs, then slice the padded query rows
+    # back off. V is ZERO-padded so the <=127 padded keys contribute nothing to
+    # the output numerator -- the only residual is a negligible softmax
+    # denominator inflation (<=127 extra keys among tens of thousands). Q and K
+    # are zero-padded too (verified NaN-free through sage_quant_mxfp4; cosine vs
+    # bf16 reference recovers to ~0.985 at the Wan2.2 per-rank length). Remove
+    # once the kernel's partial-tile masking is fixed.
+    _MXFP4_TILE = 128
+    sq = q_bshd.shape[1]
+    q_pad = (-sq) % _MXFP4_TILE
+    k_pad = (-k_bshd.shape[1]) % _MXFP4_TILE
+    if q_pad:
+        q_bshd = F.pad(q_bshd, (0, 0, 0, 0, 0, q_pad))
+    if k_pad:
+        k_bshd = F.pad(k_bshd, (0, 0, 0, 0, 0, k_pad))
+        v_bshd = F.pad(v_bshd, (0, 0, 0, 0, 0, k_pad))
+
+    fp8_type = aiter.dtypes.fp8
+    qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4(
+        q_bshd, k_bshd, v_bshd,
+        fp8_type, torch.finfo(fp8_type).max,
+        BLKQ=_AITER_SPARGE_ASM_BLOCK_M,
+        BLKK=64,
+        layout="bshd",
+        R=HADAMARD_MATRIX[q_bshd.device],
+        BLOCK_R=AITER_SAGE_V2_BLOCK_R,
+        q_smoothing=False,
+    )
+
+    # qq.shape[-1] = hd/2 because of fp4 packing.
+    softmax_scale = (qq.shape[-1] * 2) ** -0.5
+    out_bshd = flash_attn_mxfp4_pertensor_func(
+        qq.contiguous(), kq.contiguous(), vq.contiguous(),
+        qd.contiguous(), kd.contiguous(), vd.to(torch.float32).contiguous(),
+        softmax_scale=float(softmax_scale),
+    )
+    # WORKAROUND: the dense mxfp4 .co has a systematic 2x softmax-denominator
+    # bug -> its output is exactly 0.5x the correct magnitude (verified
+    # content-independent: norm ratio 0.4996-0.5002 across seqlens/heads/GQA,
+    # cosine ~0.985 vs bf16). Half-magnitude attention compounds over the
+    # transformer's layers/steps into a washed-out (near-uniform) video, so
+    # rescale by 2.0 to restore the magnitude. Remove once the kernel's
+    # normalization is fixed.
+    out_bshd = out_bshd * 2.0
+    if q_pad:
+        out_bshd = out_bshd[:, :sq]
     return torch.permute(out_bshd, [0, 2, 1, 3]), None
 
 
