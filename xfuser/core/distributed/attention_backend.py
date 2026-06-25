@@ -18,6 +18,7 @@ from xfuser.core.sparge_attention.sparge import (
     restore_sparge_output,
     mask_padded_kv_blocks,
 )
+from xfuser.core.sparge_attention.block_mask import build_ordered_block_lut
 from xfuser.core.sparge_attention.head_balance import COST_SINK_KEY
 
 ATTENTION_FUNCTION_REGISTRY = {}
@@ -438,6 +439,7 @@ class AttentionBackendType(Enum):
     FLEX_BLOCK_ATTN = "Flex Block Attention"
     AITER = "AITER"
     AITER_FP8 = "AITER FP8"
+    AITER_SPARGE_FP8 = "AITER Sparge FP8"
     AITER_MLA = "AITER MLA"
     AITER_SAGE = "AITER Sage"
     AITER_SPARSE_SAGE = "AITER Sparse Sage"
@@ -995,8 +997,31 @@ def _read_sparge_kwargs(attention_kwargs):
         attn_kwargs.get("encoder_sequence_length", 0),
     )
 
-def _build_sparge_block_mask(query, key, value, is_causal, attention_kwargs, config, pad_block_divisible=False):
+def _read_sparge_freeze_kwargs(attention_kwargs):
+    attn_kwargs = attention_kwargs or {}
+    return (
+        attn_kwargs.get("spargeattn_freeze_ratio", 0.0),
+        attn_kwargs.get("spargeattn_freeze_include_nonsim", False),
+        attn_kwargs.get("spargeattn_freeze_include_text", False),
+        attn_kwargs.get("spargeattn_freeze_static_first", False),
+        attn_kwargs.get("spargeattn_freeze_ones", True),
+        # When True: emit the LUT in ascending KV-block index order (better
+        # memory locality) and disable freezing (lut_freeze=None / plain sparse).
+        attn_kwargs.get("spargeattn_freeze_disable", True),
+        # When True: keep freezing but emit [live ascending] ++ [frozen ascending]
+        # so both KV runs stay coalesced (vs the descending-priority order).
+        attn_kwargs.get("spargeattn_freeze_coalesced", False),
+        # When True (default): selected static blocks are folded into the live
+        # set (ratio path). Set False so freeze_ratio=0.0 yields a single-block
+        # live region, nearly equivalent to freeze_ones=True.
+        attn_kwargs.get("spargeattn_freeze_include_static", False),
+    )
+
+def _build_sparge_block_mask(query, key, value, is_causal, attention_kwargs, config, pad_block_divisible=False, return_lut_freeze=False):
     simthreshd1, cdfthreshd, reorder, use_static, thw, esl = _read_sparge_kwargs(attention_kwargs)
+    (freeze_ratio, freeze_include_nonsim, freeze_include_text,
+     freeze_static_first, freeze_ones, freeze_disable,
+     freeze_coalesced, freeze_include_static) = _read_sparge_freeze_kwargs(attention_kwargs)
     q, k, v, state, static_mask = setup_sparge(
         query, key, value,
         thw=thw,
@@ -1007,7 +1032,16 @@ def _build_sparge_block_mask(query, key, value, is_causal, attention_kwargs, con
         block_m=config["BLOCK_M"], block_n=config["BLOCK_N"],
         pad_block_divisible=pad_block_divisible,
     )
-    block_mask = compute_sparge_block_mask(
+    # When freezing is disabled we use the plain ascending-order LUT, so none of
+    # the ordering/priority machinery is needed. Otherwise the static-prefix
+    # ordering and the non-ones freeze count need the extra static/priority
+    # tensors; the default (pure-descending + all-ones) path only needs the
+    # reused descending order.
+    want_ordering = return_lut_freeze and not freeze_disable
+    # The coalesced path needs priority to pick the live set; the static-prefix
+    # ordering and the non-ones freeze count also need static/priority tensors.
+    build_freeze_aux = freeze_static_first or (not freeze_ones) or freeze_coalesced
+    result = compute_sparge_block_mask(
         q, k,
         simthreshd1=simthreshd1,
         cdfthreshd=cdfthreshd,
@@ -1015,7 +1049,15 @@ def _build_sparge_block_mask(query, key, value, is_causal, attention_kwargs, con
         static_block_mask=static_mask,
         text_len=state.text_len + state.tail_pad,
         block_m=config["BLOCK_M"], block_n=config["BLOCK_N"],
+        return_ordering_aux=want_ordering,
+        freeze_include_nonsim=freeze_include_nonsim,
+        freeze_include_text=freeze_include_text,
+        build_freeze_aux=build_freeze_aux,
     )
+    if want_ordering:
+        block_mask, full_order, static_full, priority_full = result
+    else:
+        block_mask = result
     block_mask = mask_padded_kv_blocks(block_mask, state, config["BLOCK_N"])
     num_heads = q.shape[1]
     # Per-head selected-block cost for the Ulysses head-balancer. USP injects a
@@ -1024,7 +1066,39 @@ def _build_sparge_block_mask(query, key, value, is_causal, attention_kwargs, con
     cost_sink = (attention_kwargs or {}).get(COST_SINK_KEY)
     if cost_sink is not None:
         cost_sink.copy_(block_mask.to(torch.float32).sum(dim=(0, 2, 3)))
-    return q, k, v, state, block_mask, num_heads
+    if not return_lut_freeze:
+        return q, k, v, state, block_mask, num_heads
+
+    if freeze_disable:
+        # Plain block-sparse: ascending KV-block index order (sequential, cache
+        # friendly) and no freezing. Cast to int32 (cumsum promotes to int64).
+        kv_block_indices, lut_start, lut_count = block_attn_mask_to_ragged_lut(
+            block_mask, num_heads=num_heads
+        )
+        kv_block_indices = kv_block_indices.to(torch.int32).contiguous()
+        lut_start = lut_start.to(torch.int32).contiguous()
+        lut_count = lut_count.to(torch.int32).contiguous()
+        ordered_lut = (kv_block_indices, lut_start, lut_count)
+        return q, k, v, state, block_mask, num_heads, ordered_lut, None
+
+    # Ordered ragged LUT. With the defaults (freeze_static_first=False,
+    # freeze_ones=True) blocks are ordered purely by descending probability
+    # (reusing full_order, no second argsort) and lut_freeze is all ones.
+    # block_mask is already padding-masked; the compaction reads it so padded
+    # columns are excluded.
+    kv_block_indices, lut_start, lut_count, lut_freeze = build_ordered_block_lut(
+        block_mask,
+        full_order=full_order,
+        static_mask=static_full,
+        priority=priority_full,
+        freeze_ratio=freeze_ratio,
+        freeze_include_static=freeze_include_static,
+        static_first=freeze_static_first,
+        lut_freeze_ones=freeze_ones,
+        coalesced=freeze_coalesced,
+    )
+    ordered_lut = (kv_block_indices, lut_start, lut_count)
+    return q, k, v, state, block_mask, num_heads, ordered_lut, lut_freeze
 
 @register_attention_function(AttentionBackendType.AITER_SPARGE)
 def _aiter_sparge_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
@@ -1051,6 +1125,88 @@ def _aiter_sparge_v2_attn_call(query, key, value, dropout_p, is_causal, attentio
         R=HADAMARD_MATRIX[query.device], config=config,
     )
     return restore_sparge_output(output, state), None
+
+
+@register_attention_function(AttentionBackendType.AITER_SPARGE_FP8)
+def _aiter_sparge_fp8attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    config = get_sage_fwd_configs_mxfp4()
+    query, key, value, state, block_mask, num_heads, ordered_lut, lut_freeze = _build_sparge_block_mask(
+        query, key, value, is_causal, attention_kwargs, config, return_lut_freeze=True
+    )
+    # Ordered ragged LUT: per (b, h, q) the static non-frozen blocks come first,
+    # then the remaining selected blocks in descending pooled-probability order.
+    # All entries are int32 (the fp8 sparse kernel asserts this for the LUT).
+    kv_block_indices, lut_start, lut_count = ordered_lut
+    kv_block_indices = kv_block_indices.contiguous()
+    lut_start = lut_start.contiguous()
+    lut_count = lut_count.contiguous()
+    # lut_freeze is None when freezing is disabled (plain ascending-order sparse).
+    if lut_freeze is not None:
+        lut_freeze = lut_freeze.contiguous()
+
+    query = torch.permute(query, [0, 2, 1, 3]).contiguous()
+    key = torch.permute(key, [0, 2, 1, 3]).contiguous()
+    value = torch.permute(value, [0, 2, 1, 3]).contiguous()
+
+    # Hadamard-rotate Q,K before quant: QK-preserving (kernel unchanged), cuts fp8 quant error.
+    R = FP8_HADAMARD_MATRIX[query.device]
+    query = _fp8_hadamard_rotate(query, R).contiguous()
+    key = _fp8_hadamard_rotate(key, R).contiguous()
+
+    softmax_lse = None
+    quant_dtype = aiter.dtypes.fp8
+    dtypeMax = torch.finfo(quant_dtype).max
+    if AITER_FP8_HAS_DESCALE:
+        # If AITER_FP8_STATIC_SCALE_WITH_DESCALE is not set, use dynamic scaling.
+        # Set the environment variable XFUSER_AITER_FP8_STATIC_SCALE_WITH_DESCALE
+        # to a float value (i.e 2.5) to use static scaling.
+        if AITER_FP8_STATIC_SCALE_WITH_DESCALE is None:
+            scale = None
+        else:
+            scale=torch.tensor(AITER_FP8_STATIC_SCALE_WITH_DESCALE, dtype=torch.float32, device=query.device)
+    else:
+        # Use static scale of 1.0, since descale is not available.
+        scale = torch.tensor(AITER_FP8_STATIC_SCALE_NO_DESCALE, dtype=torch.float32, device=query.device)
+    quant_q, q_descale = aiter.per_tensor_quant(query,
+                                                scale=scale,
+                                                quant_dtype=quant_dtype,
+                                                dtypeMax=dtypeMax)
+    quant_k, k_descale = aiter.per_tensor_quant(key,
+                                                scale=scale,
+                                                quant_dtype=quant_dtype,
+                                                dtypeMax=dtypeMax)
+    quant_v, v_descale = aiter.per_tensor_quant(value,
+                                                scale=scale,
+                                                quant_dtype=quant_dtype,
+                                                dtypeMax=dtypeMax)
+
+    kwargs = {
+        "kv_block_indices": kv_block_indices,
+        "lut_start": lut_start,
+        "lut_count": lut_count,
+        "lut_freeze": lut_freeze,
+        "persistent": False,
+        "dispatch": "sorted",
+        "q128kv64": False,
+    }
+    if AITER_FP8_HAS_DESCALE:
+        kwargs.update(
+            {
+                "q_descale": q_descale,
+                "k_descale": k_descale,
+                "v_descale": v_descale,
+            }
+        )
+    output = aiter.flash_attn_fp8_sparse_pertensor_func(
+        quant_q,
+        quant_k,
+        quant_v,
+        **kwargs,
+    )
+    output = torch.permute(output, [0, 2, 1, 3])
+
+    return restore_sparge_output(output, state), None
+
 
 @register_attention_function(AttentionBackendType.FLEX_BLOCK_SPARGE)
 def _flex_block_sparge_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):

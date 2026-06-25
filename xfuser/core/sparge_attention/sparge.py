@@ -280,24 +280,60 @@ def compute_sparge_block_mask(
     text_len: int = 0,
     block_m: int = 128,
     block_n: int = 128,
-) -> torch.Tensor:
+    return_ordering_aux: bool = False,
+    freeze_include_nonsim: bool = True,
+    freeze_include_text: bool = True,
+    build_freeze_aux: bool = False,
+):
+    """Build the full (image + text) block-sparse map.
+
+    When ``return_ordering_aux`` is True, also returns the tensors used to
+    assemble the ordered FP8 sparse LUT (see ``build_ordered_block_lut``):
+
+      * ``full_order`` int32 ``(B, H, n_total_q, n_total_k)``: per-row
+        permutation of KV-block indices in descending-probability order, reused
+        from ``get_block_map_meansim``'s sort (image columns first in pooled
+        order, then text/padding columns; identity for text query rows), and
+      * ``static_mask`` bool / ``priority`` float, built only when
+        ``build_freeze_aux`` is True (the static-prefix ordering or a non-ones
+        freeze count need them); otherwise both are ``None``.
+    """
     image_q = q[:, :, :q.shape[2] - text_len, :] if text_len > 0 else q
     image_k = k[:, :, :k.shape[2] - text_len, :] if text_len > 0 else k
 
-    image_block_mask = get_block_map_meansim(
+    image_result = get_block_map_meansim(
         image_q, image_k,
         is_causal=is_causal,
         BLKQ=block_m, BLKK=block_n,
         simthreshd1=simthreshd1, cdfthreshd=cdfthreshd,
         attention_sink=False,
+        return_ordering_aux=return_ordering_aux,
     )
+    if return_ordering_aux:
+        image_block_mask, image_priority, image_nonsim, image_order = image_result
+        if build_freeze_aux:
+            # Static (never-frozen) prefix for the image region.
+            if freeze_include_nonsim:
+                image_static = image_nonsim
+            else:
+                image_static = torch.zeros_like(image_block_mask)
+        else:
+            image_static = None
+            image_priority = None
+    else:
+        image_block_mask = image_result
 
     if static_block_mask is not None:
         # OR the structured backbone in: static_block_mask is a (n_iq, n_ik)
         # bool tensor; broadcast across the batch and head dims.
         image_block_mask = image_block_mask | static_block_mask[None, None, ...]
+        if return_ordering_aux and build_freeze_aux:
+            # The structural backbone is static / never frozen too.
+            image_static = image_static | static_block_mask[None, None, ...]
 
     if text_len == 0:
+        if return_ordering_aux:
+            return image_block_mask, image_order.to(torch.int32), image_static, image_priority
         return image_block_mask
 
     B, H, n_iq, n_ik = image_block_mask.shape
@@ -324,7 +360,49 @@ def compute_sparge_block_mask(
     if image_len_k % block_n != 0:
         boundary_k = image_len_k // block_n
         full[:, :, :, boundary_k] = True
-    return full
+
+    if not return_ordering_aux:
+        return full
+
+    # Descending-priority order over the full grid: image query rows keep the
+    # reused pooled-order over image columns, then the text/padding columns in
+    # index order; text query rows (priority 0 everywhere) use identity order.
+    device = full.device
+    text_cols = torch.arange(n_ik, n_total_k, device=device, dtype=torch.int32)
+    image_rows_order = torch.cat(
+        [
+            image_order.to(torch.int32),
+            text_cols.view(1, 1, 1, n_text_k).expand(B, H, n_iq, n_text_k),
+        ],
+        dim=-1,
+    )
+    text_rows_order = torch.arange(n_total_k, device=device, dtype=torch.int32)
+    text_rows_order = text_rows_order.view(1, 1, 1, n_total_k).expand(B, H, n_text_q, n_total_k)
+    full_order = torch.cat([image_rows_order, text_rows_order], dim=2)
+
+    if not build_freeze_aux:
+        return full, full_order, None, None
+
+    static_full = torch.zeros_like(full)
+    static_full[:, :, :n_iq, :n_ik] = image_static
+    # Text KV columns are never frozen for any query row.
+    if freeze_include_text:
+        static_full[:, :, :, -n_text_k:] = True
+    # Text query rows are fully dense; nothing is frozen for them.
+    static_full[:, :, -n_text_q:, :] = True
+    # The image/text boundary blocks are forced dense -> treat them as static.
+    if image_len_q % block_m != 0:
+        static_full[:, :, image_len_q // block_m, :] = True
+    if image_len_k % block_n != 0:
+        static_full[:, :, :, image_len_k // block_n] = True
+
+    priority_full = torch.zeros(
+        B, H, n_total_q, n_total_k,
+        dtype=image_priority.dtype,
+        device=image_priority.device,
+    )
+    priority_full[:, :, :n_iq, :n_ik] = image_priority
+    return full, full_order, static_full, priority_full
 
 
 def restore_sparge_output(o: torch.Tensor, state: SpargeState) -> torch.Tensor:
