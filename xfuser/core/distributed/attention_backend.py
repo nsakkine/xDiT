@@ -357,6 +357,14 @@ if env_info["has_aiter"]:
     except ImportError:
         pass # Error is rasied in runtime_state.py if AITER_SAGE_V2 is not available.
     try:
+        # mxfp4 (fp4-packed Q/K + fp8 V) quantizer for the hand-written ASM
+        # block-sparse mxfp4 kernel (flash_attn_mxfp4_sparse_pertensor_func).
+        from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
+            sage_quant_mxfp4,
+        )
+    except ImportError:
+        pass # Error is raised at call time if AITER_SPARGE_MXFP4 is unavailable.
+    try:
         from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
     except ImportError:
         pass # Error is rasied in runtime_state.py if AITER_SPARSE_SAGE is not available.
@@ -447,6 +455,7 @@ class AttentionBackendType(Enum):
     AITER_SPARSE_SAGE_V2 = "AITER Sparse Sage V2"
     AITER_SPARGE = "AITER Sparge"
     AITER_SPARGE_V2 = "AITER Sparge V2"
+    AITER_SPARGE_MXFP4 = "AITER Sparge MXFP4"
     FLEX_BLOCK_SPARGE = "Flex Block Sparge"
     AITER_FLYDSL = "AITER FlyDSL"
     NPU = "NPU"
@@ -1202,6 +1211,75 @@ def _aiter_sparge_fp8attn_call(query, key, value, dropout_p, is_causal, attentio
         quant_k,
         quant_v,
         **kwargs,
+    )
+    output = torch.permute(output, [0, 2, 1, 3])
+
+    return restore_sparge_output(output, state), None
+
+
+@register_attention_function(AttentionBackendType.AITER_SPARGE_MXFP4)
+def _aiter_sparge_mxfp4_sparse_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    # Hand-written ASM block-sparse mxfp4 kernel (fwd_hd128_mxfp4_sparse.co):
+    # fp4-packed Q/K * fp8 V. Shares the exact ordered-LUT + lut_freeze contract
+    # with the fp8 sparse path; only the quantization and kernel entry differ.
+    config = get_sage_fwd_configs_mxfp4()
+    query, key, value, state, block_mask, num_heads, ordered_lut, lut_freeze = _build_sparge_block_mask(
+        query, key, value, is_causal, attention_kwargs, config, return_lut_freeze=True
+    )
+    # Ordered ragged LUT (int32). lut_freeze is None when freezing is disabled
+    # (plain ascending-order sparse); the kernel requires descending-priority
+    # ordering only when lut_freeze is provided.
+    kv_block_indices, lut_start, lut_count = ordered_lut
+    kv_block_indices = kv_block_indices.contiguous()
+    lut_start = lut_start.contiguous()
+    lut_count = lut_count.contiguous()
+    if lut_freeze is not None:
+        lut_freeze = lut_freeze.contiguous()
+
+    # The ASM kernel reads bshd (matches host fmha_fwd_v3_args layout).
+    query = torch.permute(query, [0, 2, 1, 3]).contiguous()
+    key = torch.permute(key, [0, 2, 1, 3]).contiguous()
+    value = torch.permute(value, [0, 2, 1, 3]).contiguous()
+
+    # mxfp4 quant: fp4-packed Q/K (head_dim/2 bytes) + fp8 V + E8M0 scales, with
+    # full-head (128) Hadamard rotation on Q/K (quantization-quality only; the
+    # kernel math is unchanged). q_smoothing is unsupported by the ASM kernel.
+    fp8_type = aiter.dtypes.fp8
+    fp8_max = torch.finfo(fp8_type).max
+    R = FP8_HADAMARD_MATRIX[query.device]
+    (
+        q_quant, q_descale,
+        k_quant, k_descale,
+        v_quant, v_descale,
+        _delta_s,  # ignored: ASM kernel has no smoothing-bias slot
+    ) = sage_quant_mxfp4(
+        query, key, value, fp8_type, fp8_max,
+        BLKQ=config["BLOCK_M"], BLKK=64, layout="bshd",
+        R=R, BLOCK_R=R.shape[-1], q_smoothing=False,
+    )
+    q_quant = q_quant.contiguous()
+    k_quant = k_quant.contiguous()
+    v_quant = v_quant.contiguous()
+    q_descale = q_descale.contiguous()
+    k_descale = k_descale.contiguous()
+    v_descale = v_descale.to(torch.float32).contiguous()
+
+    # Tile-dispatch strategy: "default" (hardware-scheduled) or "sorted" (LPT
+    # work-table). None reads env AITER_MXFP4_SPARSE_DISPATCH (else "default").
+    dispatch = (attention_kwargs or {}).get("spargeattn_mxfp4_dispatch", "sorted")
+
+    output = aiter.flash_attn_mxfp4_sparse_pertensor_func(
+        q_quant,
+        k_quant,
+        v_quant,
+        q_descale,
+        k_descale,
+        v_descale,
+        kv_block_indices,
+        lut_start,
+        lut_count,
+        lut_freeze=lut_freeze,
+        dispatch="sorted",
     )
     output = torch.permute(output, [0, 2, 1, 3])
 
