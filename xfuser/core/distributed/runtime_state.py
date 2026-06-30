@@ -219,6 +219,7 @@ class RuntimeState(metaclass=ABCMeta):
                                  AttentionBackendType.AITER_SPARGE_ASM,
                                  AttentionBackendType.AITER_SPARGE_ASM_V2,
                                  AttentionBackendType.AITER_SPARGE_ASM_FP8,
+                                 AttentionBackendType.AITER_SPARGE_ASM_FP8_AFFINE_SORTED,
                                  AttentionBackendType.AITER_SPARGE,
                                  AttentionBackendType.AITER_SPARGE_V2,
                                  AttentionBackendType.AITER_I8FP8,
@@ -334,6 +335,21 @@ class RuntimeState(metaclass=ABCMeta):
                     "AITER Sparge ASM FP8 attention is not available; this backend "
                     "needs the hand-written gfx950 .co (fwd_hd128_fp8_sparse.co) "
                     "and aiter.ops.mha.flash_attn_fp8_sparse_pertensor_func."
+                ) from None
+        elif attention_backend == AttentionBackendType.AITER_SPARGE_ASM_FP8_AFFINE_SORTED:
+            try:
+                from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
+                from aiter.ops.mha import (
+                    flash_attn_fp8_sparse_pertensor_func,
+                    fmha_v3_fwd_fp8_sparse_persistent,
+                )
+            except ImportError:
+                raise RuntimeError(
+                    "AITER Sparge ASM FP8 Affine Sorted attention is not available; "
+                    "this backend needs the hand-written gfx950 .co "
+                    "(fwd_hd128_fp8_sparse_affine_sorted.co) and the persistent "
+                    "entry aiter.ops.mha.fmha_v3_fwd_fp8_sparse_persistent (reached "
+                    "via flash_attn_fp8_sparse_pertensor_func(dispatch='affine_sorted'))."
                 ) from None
         elif attention_backend == AttentionBackendType.AITER_I8FP8:
             try:

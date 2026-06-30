@@ -472,6 +472,7 @@ class AttentionBackendType(Enum):
     AITER_SPARGE_ASM = "AITER Sparge ASM"
     AITER_SPARGE_ASM_V2 = "AITER Sparge ASM V2 (mxfp4)"
     AITER_SPARGE_ASM_FP8 = "AITER Sparge ASM FP8"
+    AITER_SPARGE_ASM_FP8_AFFINE_SORTED = "AITER Sparge ASM FP8 Affine Sorted"
     AITER_SPARGE_V2 = "AITER Sparge V2"
     FLEX_BLOCK_SPARGE = "Flex Block Sparge"
     AITER_FLYDSL = "AITER FlyDSL"
@@ -1247,6 +1248,59 @@ def _aiter_sparge_asm_fp8_attn_call(query, key, value, dropout_p, is_causal, att
         lut_start.to(torch.int32).contiguous(),
         lut_count.to(torch.int32).contiguous(),
         softmax_scale=float(softmax_scale),
+    )
+    output = out_bshd.permute(0, 2, 1, 3)
+    return restore_sparge_output(output, state), None
+
+
+@register_attention_function(AttentionBackendType.AITER_SPARGE_ASM_FP8_AFFINE_SORTED)
+def _aiter_sparge_asm_fp8_affine_sorted_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Block-sparse all-fp8 (E4M3 Q/K/V) ASM attention, intra-GPU load-balanced.
+
+    Identical to ``_aiter_sparge_asm_fp8_attn_call`` but routes through the
+    ``dispatch="affine_sorted"`` path of ``flash_attn_fp8_sparse_pertensor_func``
+    -> ``fmha_v3_fwd_fp8_sparse_persistent`` -> the affine-codegen
+    ``fwd_hd128_fp8_sparse_affine_sorted.co``. That kernel is launched on a flat
+    1-WG-per-tile grid driven by an LPT-sorted work table (built host-side from
+    ``lut_count``), so the few heaviest sparse tiles dispatch first and the
+    one-WG-per-tile tail latency (intra-GPU imbalance) collapses. The math is
+    identical to the base fp8 sparse path (softmax is order-independent).
+    """
+    config = {
+        "BLOCK_M": _AITER_SPARGE_ASM_BLOCK_M,
+        "BLOCK_N": _AITER_SPARGE_ASM_BLOCK_N,
+    }
+    q, k, v, state, block_mask, num_heads = _build_sparge_block_mask(
+        query, key, value, is_causal, attention_kwargs, config,
+    )
+
+    q_bshd = q.permute(0, 2, 1, 3).contiguous()
+    k_bshd = k.permute(0, 2, 1, 3).contiguous()
+    v_bshd = v.permute(0, 2, 1, 3).contiguous()
+
+    q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale = _asm_sparge_fp8_quantize(
+        q_bshd, k_bshd, v_bshd,
+    )
+
+    block_lut = block_attn_mask_to_ragged_lut(
+        block_mask,
+        num_heads=num_heads,
+        return_none_if_dense=False,
+        BLOCK_KB=_AITER_SPARGE_ASM_BLOCK_N,
+    )
+    kv_block_indices, lut_start, lut_count = block_lut
+
+    softmax_scale = q_bshd.shape[-1] ** -0.5
+    out_bshd = flash_attn_fp8_sparse_pertensor_func(
+        q_fp8, k_fp8, v_fp8,
+        q_descale.contiguous(),
+        k_descale.contiguous(),
+        v_descale.contiguous(),
+        kv_block_indices.to(torch.int32).contiguous(),
+        lut_start.to(torch.int32).contiguous(),
+        lut_count.to(torch.int32).contiguous(),
+        softmax_scale=float(softmax_scale),
+        dispatch="affine_sorted",
     )
     output = out_bshd.permute(0, 2, 1, 3)
     return restore_sparge_output(output, state), None
