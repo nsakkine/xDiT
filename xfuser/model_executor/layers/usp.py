@@ -1,5 +1,7 @@
 # This file implements USP with torch version >= '2.5.0'
+import os
 import torch
+import torch.distributed as dist
 import functools
 
 import torch.distributed._functional_collectives as ft_c
@@ -46,6 +48,10 @@ _HEAD_BALANCE_BACKENDS = frozenset({
     AttentionBackendType.FLEX_BLOCK_SPARGE,
 })
 
+_FP8_LOG_SCALES = bool(os.environ.get("XFUSER_FP8_LOG_SCALES"))
+_FP8_NCCL_NEEDS_VIEW = parse(torch.__version__).release < parse("2.11.0").release
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2, torch.float8_e5m2fnuz)
+
 
 def ring_attn(attention_function, query, key, value, dropout_p=0.0, is_causal=False, joint_attn_kwargs=None, attention_kwargs=None):
     kwargs = {
@@ -90,10 +96,14 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
 
 def _sdpa_all_to_all_single(x):
     x_shape = x.shape
+    x_dtype = x.dtype
     x = x.flatten()
+    # NCCL does not support FP8 collectives before PyTorch 2.11, view as uint8 (same width) for the transfer.
+    if _FP8_NCCL_NEEDS_VIEW and x_dtype in _FP8_DTYPES:
+        x = x.view(torch.uint8)
     x = ft_c.all_to_all_single(x, output_split_sizes=None, input_split_sizes=None, group=PROCESS_GROUP.ULYSSES_PG)
     x = _maybe_wait(x)
-    x = x.reshape(x_shape)
+    x = x.view(x_dtype).reshape(x_shape)
     return x
 
 
@@ -110,6 +120,56 @@ def _ft_c_input_all_to_all(x):
     x = _sdpa_all_to_all_single(x)
     x = x.reshape(world_size, h // world_size, b, -1, d).permute(2, 1, 0, 3, 4).reshape(b, h // world_size, -1, d)
     return x
+
+
+def _per_tensor_quant(x: torch.Tensor, scale_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize x to FP8 using a fixed pre-allocated scale tensor. Returns (x_fp8, descale)."""
+    import aiter
+    fp8_dtype = aiter.dtypes.fp8
+    return aiter.per_tensor_quant(x, scale=scale_t, quant_dtype=fp8_dtype, dtypeMax=torch.finfo(fp8_dtype).max)
+
+
+def _fp8_comms_input_all_to_all(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+) -> tuple:
+    """Quantize Q/K/V to FP8 using per-layer scales and run interleaved input all-to-alls.
+
+    Returns (query, key, value, attn_kwargs_update, (q_scale, k_scale, v_scale), qkv_amaxes).
+    """
+    q_fp8, q_descale = _per_tensor_quant(query, q_scale)
+    query = _ft_c_input_all_to_all(q_fp8)
+    k_fp8, k_descale = _per_tensor_quant(key, k_scale)
+    key = _ft_c_input_all_to_all(k_fp8)
+    v_fp8, v_descale = _per_tensor_quant(value, v_scale)
+    value = _ft_c_input_all_to_all(v_fp8)
+
+    qkv_amaxes = (
+        (q_descale.item(), k_descale.item(), v_descale.item())
+        if _FP8_LOG_SCALES else None
+    )
+
+    attn_kwargs_update = {
+        "pre_quantized": True,
+        "q_descale": q_descale,
+        "k_descale": k_descale,
+        "v_descale": v_descale,
+    }
+    return query, key, value, attn_kwargs_update, (q_scale, k_scale, v_scale), qkv_amaxes
+
+
+def _fp8_comms_output_all_to_all(out: torch.Tensor, v_scale_t: torch.Tensor) -> torch.Tensor:
+    """Quantize attention output to FP8, run output all-to-all, dequantize back."""
+    restore_dtype = out.dtype if out.dtype not in _FP8_DTYPES else torch.bfloat16
+    if out.dtype not in _FP8_DTYPES:
+        out_fp8, out_descale = _per_tensor_quant(out, v_scale_t)
+    else:
+        out_fp8, out_descale = out, v_scale_t
+    return (_ft_c_output_all_to_all(out_fp8).float() * out_descale).to(restore_dtype)
 
 
 def _combined_qkv_all_to_all(q, k, v):
@@ -260,9 +320,13 @@ def USP(
         joint_strategy: str | None = None,
         attn_layer=None,
         combine_qkv_a2a: bool | None = None,
+        use_fp8_comms: bool = False,
         backend=None,
         attention_kwargs: dict | None = None,
         head_balance_layer=None,
+        fp8_q_scale: torch.Tensor | None = None,
+        fp8_k_scale: torch.Tensor | None = None,
+        fp8_v_scale: torch.Tensor | None = None,
     ):
     """
     Unified Sequence Parallelism (USP) attention call, supporting combinations of Ulysses and
@@ -306,8 +370,28 @@ def USP(
 
         }
 
+    qkv_scales = None
+    qkv_amaxes = None
     if get_ulysses_parallel_world_size() > 1:
-        if combine_qkv_a2a and query.shape == key.shape == value.shape:
+        if use_fp8_comms:
+            fp8_comms_backend = backend if backend is not None else get_runtime_state().attention_backend
+            if fp8_comms_backend == AttentionBackendType.AITER_FP8:
+                from xfuser.core.distributed.attention_backend import (
+                    FP8_HADAMARD_MATRIX,
+                    _fp8_hadamard_rotate,
+                )
+                R = FP8_HADAMARD_MATRIX[query.device]
+                query = _fp8_hadamard_rotate(query, R).contiguous()
+                key = _fp8_hadamard_rotate(key, R).contiguous()
+            if fp8_q_scale is None or fp8_k_scale is None or fp8_v_scale is None:
+                raise RuntimeError(
+                    "FP8 comms requires per-layer scale buffers (fp8_q_scale, fp8_k_scale, fp8_v_scale)."
+                )
+            query, key, value, attn_kwargs_update, qkv_scales, qkv_amaxes = _fp8_comms_input_all_to_all(
+                query, key, value, fp8_q_scale, fp8_k_scale, fp8_v_scale,
+            )
+            attention_kwargs = (attention_kwargs or {}) | attn_kwargs_update
+        elif combine_qkv_a2a and query.shape == key.shape == value.shape:
             query, key, value = _combined_qkv_all_to_all(query, key, value)
         else:
             query = _ft_c_input_all_to_all(query)
@@ -354,7 +438,16 @@ def USP(
                             is_causal=is_causal,
                             joint_attn_kwargs=joint_attn_kwargs,
                             attention_kwargs=attention_kwargs)
-        out = _ft_c_output_all_to_all(out)
+        if use_fp8_comms:
+            if _FP8_LOG_SCALES and qkv_amaxes is not None:
+                out_amax = out.abs().amax().item()
+                rank = dist.get_rank()
+                q_amax, k_amax, v_amax = qkv_amaxes
+                print(f"[fp8_scales rank{rank}] q_amax={q_amax:.4f} k_amax={k_amax:.4f} v_amax={v_amax:.4f} out_amax={out_amax:.4f}")
+            _, _, v_scale_t = qkv_scales
+            out = _fp8_comms_output_all_to_all(out, v_scale_t)
+        else:
+            out = _ft_c_output_all_to_all(out)
         if hb_applied:
             # Restore global head order on the output, gather this step's per-head
             # costs across the Ulysses group, and plan next step's permutation.
@@ -371,9 +464,13 @@ def attention(
         value: torch.Tensor,
         dropout_p: float = 0.0,
         is_causal: bool = False,
+        use_fp8_comms: bool = False,  # accepted for call-site uniformity with USP(), never applied
         backend=None,
         attention_kwargs=None,
         head_balance_layer=None,
+        fp8_q_scale: torch.Tensor | None = None,
+        fp8_k_scale: torch.Tensor | None = None,
+        fp8_v_scale: torch.Tensor | None = None,
     ):
     """
     Runs attention call without any parallelism.

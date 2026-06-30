@@ -17,6 +17,7 @@ from xfuser.core.distributed import (
     get_sp_group,
     get_runtime_state,
 )
+from xfuser.core.distributed.attention_backend import SUPPORTS_PRE_QUANTIZATION_BACKENDS
 from xfuser.model_executor.layers.attention_processor import (
     xFuserAttentionProcessorRegister
 )
@@ -87,13 +88,14 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             # as some backends may have too much overhead for cross-attention.
             backend = get_runtime_state().get_cross_attention_backend()
 
+        activation_dtype = hidden_states.dtype
+
         encoder_hidden_states_img = None
         if attn.add_k_proj is not None:
             # 512 is the context length of the text encoder, hardcoded for now
             image_context_length = encoder_hidden_states.shape[1] - 512
             encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
             encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
-
         query, key, value = self._get_qkv_projections(attn, hidden_states, encoder_hidden_states)
 
         query = attn.norm_q(query)
@@ -121,6 +123,38 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             query = apply_rotary_emb(query, *rotary_emb)
             key = apply_rotary_emb(key, *rotary_emb)
 
+        runtime_state = get_runtime_state()
+        use_fp8_comms = (
+            not self.is_cross_attention
+            and runtime_state.fp8_comms is not None
+            and runtime_state.attention_backend in SUPPORTS_PRE_QUANTIZATION_BACKENDS
+        )
+
+        # update running max for dynamic scale calibration -- pure in-place tensor ops, no graph break
+        if not self.is_cross_attention and runtime_state.fp8_comms is not None:
+            fp8_owner = getattr(attn, "fp8_comms_owner", None)
+            if fp8_owner is not None and hasattr(attn, "fp8_comms_layer_idx"):
+                runtime_state.fp8_comms.update_running_max(
+                    fp8_owner,
+                    attn.fp8_comms_layer_idx,
+                    query,
+                    key,
+                    value,
+                )
+
+        fp8_q_scale = getattr(attn, "fp8_q_scale", None)
+        fp8_k_scale = getattr(attn, "fp8_k_scale", None)
+        fp8_v_scale = getattr(attn, "fp8_v_scale", None)
+        fp8_kwargs = (
+            {
+                "fp8_q_scale": fp8_q_scale,
+                "fp8_k_scale": fp8_k_scale,
+                "fp8_v_scale": fp8_v_scale,
+            }
+            if use_fp8_comms
+            else {}
+        )
+
         # I2V task
         hidden_states_img = None
         if encoder_hidden_states_img is not None:
@@ -130,27 +164,31 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             key_img = key_img.unflatten(2, (attn.heads, -1))
             value_img = value_img.unflatten(2, (attn.heads, -1))
 
-            hidden_states_img = self.attention_function(query.transpose(1, 2),
-                                                        key_img.transpose(1, 2),
-                                                        value_img.transpose(1, 2),
-                                                        backend=backend,
-                                                        attention_kwargs=self.attention_kwargs,
-                                                        ).transpose(1, 2)
+            hidden_states_img = self.attention_function(
+                query.transpose(1, 2),
+                key_img.transpose(1, 2),
+                value_img.transpose(1, 2),
+                backend=backend,
+                attention_kwargs=self.attention_kwargs,
+                use_fp8_comms=use_fp8_comms,
+                **fp8_kwargs,
+            ).transpose(1, 2)
             hidden_states_img = hidden_states_img.flatten(2, 3)
-            hidden_states_img = hidden_states_img.type_as(query)
-
+            hidden_states_img = hidden_states_img.to(activation_dtype)
 
         hidden_states = self.attention_function(
             query.transpose(1, 2),
             key.transpose(1, 2),
             value.transpose(1, 2),
             backend=backend,
+            use_fp8_comms=use_fp8_comms,
             attention_kwargs=self.attention_kwargs,
             head_balance_layer=attn,
+            **fp8_kwargs,
         ).transpose(1, 2)
 
         hidden_states = hidden_states.flatten(2, 3)
-        hidden_states = hidden_states.type_as(query)
+        hidden_states = hidden_states.to(activation_dtype)
 
         if hidden_states_img is not None:
             hidden_states = hidden_states + hidden_states_img
@@ -202,7 +240,7 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
            pos_embed_seq_len,
         )
         self.attention_kwargs = attention_kwargs
-        for block in self.blocks:
+        for layer_idx, block in enumerate(self.blocks):
             block.attn1.processor = xFuserWanAttnProcessor(attention_kwargs=self.attention_kwargs)
             block.attn2.processor = xFuserWanAttnProcessor(use_ulysses_parallel_attention=False, is_cross_attention=True)
             # Per-layer head permutation buffer for the Ulysses block-sparse head
@@ -214,6 +252,30 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
                 torch.arange(num_attention_heads, dtype=torch.long),
                 persistent=False,
             )
+            # Per-layer FP8 comms scales (updated during calibration, frozen before compile).
+            block.attn1.register_buffer(
+                "fp8_q_scale", torch.ones(1, dtype=torch.float32), persistent=False
+            )
+            block.attn1.register_buffer(
+                "fp8_k_scale", torch.ones(1, dtype=torch.float32), persistent=False
+            )
+            block.attn1.register_buffer(
+                "fp8_v_scale", torch.ones(1, dtype=torch.float32), persistent=False
+            )
+            block.attn1.register_buffer(
+                "fp8_comms_layer_idx",
+                torch.tensor([layer_idx], dtype=torch.long),
+                persistent=False,
+            )
+            # Plain attribute (not nn.Module child) — assigning self directly would
+            # register the transformer as a submodule of attn1 and recurse forever.
+            object.__setattr__(block.attn1, "fp8_comms_owner", self)
+
+    def register_fp8_comms_state(self, fp8_comms) -> None:
+        """Register this transformer with runtime FP8 comms state (after runtime init)."""
+        if fp8_comms is None:
+            return
+        fp8_comms.register_model(self, len(self.blocks))
 
 
     def _chunk_and_pad_sequence(self, x: torch.Tensor, sp_world_rank: int, sp_world_size: int, pad_amount: int, dim: int) -> torch.Tensor:

@@ -140,6 +140,8 @@ class xFuserArgs:
     use_fp4_gemms: bool = False
     fp8_precision_override_prefix_patterns: Optional[str] = None
     fp8_precision_override_suffix_patterns: Optional[str] = None
+    use_fp8_comms: bool = False
+    fp8_comms_scale: Optional[float] = None
     # Model runner specific
     num_iterations: int = 1
     profile: bool = False
@@ -406,6 +408,17 @@ class xFuserArgs:
             action="store_true",
             help="Quantize the transformer linear layers (selected models only).",
         )
+        runtime_group.add_argument(
+            "--use_fp8_comms",
+            action="store_true",
+            help="Quantize Ulysses all-to-all communication to FP8.",
+        )
+        runtime_group.add_argument(
+            "--fp8_comms_scale",
+            type=float,
+            default=None,
+            help="Override the model-specific FP8 communication scale.",
+        )
 
         # DiTFastAttn arguments
         fast_attn_group = parser.add_argument_group("DiTFastAttn Options")
@@ -628,6 +641,17 @@ class xFuserArgs:
             type=nullable_str,
             default=None,
             help="Comma-delimited FQN suffix patterns to keep in FP8 during FP4 GEMMs.",
+        )
+        parser.add_argument(
+            "--use_fp8_comms",
+            action="store_true",
+            help="Quantize Ulysses all-to-all communication to FP8.",
+        )
+        parser.add_argument(
+            "--fp8_comms_scale",
+            type=float,
+            default=None,
+            help="Override the model-specific FP8 communication scale.",
         )
 
         parser.add_argument(
@@ -891,6 +915,8 @@ class xFuserArgs:
             spargeattn_simthreshold=self.spargeattn_simthreshold,
             spargeattn_cdfthreshold=self.spargeattn_cdfthreshold,
             use_spargeattn_head_balance=self.use_spargeattn_head_balance,
+            use_fp8_comms=self.use_fp8_comms,
+            fp8_comms_scale=self.fp8_comms_scale,
         )
 
         parallel_config = ParallelConfig(

@@ -11,6 +11,7 @@ from torch.cuda import manual_seed_all as device_manual_seed_all
 import diffusers
 from diffusers import DiffusionPipeline
 import torch.distributed
+import torch.distributed as dist
 
 try:
     import torch_musa
@@ -21,6 +22,11 @@ except ModuleNotFoundError:
 
 import xfuser.envs as envs
 from xfuser.envs import PACKAGES_CHECKER
+
+if torch.cuda.is_available() or envs._is_npu():
+    from yunchang.globals import PROCESS_GROUP
+else:
+    PROCESS_GROUP = None
 if envs._is_npu():
     from torch.npu import manual_seed as device_manual_seed
     from torch.npu import manual_seed_all as device_manual_seed_all
@@ -50,6 +56,7 @@ logger = init_logger(__name__)
 
 env_info = PACKAGES_CHECKER.get_packages_info()
 
+
 def set_random_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -58,9 +65,102 @@ def set_random_seed(seed: int):
     device_manual_seed_all(seed)
 
 
+class Fp8CommsModelState:
+    """Per-transformer FP8 comms calibration state (one entry per self-attn layer)."""
+
+    def __init__(self, num_layers: int):
+        self.num_layers = num_layers
+        self.q_running_max = torch.zeros(num_layers, dtype=torch.float32)
+        self.k_running_max = torch.zeros(num_layers, dtype=torch.float32)
+        self.v_running_max = torch.zeros(num_layers, dtype=torch.float32)
+        self.synced = False
+
+    def to_device_(self, device: torch.device):
+        self.q_running_max = self.q_running_max.to(device)
+        self.k_running_max = self.k_running_max.to(device)
+        self.v_running_max = self.v_running_max.to(device)
+
+
+class Fp8CommsState:
+    """Holds all state for FP8 Ulysses all-to-all communication.
+
+    Per-layer scales live on each attn1 module as compile-friendly buffers; this class
+    holds per-model running amaxes during calibration only.
+    """
+    def __init__(self, fixed_scale: Optional[float] = None):
+        self.fixed_scale = fixed_scale
+        self._models: dict[int, Fp8CommsModelState] = {}
+        self.calibrated_model_ids: set = set()
+
+    def register_model(self, model, num_layers: int) -> None:
+        """Register a transformer for per-layer FP8 comms calibration."""
+        model_id = id(model)
+        if model_id in self._models:
+            return
+        self._models[model_id] = Fp8CommsModelState(num_layers)
+        if self.fixed_scale is not None:
+            self.apply_fixed_scales_to_model(model)
+            self._models[model_id].synced = True
+            self.calibrated_model_ids.add(model_id)
+
+    def get_model_state(self, model) -> Optional[Fp8CommsModelState]:
+        return self._models.get(id(model))
+
+    def apply_fixed_scales_to_model(self, model) -> None:
+        """Broadcast a fixed scale to all self-attention layer buffers."""
+        scale = float(self.fixed_scale)
+        for block in model.blocks:
+            block.attn1.fp8_q_scale.fill_(scale)
+            block.attn1.fp8_k_scale.fill_(scale)
+            block.attn1.fp8_v_scale.fill_(scale)
+
+    def update_running_max(
+        self,
+        model,
+        layer_idx: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ):
+        """Update running amaxes in-place for one layer. Safe inside compiled region when unsynced."""
+        model_state = self._models.get(id(model))
+        if model_state is None or model_state.synced:
+            return
+        idx = layer_idx.reshape(-1).long()
+        q_amax = q.abs().amax().reshape(1)
+        k_amax = k.abs().amax().reshape(1)
+        v_amax = v.abs().amax().reshape(1)
+        model_state.q_running_max.index_copy_(
+            0,
+            idx,
+            torch.maximum(model_state.q_running_max.index_select(0, idx), q_amax),
+        )
+        model_state.k_running_max.index_copy_(
+            0,
+            idx,
+            torch.maximum(model_state.k_running_max.index_select(0, idx), k_amax),
+        )
+        model_state.v_running_max.index_copy_(
+            0,
+            idx,
+            torch.maximum(model_state.v_running_max.index_select(0, idx), v_amax),
+        )
+
+    def _scatter_scales_to_model(self, model, q_scales: torch.Tensor, k_scales: torch.Tensor, v_scales: torch.Tensor):
+        for i, block in enumerate(model.blocks):
+            block.attn1.fp8_q_scale.copy_(q_scales[i : i + 1])
+            block.attn1.fp8_k_scale.copy_(k_scales[i : i + 1])
+            block.attn1.fp8_v_scale.copy_(v_scales[i : i + 1])
+
+    def to_device_(self, device: torch.device):
+        for model_state in self._models.values():
+            model_state.to_device_(device)
+
+
 class RuntimeState(metaclass=ABCMeta):
     attention_backend: AttentionBackendType = AttentionBackendType.SDPA_FLASH
     cross_attention_backend: Optional[AttentionBackendType] = None
+    fp8_comms: Optional[Fp8CommsState] = None        # None = disabled
     parallel_config: ParallelConfig
     runtime_config: RuntimeConfig
     input_config: InputConfig
@@ -79,6 +179,7 @@ class RuntimeState(metaclass=ABCMeta):
         self.set_attention_backend(attention_backend)
         cross_attention_backend = self._select_cross_attention_backend(config)
         self.set_cross_attention_backend(cross_attention_backend)
+        self._init_fp8_comms(config)
 
     def is_ready(self):
         return self.ready
@@ -129,6 +230,91 @@ class RuntimeState(metaclass=ABCMeta):
         if attention_backend in [AttentionBackendType.FLASH_3_FP8, AttentionBackendType.AITER_FP8, AttentionBackendType.NVTE_FP8, AttentionBackendType.FLASH_4_FP4, AttentionBackendType.AITER_MLA, AttentionBackendType.AITER_MXFP4]:
             logger.warning("Low-precision attention backend is enabled. This may cause poor quality outputs, consider using hybrid attention if possible.")
 
+
+    def _init_fp8_comms(self, config: EngineConfig):
+        if not config.runtime_config.use_fp8_comms:
+            self.fp8_comms = None
+            return
+        ulysses_degree = config.parallel_config.sp_config.ulysses_degree or 1
+        if ulysses_degree <= 1:
+            logger.warning(
+                "--use_fp8_comms is set but ulysses_degree <= 1. "
+                "FP8 communication will not be applied."
+            )
+            self.fp8_comms = None
+            return
+        scale = config.runtime_config.fp8_comms_scale
+        if scale is not None:
+            logger.warning(f"FP8 communication enabled with fixed scale {scale}.")
+        else:
+            logger.warning(
+                "FP8 communication enabled with dynamic per-layer scaling "
+                "(calibrated before inference)."
+            )
+        self.fp8_comms = Fp8CommsState(fixed_scale=scale)
+
+    def sync_fp8_comms(self, model=None):
+        """All-reduce per-layer running amaxes and scatter scales into attn1 buffers.
+
+        Call outside the compiled region after a calibration forward pass.
+        """
+        fp8_comms = self.fp8_comms
+        if fp8_comms is None or fp8_comms.fixed_scale is not None or model is None:
+            return
+        model_state = fp8_comms.get_model_state(model)
+        if model_state is None or model_state.synced:
+            return
+        if (
+            model_state.q_running_max.max() == 0
+            and model_state.k_running_max.max() == 0
+            and model_state.v_running_max.max() == 0
+        ):
+            return
+        from xfuser.core.distributed.attention_backend import AITER_FP8_DTYPE
+        _FP8_COMMS_SAFETY_FACTOR = 0.85
+        dtype_max = torch.finfo(AITER_FP8_DTYPE).max
+        maxes = torch.stack(
+            [model_state.q_running_max, model_state.k_running_max, model_state.v_running_max],
+            dim=0,
+        )
+        dist.all_reduce(maxes, op=dist.ReduceOp.MAX, group=PROCESS_GROUP.ULYSSES_PG)
+        scales = maxes.clamp(min=1e-6) / (dtype_max * _FP8_COMMS_SAFETY_FACTOR)
+        fp8_comms._scatter_scales_to_model(model, scales[0], scales[1], scales[2])
+        model_state.q_running_max.zero_()
+        model_state.k_running_max.zero_()
+        model_state.v_running_max.zero_()
+        model_state.synced = True
+        fp8_comms.calibrated_model_ids.add(id(model))
+        if dist.get_rank() == 0:
+            q_scales, k_scales, v_scales = scales[0], scales[1], scales[2]
+            print(
+                f"[fp8_comms] {model.__class__.__name__} per-layer scales synced: "
+                f"q=[{q_scales.min().item():.6f}, {q_scales.max().item():.6f}] "
+                f"k=[{k_scales.min().item():.6f}, {k_scales.max().item():.6f}] "
+                f"v=[{v_scales.min().item():.6f}, {v_scales.max().item():.6f}] "
+                f"(amax q={maxes[0].max().item():.4f} k={maxes[1].max().item():.4f} "
+                f"v={maxes[2].max().item():.4f})"
+            )
+
+    def reset_fp8_comms_calibration(self, model=None):
+        """Reset per-layer scales for recalibration. No-op if already calibrated."""
+        fp8_comms = self.fp8_comms
+        if fp8_comms is None or fp8_comms.fixed_scale is not None or model is None:
+            return
+        model_id = id(model)
+        if model_id in fp8_comms.calibrated_model_ids:
+            return
+        model_state = fp8_comms.get_model_state(model)
+        if model_state is None:
+            return
+        for block in model.blocks:
+            block.attn1.fp8_q_scale.fill_(1.0)
+            block.attn1.fp8_k_scale.fill_(1.0)
+            block.attn1.fp8_v_scale.fill_(1.0)
+        model_state.q_running_max.zero_()
+        model_state.k_running_max.zero_()
+        model_state.v_running_max.zero_()
+        model_state.synced = False
 
     def set_cross_attention_backend(self, cross_attention_backend: Optional[str | AttentionBackendType]):
         """
@@ -220,7 +406,6 @@ class RuntimeState(metaclass=ABCMeta):
                                  AttentionBackendType.AITER_SPARGE_ASM_V2,
                                  AttentionBackendType.AITER_SPARGE_ASM_FP8,
                                  AttentionBackendType.AITER_SPARGE_ASM_FP8_AFFINE_SORTED,
-                                 AttentionBackendType.AITER_SPARGE,
                                  AttentionBackendType.AITER_SPARGE_V2,
                                  AttentionBackendType.AITER_I8FP8,
                                  AttentionBackendType.AITER_MXFP4,
@@ -365,14 +550,17 @@ class RuntimeState(metaclass=ABCMeta):
             try:
                 from aiter.ops.mha import flash_attn_mxfp4_pertensor_func
                 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_mxfp4
+                from aiter.ops.triton.quant.sage_attention_quant_fp8_input_wrapper import (
+                    sage_quant_mxfp4_fp8_input,
+                )
             except ImportError:
                 raise RuntimeError(
                     "AITER mxfp4 ASM attention is not available; this backend "
-                    "needs the dense gfx950 .co (fwd_hd128_mxfp4.co) and "
-                    "aiter.ops.mha.flash_attn_mxfp4_pertensor_func (the dense "
-                    "sibling of flash_attn_mxfp4_sparse_pertensor_func) plus "
-                    "aiter.ops.triton.quant.sage_attention_quant_wrappers."
-                    "sage_quant_mxfp4."
+                    "needs the dense gfx950 .co (fwd_hd128_mxfp4.co), "
+                    "aiter.ops.mha.flash_attn_mxfp4_pertensor_func, "
+                    "aiter.ops.triton.quant.sage_attention_quant_wrappers.sage_quant_mxfp4, "
+                    "and aiter.ops.triton.quant.sage_attention_quant_fp8_input_wrapper."
+                    "sage_quant_mxfp4_fp8_input for fp8-comms input."
                 ) from None
         elif attention_backend == AttentionBackendType.AITER_SPARGE:
             msg = "AITER Sparge attention is not available, please update AITER"
@@ -448,6 +636,8 @@ class DiTRuntimeState(RuntimeState):
         except Exception:
             # Keeps backward compatatability with existing pipeline classes.
             pass
+        if self.fp8_comms is not None and torch.cuda.is_available():
+            self.fp8_comms.to_device_(torch.device("cuda", torch.cuda.current_device()))
 
     def _check_pipeline_class_name(self, pipeline: DiffusionPipeline, config: EngineConfig):
         self.cogvideox = False
@@ -524,6 +714,7 @@ class DiTRuntimeState(RuntimeState):
             self.use_high_precision_gemm = self.gemm_schedule.is_high_precision(current_step)
 
         self.step_counter = self.step_counter + 1
+
         if self.step_counter >= active_total_steps:
             self.step_counter = 0
 

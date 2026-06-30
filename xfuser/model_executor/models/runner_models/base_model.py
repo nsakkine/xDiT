@@ -43,7 +43,10 @@ from xfuser.core.distributed import (
     init_distributed_environment,
     shard_component,
 )
-from xfuser.core.distributed.attention_backend import AttentionBackendType
+from xfuser.core.distributed.attention_backend import (
+    AttentionBackendType,
+    SUPPORTS_PRE_QUANTIZATION_BACKENDS,
+)
 from xfuser.core.distributed.attention_schedule import AttentionSchedule, create_hybrid_attn_schedule, create_hybrid_gemm_schedule
 
 
@@ -123,6 +126,7 @@ class ModelCapabilities:
     # Other features
     use_fp8_gemms: bool = False
     use_fp4_gemms: bool = False
+    use_fp8_comms: bool = False
     use_fbcache: bool = False
     use_hybrid_attn_schedule: bool = False
     use_hybrid_gemm_schedule: bool = False
@@ -266,6 +270,9 @@ class xFuserModel(abc.ABC):
 
         self._post_load_and_state_initialization(input_args)
         self._enable_options()
+        self._register_fp8_comms_models()
+        if self._needs_fp8_comms_calibration():
+            self._calibrate_fp8_comms(input_args)
 
         if self.config.use_torch_compile:
             log("Torch.compile enabled. Warming up torch compiler ...")
@@ -295,6 +302,79 @@ class xFuserModel(abc.ABC):
             log("Enabling model CPU offload...")
             self.pipe.enable_model_cpu_offload()
 
+
+    def _needs_fp8_comms_calibration(self) -> bool:
+        fp8_comms = get_runtime_state().fp8_comms
+        return fp8_comms is not None and fp8_comms.fixed_scale is None
+
+    def _register_fp8_comms_models(self) -> None:
+        fp8_comms = get_runtime_state().fp8_comms
+        if fp8_comms is None:
+            return
+        transformer = getattr(self.pipe, "transformer", None)
+        if transformer is not None and hasattr(transformer, "register_fp8_comms_state"):
+            transformer.register_fp8_comms_state(fp8_comms)
+        transformer_2 = getattr(self.pipe, "transformer_2", None)
+        if transformer_2 is not None and hasattr(transformer_2, "register_fp8_comms_state"):
+            transformer_2.register_fp8_comms_state(fp8_comms)
+        if torch.cuda.is_available():
+            fp8_comms.to_device_(torch.device("cuda", torch.cuda.current_device()))
+
+    def _calibrate_fp8_comms(self, input_args: dict) -> None:
+        """Run one throwaway pipe call to calibrate per-layer FP8 comms scales."""
+        log("Calibrating FP8 comms scales (throwaway inference pass)...")
+        calib_args = copy.deepcopy(input_args)
+        calib_args = self._split_prompts_for_dp(calib_args)
+        if self.config.batch_size and isinstance(calib_args.get("prompt"), list):
+            calib_args["prompt"] = calib_args["prompt"][: self.config.batch_size]
+        self._run_timed_pipe(calib_args)
+        runtime_state = get_runtime_state()
+        transformer = getattr(self.pipe, "transformer", None)
+        if transformer is not None:
+            runtime_state.sync_fp8_comms(transformer)
+        transformer_2 = getattr(self.pipe, "transformer_2", None)
+        if transformer_2 is not None:
+            runtime_state.sync_fp8_comms(transformer_2)
+        log("FP8 comms calibration complete.")
+
+    def _validate_fp8_comms_config(self, config: xFuserArgs) -> None:
+        if not self.capabilities.use_fp8_comms:
+            raise ValueError(f"Model {self.settings.model_name} does not support --use_fp8_comms.")
+        if (config.ulysses_degree or 1) <= 1:
+            raise ValueError("--use_fp8_comms requires ulysses_degree > 1.")
+        effective_backends = set()
+        if config.attention_backend:
+            effective_backends.add(_parse_attention_backend(config.attention_backend, "attention backend"))
+        if config.use_hybrid_attn_schedule:
+            if config.hybrid_attn_schedule:
+                effective_backends.update(
+                    AttentionSchedule.from_comma_delimited_string(
+                        config.hybrid_attn_schedule
+                    ).backends
+                )
+            else:
+                if config.hybrid_attn_low_precision_backend:
+                    effective_backends.add(
+                        _parse_attention_backend(
+                            config.hybrid_attn_low_precision_backend,
+                            "hybrid low-precision attention backend",
+                        )
+                    )
+                if config.hybrid_attn_high_precision_backend:
+                    effective_backends.add(
+                        _parse_attention_backend(
+                            config.hybrid_attn_high_precision_backend,
+                            "hybrid high-precision attention backend",
+                        )
+                    )
+        if not effective_backends & SUPPORTS_PRE_QUANTIZATION_BACKENDS:
+            raise ValueError(
+                f"--use_fp8_comms requires an attention backend that supports pre-quantization "
+                f"({', '.join(b.name for b in SUPPORTS_PRE_QUANTIZATION_BACKENDS)}). "
+                f"Set --attention_backend, --hybrid_attn_schedule, or "
+                f"--hybrid_attn_low_precision_backend / --hybrid_attn_high_precision_backend "
+                f"so at least one scheduled backend supports pre-quantization."
+            )
 
     def _validate_config(self, config: xFuserArgs) -> None:
         """ Validate if the model supports requested config """
@@ -364,6 +444,9 @@ class xFuserModel(abc.ABC):
             raise ValueError(f"Model {self.settings.model_name} requires a task to be specified. Supported tasks: {self.settings.valid_tasks}")
         if config.dataset_path and not config.batch_size:
             raise ValueError(f"Dataset path specified without batch size. Please specify batch size for dataset inference.")
+
+        if config.use_fp8_comms:
+            self._validate_fp8_comms_config(config)
 
         if self.model_output_type == "video" and not self.fps:
             raise ValueError(f"Model {self.settings.model_name} produces video output but fps is not set.")

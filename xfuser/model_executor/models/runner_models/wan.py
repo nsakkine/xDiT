@@ -1,6 +1,7 @@
 import copy
 import re
 import torch
+from dataclasses import replace
 from typing import List, Optional
 from PIL import Image
 from diffusers import FlowMatchEulerDiscreteScheduler, WanPipeline
@@ -281,6 +282,8 @@ class xFuserWan21I2VModel(xFuserModel):
 @register_model("Wan2.2-I2V")
 class xFuserWan22I2VModel(xFuserWan21I2VModel):
 
+    capabilities = replace(xFuserWan21I2VModel.capabilities, use_fp8_comms=True)
+
     def _customize_settings(self, config: xFuserArgs) -> None:
         super()._customize_settings(config)
         self.settings.model_name = "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
@@ -527,6 +530,8 @@ class xFuserWan21T2VModel(xFuserModel):
 @register_model("Wan2.2-T2V")
 class xFuserWan22T2VModel(xFuserWan21T2VModel):
 
+    capabilities = replace(xFuserWan21T2VModel.capabilities, use_fp8_comms=True)
+
     def _customize_settings(self, config: xFuserArgs) -> None:
         super()._customize_settings(config)
         self.settings.model_name = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
@@ -576,6 +581,7 @@ class xFuserWan22TI2VModel(xFuserWan21T2VModel):
         fully_shard_degree=True,
         use_fp8_gemms=True,
         use_fp4_gemms=True,
+        use_fp8_comms=True,
         use_hybrid_attn_schedule=True,
         use_hybrid_gemm_schedule=True,
         use_parallel_vae=True,
