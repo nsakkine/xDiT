@@ -1279,7 +1279,7 @@ def _aiter_sparge_mxfp4_sparse_attn_call(query, key, value, dropout_p, is_causal
         lut_start,
         lut_count,
         lut_freeze=lut_freeze,
-        dispatch="sorted",
+        dispatch="default",
     )
     output = torch.permute(output, [0, 2, 1, 3])
 
