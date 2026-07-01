@@ -492,6 +492,8 @@ SUPPORTS_PRE_QUANTIZATION_BACKENDS = {
     AttentionBackendType.AITER_MXFP4,
     AttentionBackendType.AITER_SPARGE_ASM_FP8,
     AttentionBackendType.AITER_SPARGE_ASM_FP8_AFFINE_SORTED,
+    AttentionBackendType.AITER_SPARGE_ASM_V2,
+    AttentionBackendType.AITER_SPARGE_ASM_V2_AFFINE_SORTED,
 }
 
 def register_attention_function(backend_type):
@@ -1391,6 +1393,8 @@ def _aiter_sparge_asm_v2_attn_call(query, key, value, dropout_p, is_causal, atte
     """Sparse mxfp4 ASM attention (mxfp4 Q/K + fp8 V)."""
     # ASM kernel is hard-wired to kTileKV=128; force the LUT block size to
     # match (Triton tuner may otherwise pick 64).
+    attention_kwargs = attention_kwargs or {}
+    pre_quantized = attention_kwargs.get("pre_quantized", False)
     config = {**get_sage_fwd_configs_mxfp4(),
               "BLOCK_M": _AITER_SPARGE_ASM_BLOCK_M,
               "BLOCK_N": _AITER_SPARGE_ASM_BLOCK_N}
@@ -1403,9 +1407,9 @@ def _aiter_sparge_asm_v2_attn_call(query, key, value, dropout_p, is_causal, atte
     v_bshd = v.permute(0, 2, 1, 3).contiguous()
 
     fp8_type = aiter.dtypes.fp8
-    qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4(
-        q_bshd, k_bshd, v_bshd,
-        fp8_type, torch.finfo(fp8_type).max,
+    mxfp4_quant_kwargs = dict(
+        FP8_TYPE=fp8_type,
+        FP8_MAX=torch.finfo(fp8_type).max,
         BLKQ=_AITER_SPARGE_ASM_BLOCK_M,
         BLKK=64,
         layout="bshd",
@@ -1413,6 +1417,24 @@ def _aiter_sparge_asm_v2_attn_call(query, key, value, dropout_p, is_causal, atte
         BLOCK_R=AITER_SAGE_V2_BLOCK_R,
         q_smoothing=False,
     )
+    if (
+        pre_quantized
+        and q_bshd.dtype in _FP8_INPUT_DTYPES
+        and k_bshd.dtype in _FP8_INPUT_DTYPES
+    ):
+        qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4_fp8_input(
+            q_bshd,
+            k_bshd,
+            v_bshd,
+            **mxfp4_quant_kwargs,
+            q_input_scale=attention_kwargs["q_descale"],
+            k_input_scale=attention_kwargs["k_descale"],
+            v_scale=attention_kwargs["v_descale"] if v_bshd.dtype in _FP8_INPUT_DTYPES else None,
+        )
+    else:
+        qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4(
+            q_bshd, k_bshd, v_bshd, **mxfp4_quant_kwargs,
+        )
 
     kv_block_indices, lut_start, lut_count = block_attn_mask_to_ragged_lut(
         block_mask,
@@ -1448,6 +1470,8 @@ def _aiter_sparge_asm_v2_affine_sorted_attn_call(query, key, value, dropout_p, i
     collapses. The math is identical to the base mxfp4 sparse path (softmax is
     order-independent), so it is bit-exact with AITER_SPARGE_ASM_V2.
     """
+    attention_kwargs = attention_kwargs or {}
+    pre_quantized = attention_kwargs.get("pre_quantized", False)
     config = {**get_sage_fwd_configs_mxfp4(),
               "BLOCK_M": _AITER_SPARGE_ASM_BLOCK_M,
               "BLOCK_N": _AITER_SPARGE_ASM_BLOCK_N}
@@ -1460,9 +1484,9 @@ def _aiter_sparge_asm_v2_affine_sorted_attn_call(query, key, value, dropout_p, i
     v_bshd = v.permute(0, 2, 1, 3).contiguous()
 
     fp8_type = aiter.dtypes.fp8
-    qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4(
-        q_bshd, k_bshd, v_bshd,
-        fp8_type, torch.finfo(fp8_type).max,
+    mxfp4_quant_kwargs = dict(
+        FP8_TYPE=fp8_type,
+        FP8_MAX=torch.finfo(fp8_type).max,
         BLKQ=_AITER_SPARGE_ASM_BLOCK_M,
         BLKK=64,
         layout="bshd",
@@ -1470,6 +1494,24 @@ def _aiter_sparge_asm_v2_affine_sorted_attn_call(query, key, value, dropout_p, i
         BLOCK_R=AITER_SAGE_V2_BLOCK_R,
         q_smoothing=False,
     )
+    if (
+        pre_quantized
+        and q_bshd.dtype in _FP8_INPUT_DTYPES
+        and k_bshd.dtype in _FP8_INPUT_DTYPES
+    ):
+        qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4_fp8_input(
+            q_bshd,
+            k_bshd,
+            v_bshd,
+            **mxfp4_quant_kwargs,
+            q_input_scale=attention_kwargs["q_descale"],
+            k_input_scale=attention_kwargs["k_descale"],
+            v_scale=attention_kwargs["v_descale"] if v_bshd.dtype in _FP8_INPUT_DTYPES else None,
+        )
+    else:
+        qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4(
+            q_bshd, k_bshd, v_bshd, **mxfp4_quant_kwargs,
+        )
 
     kv_block_indices, lut_start, lut_count = block_attn_mask_to_ragged_lut(
         block_mask,

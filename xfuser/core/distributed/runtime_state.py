@@ -503,6 +503,9 @@ class RuntimeState(metaclass=ABCMeta):
                 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
                 from aiter.ops.mha import flash_attn_mxfp4_sparse_pertensor_func
                 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_mxfp4
+                from aiter.ops.triton.quant.sage_attention_quant_fp8_input_wrapper import (
+                    sage_quant_mxfp4_fp8_input,
+                )
             except ImportError:
                 raise RuntimeError(
                     "AITER Sparge ASM V2 (mxfp4) attention is not available; this "
@@ -520,6 +523,9 @@ class RuntimeState(metaclass=ABCMeta):
                     fmha_v3_fwd_mxfp4_sparse_sorted,
                 )
                 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_mxfp4
+                from aiter.ops.triton.quant.sage_attention_quant_fp8_input_wrapper import (
+                    sage_quant_mxfp4_fp8_input,
+                )
             except ImportError:
                 raise RuntimeError(
                     "AITER Sparge ASM V2 Affine Sorted (mxfp4) attention is not "
