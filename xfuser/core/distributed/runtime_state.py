@@ -404,6 +404,7 @@ class RuntimeState(metaclass=ABCMeta):
                                  AttentionBackendType.AITER_SPARSE_SAGE_V2,
                                  AttentionBackendType.AITER_SPARGE_ASM,
                                  AttentionBackendType.AITER_SPARGE_ASM_V2,
+                                 AttentionBackendType.AITER_SPARGE_ASM_V2_AFFINE_SORTED,
                                  AttentionBackendType.AITER_SPARGE_ASM_FP8,
                                  AttentionBackendType.AITER_SPARGE_ASM_FP8_AFFINE_SORTED,
                                  AttentionBackendType.AITER_SPARGE_V2,
@@ -510,6 +511,23 @@ class RuntimeState(metaclass=ABCMeta):
                     "aiter.ops.mha.flash_attn_mxfp4_sparse_pertensor_func plus "
                     "aiter.ops.triton.quant.sage_attention_quant_wrappers."
                     "sage_quant_mxfp4."
+                ) from None
+        elif attention_backend == AttentionBackendType.AITER_SPARGE_ASM_V2_AFFINE_SORTED:
+            try:
+                from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
+                from aiter.ops.mha import (
+                    flash_attn_mxfp4_sparse_pertensor_func,
+                    fmha_v3_fwd_mxfp4_sparse_sorted,
+                )
+                from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_mxfp4
+            except ImportError:
+                raise RuntimeError(
+                    "AITER Sparge ASM V2 Affine Sorted (mxfp4) attention is not "
+                    "available; this backend needs the hand-written gfx950 .co "
+                    "(fwd_hd128_mxfp4_sparse_sorted.co) and the sorted entry "
+                    "aiter.ops.mha.fmha_v3_fwd_mxfp4_sparse_sorted (reached via "
+                    "flash_attn_mxfp4_sparse_pertensor_func(dispatch='sorted')) plus "
+                    "aiter.ops.triton.quant.sage_attention_quant_wrappers.sage_quant_mxfp4."
                 ) from None
         elif attention_backend == AttentionBackendType.AITER_SPARGE_ASM_FP8:
             try:
