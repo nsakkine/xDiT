@@ -60,17 +60,19 @@ def scatter_to_global(full_in_applied_order: torch.Tensor,
 
 def apply_head_balance(query, key, value, head_balance_layer, *,
                        enabled, ulysses_world_size, ring_world_size,
-                       is_sparge_backend, joint_strategy, attention_kwargs):
+                       backend_publishes_head_cost, joint_strategy,
+                       attention_kwargs):
     """Conditionally apply Ulysses block-sparse head balancing before the input
     all-to-all.
 
     Balancing engages only when the feature flag is set and we are on the
-    Ulysses-only sparge path with a per-layer balancing buffer present. When it
-    does, Q,K,V heads are permuted by this step's plan so each rank receives a
-    cost-balanced subset, and a per-head "cost sink" (for the backend to fill)
-    plus the revert bookkeeping (applied + inverse permutation) are stashed in a
-    shallow-copied attention_kwargs -- keeping the head cost OUT of the
-    (output, softmax_lse) contract and leaving USP with no extra locals.
+    Ulysses-only path with a block-sparse backend that publishes a per-head cost
+    and a per-layer balancing buffer present. When it does, Q,K,V heads are
+    permuted by this step's plan so each rank receives a cost-balanced subset,
+    and a per-head "cost sink" (for the backend to fill) plus the revert
+    bookkeeping (applied + inverse permutation) are stashed in a shallow-copied
+    attention_kwargs -- keeping the head cost OUT of the (output, softmax_lse)
+    contract and leaving USP with no extra locals.
 
     Returns ``(query, key, value, hb_applied, attention_kwargs)``; when not
     applied the inputs are returned unchanged with ``hb_applied=False``. The gate
@@ -82,9 +84,17 @@ def apply_head_balance(query, key, value, head_balance_layer, *,
         and ulysses_world_size > 1
         and ring_world_size == 1
         and head_perm is not None
-        and is_sparge_backend
+        and backend_publishes_head_cost
         and joint_strategy is None
         and query.shape[1] % ulysses_world_size == 0
+        # MHA only. The permutation below is built over QUERY heads and applied
+        # to K and V as well, which is only a consistent relabelling when they
+        # have the same head count: under GQA it would index K/V out of range,
+        # and even clamped it would break the query-head -> KV-head mapping that
+        # kernels assume (AITER_SOL_ATTN's is a right shift by log2 of the
+        # ratio). Balancing GQA needs a group-wise permutation, so until then
+        # this is a no-op there rather than silent corruption.
+        and key.shape[1] == query.shape[1]
     )
     if not hb_applied:
         return query, key, value, False, attention_kwargs

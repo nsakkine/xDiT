@@ -32,14 +32,17 @@ from xfuser.core.sparge_attention.head_balance import (
     revert_head_balance,
 )
 
-# Sparge backends whose kernel cost can be load-balanced across Ulysses ranks.
-# These all build a block mask via _build_sparge_block_mask and write the
-# per-head cost into the head-balance "cost sink". Non-sparge backends are
-# excluded so head balancing is a clean no-op for them.
+# Block-sparse backends whose kernel cost can be load-balanced across Ulysses
+# ranks, because each publishes its per-head cost into the head-balance "cost
+# sink": the sparge backends from the block mask built by
+# _build_sparge_block_mask, AITER_SOL_ATTN from its threshold routing. Backends
+# with no per-head cost to publish are excluded so head balancing is a clean
+# no-op for them rather than a permutation nothing ever informs.
 _HEAD_BALANCE_BACKENDS = frozenset({
     AttentionBackendType.AITER_SPARGE,
     AttentionBackendType.AITER_SPARGE_V2,
     AttentionBackendType.FLEX_BLOCK_SPARGE,
+    AttentionBackendType.AITER_SOL_ATTN,
 })
 
 
@@ -284,7 +287,7 @@ def USP(
         enabled=get_runtime_state().runtime_config.use_spargeattn_head_balance,
         ulysses_world_size=hb_uly,
         ring_world_size=get_ring_parallel_world_size(),
-        is_sparge_backend=hb_backend in _HEAD_BALANCE_BACKENDS,
+        backend_publishes_head_cost=hb_backend in _HEAD_BALANCE_BACKENDS,
         joint_strategy=joint_strategy,
         attention_kwargs=attention_kwargs,
     )

@@ -820,7 +820,9 @@ class xFuserArgs:
             action="store_true",
             help="Balance per-rank attention work across Ulysses ranks by "
                  "permuting heads (block-sparse load balancing). Only has an "
-                 "effect with ulysses_degree>1 and a Sparge attention backend.",
+                 "effect with ulysses_degree>1, equal query and KV head counts, "
+                 "and a block-sparse attention backend that publishes a per-head "
+                 "cost (the Sparge backends or aiter_sol_attn).",
         )
         parser.add_argument(
             "--vsa_block_size",

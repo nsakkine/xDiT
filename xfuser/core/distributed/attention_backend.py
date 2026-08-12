@@ -546,6 +546,7 @@ class AttentionBackendType(Enum):
     AITER_SPARSE_SAGE = "AITER Sparse Sage"
     AITER_SAGE_V2 = "AITER Sage V2"
     AITER_SPARSE_SAGE_V2 = "AITER Sparse Sage V2"
+    AITER_SOL_ATTN = "AITER Sol-Attn"
     AITER_SPARGE = "AITER Sparge"
     AITER_SPARGE_V2 = "AITER Sparge V2"
     AITER_VSA = "AITER VSA CK"
@@ -1008,6 +1009,49 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
 
     output = torch.permute(output, [0, 2, 1, 3])
     return output, None
+
+@register_attention_function(AttentionBackendType.AITER_SOL_ATTN)
+def _aiter_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Block-sparse fp8 attention that approximates the skipped blocks from pooled K/V.
+
+    Unlike AITER_SPARSE_SAGE, the routing is derived from the operands themselves (a pooled-score
+    threshold at XFUSER_SOL_ATTN_BETA) rather than from a model-supplied mask, so this backend needs
+    nothing published in attention_kwargs. A caller that can identify the calling layer may still pass
+    attention_kwargs["sol_attn_routing"] to reuse routing across denoising steps; see
+    xfuser/core/distributed/sol_attn.py for why that is not done automatically.
+
+    Publishes this rank's per-head exact-block count into the head-balance cost sink when USP has
+    injected one, exactly as the sparge backends do from _build_sparge_block_mask.
+
+    Returns softmax_lse as None: LSE-merging partial outputs across ring ranks is not valid once each
+    rank has added a pooled correction, and check_sol_attn_supported rejects ring parallelism outright.
+    """
+    from xfuser.core.distributed.sol_attn import sol_attn_bhsd, sol_attn_settings
+
+    beta, dump_path, hadamard = sol_attn_settings()
+    routing = (attention_kwargs or {}).get("sol_attn_routing")
+    # Ring parallelism is rejected once, at setup, by
+    # RuntimeState._check_if_backend_compatible_with_current_configuration, so it is not re-queried per
+    # call. That is not just to save the lookup: get_sp_group() asserts the group exists, and Dynamo
+    # refuses to compile a graph containing an assertion it cannot prove, which would break
+    # torch.compile for every model using this backend.
+    ring_world_size = 1
+    output, head_cost = sol_attn_bhsd(
+        query,
+        key,
+        value,
+        is_causal=is_causal,
+        beta=beta,
+        routing=routing,
+        ring_world_size=ring_world_size,
+        dump_path=dump_path,
+        hadamard=hadamard,
+    )
+    cost_sink = (attention_kwargs or {}).get(COST_SINK_KEY)
+    if cost_sink is not None:
+        cost_sink.copy_(head_cost)
+    return output, None
+
 
 @register_attention_function(AttentionBackendType.AITER)
 def _aiter_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):

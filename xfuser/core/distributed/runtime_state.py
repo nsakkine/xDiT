@@ -221,6 +221,7 @@ class RuntimeState(metaclass=ABCMeta):
                                  AttentionBackendType.AITER_MLA,
                                  AttentionBackendType.AITER_SAGE,
                                  AttentionBackendType.AITER_SPARSE_SAGE,
+                                 AttentionBackendType.AITER_SOL_ATTN,
                                  AttentionBackendType.AITER_SPARGE,
                                  AttentionBackendType.AITER_SAGE_V2,
                                  AttentionBackendType.AITER_SPARSE_SAGE_V2,
@@ -291,6 +292,18 @@ class RuntimeState(metaclass=ABCMeta):
                 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
             except ImportError:
                 raise RuntimeError("AITER Sparse Sage attention is not available, please update AITER") from None
+        elif attention_backend == AttentionBackendType.AITER_SOL_ATTN:
+            from xfuser.core.distributed.sol_attn import sol_attn_available
+            if not sol_attn_available():
+                raise RuntimeError(
+                    "AITER Sol-Attn attention is not available: it needs aiter with "
+                    "fmha_v3_fwd_sol_attn and sol_attn_prepare, please update AITER")
+            # Fail here rather than on the first attention call: the kernel is gfx950-only, and the
+            # per-call check cannot be reached early enough to give a useful message during setup.
+            arch = torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName or ""
+            if not arch.startswith("gfx950"):
+                raise RuntimeError(
+                    f"AITER Sol-Attn ships only a gfx950 kernel, this device reports '{arch}'")
         elif attention_backend == AttentionBackendType.AITER_SAGE_V2:
             try:
                 from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import fav3_sage_mxfp4_wrapper
