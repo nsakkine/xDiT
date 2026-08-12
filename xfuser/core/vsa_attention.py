@@ -14,7 +14,7 @@ from typing import Optional
 
 import torch
 
-from xfuser.core.sparge_attention.sparge import (
+from xfuser.core.sparse_attention.sparge import (
     mask_padded_kv_blocks,
     restore_sparge_output,
     setup_sparge,

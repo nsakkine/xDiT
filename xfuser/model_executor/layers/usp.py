@@ -27,22 +27,21 @@ from xfuser.core.distributed.attention_backend import (
     ATTENTION_FUNCTION_REGISTRY,
     AttentionBackendType,
 )
-from xfuser.core.sparge_attention.head_balance import (
+from xfuser.core.sparse_attention.head_balance import (
     apply_head_balance,
     revert_head_balance,
 )
 
 # Block-sparse backends whose kernel cost can be load-balanced across Ulysses
 # ranks, because each publishes its per-head cost into the head-balance "cost
-# sink": the sparge backends from the block mask built by
-# _build_sparge_block_mask, AITER_SOL_ATTN from its threshold routing. Backends
-# with no per-head cost to publish are excluded so head balancing is a clean
-# no-op for them rather than a permutation nothing ever informs.
+# sink". Backends with no per-head cost to publish are excluded so head
+# balancing is a clean no-op for them rather than a permutation nothing ever
+# informs.
 _HEAD_BALANCE_BACKENDS = frozenset({
     AttentionBackendType.AITER_SPARGE,
     AttentionBackendType.AITER_SPARGE_V2,
     AttentionBackendType.FLEX_BLOCK_SPARGE,
-    AttentionBackendType.AITER_SOL_ATTN,
+    AttentionBackendType.AITER_FP8_SOL,
 })
 
 
@@ -269,7 +268,7 @@ def USP(
     Explicit backend can be provided to specify the attention backend to use.
 
     ``head_balance_layer`` (optional): a stable per-layer handle (e.g. the
-    attention module). When provided and --use_spargeattn_head_balance is set, the
+    attention module). When provided and --use_sparseattn_head_balance is set, the
     Ulysses head dimension is permuted so each rank gets a cost-balanced subset
     of heads (block-sparse load balancing); the permutation is inverted on the
     output. No-op for non-sparse backends (no cost is published) and for ring/
@@ -284,7 +283,7 @@ def USP(
     hb_backend = backend if backend is not None else get_runtime_state().attention_backend
     query, key, value, hb_applied, attention_kwargs = apply_head_balance(
         query, key, value, head_balance_layer,
-        enabled=get_runtime_state().runtime_config.use_spargeattn_head_balance,
+        enabled=get_runtime_state().runtime_config.use_sparseattn_head_balance,
         ulysses_world_size=hb_uly,
         ring_world_size=get_ring_parallel_world_size(),
         backend_publishes_head_cost=hb_backend in _HEAD_BALANCE_BACKENDS,

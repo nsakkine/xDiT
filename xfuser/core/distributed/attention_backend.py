@@ -5,20 +5,20 @@ import math
 import torch.nn.functional as F
 from enum import Enum
 from xfuser.envs import PACKAGES_CHECKER, environment_variables
-from xfuser.core.distributed.ssta import (
+from xfuser.core.sparse_attention.ssta import (
     setup_ssta,
     get_sparse_mask,
     untile_ssta_output,
     expand_block_mask,
 )
 from xfuser.core.distributed import get_ulysses_parallel_world_size, get_ring_parallel_world_size
-from xfuser.core.sparge_attention.sparge import (
+from xfuser.core.sparse_attention.sparge import (
     setup_sparge,
     compute_sparge_block_mask,
     restore_sparge_output,
     mask_padded_kv_blocks,
 )
-from xfuser.core.sparge_attention.head_balance import COST_SINK_KEY
+from xfuser.core.sparse_attention.head_balance import COST_SINK_KEY
 from xfuser.logger import init_logger
 
 logger = init_logger(__name__)
@@ -546,7 +546,7 @@ class AttentionBackendType(Enum):
     AITER_SPARSE_SAGE = "AITER Sparse Sage"
     AITER_SAGE_V2 = "AITER Sage V2"
     AITER_SPARSE_SAGE_V2 = "AITER Sparse Sage V2"
-    AITER_SOL_ATTN = "AITER Sol-Attn"
+    AITER_FP8_SOL = "AITER FP8 Sol"
     AITER_SPARGE = "AITER Sparge"
     AITER_SPARGE_V2 = "AITER Sparge V2"
     AITER_VSA = "AITER VSA CK"
@@ -1010,7 +1010,7 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
     output = torch.permute(output, [0, 2, 1, 3])
     return output, None
 
-@register_attention_function(AttentionBackendType.AITER_SOL_ATTN)
+@register_attention_function(AttentionBackendType.AITER_FP8_SOL)
 def _aiter_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
     """Block-sparse fp8 attention that approximates the skipped blocks from pooled K/V.
 
@@ -1018,7 +1018,7 @@ def _aiter_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
     threshold at XFUSER_SOL_ATTN_BETA) rather than from a model-supplied mask, so this backend needs
     nothing published in attention_kwargs. A caller that can identify the calling layer may still pass
     attention_kwargs["sol_attn_routing"] to reuse routing across denoising steps; see
-    xfuser/core/distributed/sol_attn.py for why that is not done automatically.
+    xfuser/core/sparse_attention/sol.py for why that is not done automatically.
 
     Publishes this rank's per-head exact-block count into the head-balance cost sink when USP has
     injected one, exactly as the sparge backends do from _build_sparge_block_mask.
@@ -1026,7 +1026,7 @@ def _aiter_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
     Returns softmax_lse as None: LSE-merging partial outputs across ring ranks is not valid once each
     rank has added a pooled correction, and check_sol_attn_supported rejects ring parallelism outright.
     """
-    from xfuser.core.distributed.sol_attn import sol_attn_bhsd, sol_attn_settings
+    from xfuser.core.sparse_attention.sol import sol_attn_bhsd, sol_attn_settings
 
     beta, dump_path, hadamard = sol_attn_settings()
     routing = (attention_kwargs or {}).get("sol_attn_routing")

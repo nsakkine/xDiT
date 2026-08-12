@@ -4,8 +4,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from xfuser.core.sparge_attention.block_mask import get_block_map_meansim
-from xfuser.core.sparge_attention.gilbert import (
+from xfuser.core.sparse_attention.block_mask import get_block_map_meansim
+from xfuser.core.sparse_attention.gilbert import (
     curve as gilbert_curve,
     sliced_curve,
     sliced_gilbert_mapping,

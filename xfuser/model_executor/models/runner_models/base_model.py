@@ -324,8 +324,8 @@ class xFuserModel(abc.ABC):
 
     def _enable_options(self) -> None:
         """ Enable model options based on config"""
-        if getattr(self.config, "use_spargeattn_head_balance", False):
-            log("Enabling Sparge block-sparse head balancing...")
+        if getattr(self.config, "use_sparseattn_head_balance", False):
+            log("Enabling block-sparse head balancing...")
 
         if self.config.enable_slicing:
             log("Enabling VAE slicing...")

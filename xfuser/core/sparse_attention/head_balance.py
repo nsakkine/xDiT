@@ -91,7 +91,7 @@ def apply_head_balance(query, key, value, head_balance_layer, *,
         # to K and V as well, which is only a consistent relabelling when they
         # have the same head count: under GQA it would index K/V out of range,
         # and even clamped it would break the query-head -> KV-head mapping that
-        # kernels assume (AITER_SOL_ATTN's is a right shift by log2 of the
+        # kernels assume (AITER_FP8_SOL's is a right shift by log2 of the
         # ratio). Balancing GQA needs a group-wise permutation, so until then
         # this is a no-op there rather than silent corruption.
         and key.shape[1] == query.shape[1]

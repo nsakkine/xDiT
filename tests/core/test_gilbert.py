@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from xfuser.core.sparge_attention.gilbert import (
+from xfuser.core.sparse_attention.gilbert import (
     sliced_gilbert_block_neighbor_mapping,
     _sliced_gilbert_block_neighbor_mapping,
 )

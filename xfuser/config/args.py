@@ -176,7 +176,8 @@ class xFuserArgs:
     use_spargeattn_static_block_mask: bool = True
     spargeattn_simthreshold: float = 0.3
     spargeattn_cdfthreshold: float = 0.92
-    use_spargeattn_head_balance: bool = False
+    # Block-sparse Ulysses head balancing (not Sparge-specific)
+    use_sparseattn_head_balance: bool = False
     # AITER CK-Tile VSA attention
     vsa_block_size: int = 128
     vsa_top_k: int = 1
@@ -816,13 +817,13 @@ class xFuserArgs:
                  "--spargeattn_reorder_sequence is set. Use --no-use_spargeattn_static_block_mask to disable."
         )
         parser.add_argument(
-            "--use_spargeattn_head_balance",
+            "--use_sparseattn_head_balance",
             action="store_true",
             help="Balance per-rank attention work across Ulysses ranks by "
                  "permuting heads (block-sparse load balancing). Only has an "
                  "effect with ulysses_degree>1, equal query and KV head counts, "
                  "and a block-sparse attention backend that publishes a per-head "
-                 "cost (the Sparge backends or aiter_sol_attn).",
+                 "cost (the Sparge backends or aiter_fp8_sol).",
         )
         parser.add_argument(
             "--vsa_block_size",
@@ -984,7 +985,7 @@ class xFuserArgs:
             use_spargeattn_static_block_mask=self.use_spargeattn_static_block_mask,
             spargeattn_simthreshold=self.spargeattn_simthreshold,
             spargeattn_cdfthreshold=self.spargeattn_cdfthreshold,
-            use_spargeattn_head_balance=self.use_spargeattn_head_balance,
+            use_sparseattn_head_balance=self.use_sparseattn_head_balance,
             vsa_block_size=self.vsa_block_size,
             vsa_top_k=self.vsa_top_k,
             vsa_top_k_ratio=self.vsa_top_k_ratio,

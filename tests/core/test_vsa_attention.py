@@ -15,7 +15,7 @@ from xfuser.core.vsa_attention import (
     build_jenga_block_mask,
     jenga_scheduled_drop_rate,
 )
-from xfuser.core.sparge_attention.sparge import (
+from xfuser.core.sparse_attention.sparge import (
     get_sliced_gilbert_perm,
     setup_sparge,
 )
