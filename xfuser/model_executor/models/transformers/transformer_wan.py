@@ -21,7 +21,7 @@ from xfuser.model_executor.layers.attention_processor import (
     xFuserAttentionProcessorRegister
 )
 from xfuser.envs import PACKAGES_CHECKER
-from xfuser.core.vsa_attention import jenga_scheduled_drop_rate
+from xfuser.core.sparse_attention.vsa import jenga_scheduled_drop_rate
 
 env_info = PACKAGES_CHECKER.get_packages_info()
 HAS_LONG_CTX_ATTN = env_info["has_long_ctx_attn"]

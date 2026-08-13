@@ -8,7 +8,7 @@ from xfuser.config.args import xFuserArgs
 from xfuser.config.config import RuntimeConfig
 from xfuser.core.distributed.attention_backend import AttentionBackendType
 from xfuser.core.distributed.runtime_state import DiTRuntimeState
-from xfuser.core.vsa_attention import (
+from xfuser.core.sparse_attention.vsa import (
     _first_frame_block_count,
     aiter_vsa_attention,
     block_mask_to_delta_lut,

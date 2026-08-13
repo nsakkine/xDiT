@@ -71,6 +71,7 @@ class RuntimeConfig:
     spargeattn_simthreshold: float = 0.3
     spargeattn_cdfthreshold: float = 0.92
     use_sparseattn_head_balance: bool = False
+    solattn_beta: float = 0.5
     vsa_block_size: int = 128
     vsa_top_k: int = 1
     vsa_top_k_ratio: float = 0.0

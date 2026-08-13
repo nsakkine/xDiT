@@ -74,11 +74,16 @@ _SPARSE_ATTENTION_BACKENDS = frozenset({
     AttentionBackendType.AITER_SPARSE_SAGE_V2,
     AttentionBackendType.FLEX_BLOCK_ATTN
 })
+# Block-sparse backends a model must explicitly opt into via
+# supports_sparge_attention_backends, and which additionally require a separate
+# non-block-sparse cross-attention backend. Not all of these are Sparge: VSA and
+# Sol are here because they carry the same requirements, not the same algorithm.
 _SPARGE_ATTENTION_BACKENDS = frozenset({
     AttentionBackendType.AITER_SPARGE,
     AttentionBackendType.AITER_SPARGE_V2,
     AttentionBackendType.AITER_VSA,
     AttentionBackendType.FLEX_BLOCK_SPARGE,
+    AttentionBackendType.AITER_SOL_FP8,
 })
 
 
@@ -92,22 +97,46 @@ def _parse_attention_backend(name: Optional[str], kind: str) -> Optional[Attenti
 
 
 def _validate_cross_attention_for_sparge(config: xFuserArgs) -> None:
-    """Cross-attention must be set and must not itself be a Sparge backend
-    whenever Sparge Attention is in play (either as the explicit backend or
-    via the hybrid schedule)."""
+    """Cross-attention must be set and must not itself be a block-sparse backend
+    whenever one is in play (either as the explicit backend or via the hybrid
+    schedule)."""
     if config.cross_attention_backend is None:
         raise ValueError(
-            "When Sparge Attention is used, --cross_attention_backend must be "
-            "set to a non-Sparge backend."
+            "When a block-sparse attention backend is used, "
+            "--cross_attention_backend must be set to a non-block-sparse backend."
         )
     cross = _parse_attention_backend(
         config.cross_attention_backend, "cross attention backend",
     )
     if cross in _SPARGE_ATTENTION_BACKENDS:
         raise ValueError(
-            f"--cross_attention_backend cannot be {cross.name} when Sparge "
-            f"Attention is used. Pick a non-Sparge cross attention backend."
+            f"--cross_attention_backend cannot be {cross.name} when a "
+            f"block-sparse attention backend is used. Pick a non-block-sparse "
+            f"cross attention backend."
         )
+
+
+def _hybrid_schedule_backends(config: xFuserArgs) -> set:
+    """Every backend a hybrid schedule may select, from either way of specifying one.
+
+    An explicit --hybrid_attn_schedule names a backend per step, while the low/high precision
+    pair names two; both need the same model-support and cross-attention validation, so they
+    are normalised to one set here.
+    """
+    if config.hybrid_attn_schedule is not None:
+        schedule = AttentionSchedule.from_comma_delimited_string(config.hybrid_attn_schedule)
+        return set(schedule.backends)
+    pair = (
+        _parse_attention_backend(
+            config.hybrid_attn_low_precision_backend,
+            "hybrid low-precision attention backend",
+        ),
+        _parse_attention_backend(
+            config.hybrid_attn_high_precision_backend,
+            "hybrid high-precision attention backend",
+        ),
+    )
+    return {backend for backend in pair if backend is not None}
 
 
 @dataclass(frozen=True)
@@ -371,16 +400,18 @@ class xFuserModel(abc.ABC):
                     f"use the dense model equivalent."
                 )
             if config.use_hybrid_attn_schedule:
-                low = _parse_attention_backend(
-                    config.hybrid_attn_low_precision_backend,
-                    "hybrid low-precision attention backend",
+                gated = sorted(
+                    scheduled.name
+                    for scheduled in _hybrid_schedule_backends(config)
+                    if scheduled in _SPARGE_ATTENTION_BACKENDS
                 )
-                high = _parse_attention_backend(
-                    config.hybrid_attn_high_precision_backend,
-                    "hybrid high-precision attention backend",
-                )
-                if (low in _SPARGE_ATTENTION_BACKENDS
-                        or high in _SPARGE_ATTENTION_BACKENDS):
+                if gated:
+                    if not supports_sparge:
+                        raise ValueError(
+                            f"Model {config.model} does not support block-sparse "
+                            f"attention backends, but the hybrid attention schedule "
+                            f"selects {', '.join(gated)}."
+                        )
                     _validate_cross_attention_for_sparge(config)
         else:
             if backend in _SPARSE_ATTENTION_BACKENDS and not supports_sparse:
@@ -399,7 +430,7 @@ class xFuserModel(abc.ABC):
             if backend in _SPARGE_ATTENTION_BACKENDS:
                 if not supports_sparge:
                     raise ValueError(
-                        f"Model {config.model} does not support Sparge attention backend."
+                        f"Model {config.model} does not support block-sparse attention backends."
                     )
                 if self.capabilities.cross_attention_backend:
                     _validate_cross_attention_for_sparge(config)

@@ -3,44 +3,11 @@
 Plain block-sparse attention routes each query tile to a subset of KV blocks and DROPS the rest.
 Sol-Attn (arXiv 2607.24027) computes the same selected blocks exactly and additionally recovers the
 contribution of the skipped blocks from pooled (mean) K/V, so the mass outside the selection is
-approximated instead of discarded. It runs on the gfx950 ASM kernel shipped in aiter as
-fwd_hd128_fp8_sol_attn.co and driven by aiter.ops.mha.fmha_v3_fwd_sol_attn.
-
-This module holds everything the backend needs that is not xDiT plumbing: the hard compatibility
-constraints, the Hadamard rotation, per-tensor fp8 quantization, routing construction, and the kernel
-call.
-
-WHY THE CONSTRAINTS ARE HARD ERRORS. The kernel family derives the KV head for a Q head by SHIFTING
-the head index right by floor(log2(nheads_q / nheads_kv)) rather than dividing:
-
-    # s[58] = gqa_ratio (power-of-2: 1, 2, 4, 8, 16)
-    s_lshr_b32(_s_tmp1, _s_tgid_y, s[58])   # kv_head = tgid_y >> gqa_shift
-
-A non-power-of-2 GQA ratio therefore reads the WRONG KV head, and because it is a shift the wrong head
-is frequently out of bounds. Measured at hd128 fp8 on gfx950, for dense as well as the sparse and
-Sol-Attn paths, the observable outcome is one of: silently wrong output (cosine 0.72 vs reference at
-nheads_q=10 / nheads_kv=2), non-finite output confined to exactly the misrouted heads, or an
-unrecoverable GPU page fault -- and which one you get depends on the allocation layout, so it is not
-reproducible run to run. There is no accuracy gate that reliably catches the first case, so this module
-refuses the configuration up front rather than letting a pipeline emit quietly corrupted frames.
-
-ROUTING COST. sol_attn_prepare (pooling + routing, both host-launched Triton) costs roughly 1-2 ms and
-is largely shape-insensitive, against a kernel that runs 1.0-2.6 ms at video shapes. Recomputing it on
-every attention call is therefore a real fraction of the win, and at short sequence lengths it exceeds
-the entire kernel time. It is still recomputed per call here, because reuse requires knowing WHICH
-layer is calling: xDiT hands the registered attention function only (query, key, value, dropout_p,
-is_causal, attention_kwargs), and every transformer block in a model like Wan has identical Q/K shapes,
-so any cache keyed on shape would hand layer 0's routing to all 40 blocks. A caller that can supply
-that identity may pass precomputed routing through attention_kwargs["sol_attn_routing"], which is used
-as-is; see sol_attn_routing_for().
+approximated instead of discarded.s
 """
-import os
 import typing
 
 import torch
-
-_TRUTHY = frozenset({"1", "true", "yes", "on"})
-_FALSY = frozenset({"0", "false", "no", "off"})
 
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
 _SUPPORTED_HEAD_DIM = 128
@@ -138,13 +105,6 @@ def check_sol_attn_supported(query, key, value, is_causal, ring_world_size=1):
 
 def _sol_attn_output_strides(shape):
     """Strides of the BHSD output, which are fixed by the implementation rather than by the caller.
-
-    The ASM kernel writes its own contiguous BSHD (batch, seqlen, nheads, head_dim) tensor and the
-    result is returned as a BHSD permute of it, so the strides are always these regardless of how the
-    caller laid out its query. The fake kernel must declare the same thing: torch.empty_like(query)
-    would instead PRESERVE the query's layout, and in a model like Wan the query is itself a transposed
-    view of a BSHD-contiguous tensor, so the fake and the implementation would disagree and Inductor
-    would fail an assert_size_stride check on the op's output.
     """
     _, h, s, d = shape
     return (h * s * d, d, h * d, 1)
@@ -161,19 +121,6 @@ def _per_tensor_quant_fp8(x):
 
 def _hadamard_rotate_qk(query, key):
     """Rotate Q and K by the shared orthonormal Hadamard matrix AITER_FP8 uses, along head_dim.
-
-    Reuses the dense fp8 backend's matrix and rotation so the two backends cannot drift apart; it is a
-    full-head rotation here, since that matrix is built at block_r=128 and Sol-Attn requires
-    head_dim==128 exactly, so there is no partial block to reason about.
-
-    Sol-Attn stays correct under this for a reason dense attention does not need: besides leaving Q@K.T
-    untouched, the rotation COMMUTES WITH THE POOLING the approximate branch depends on. mean_k averages
-    keys along the sequence while the rotation acts on head_dim and is applied identically to every
-    token, so mean(K @ R) == mean(K) @ R, and because sol_attn_prepare pools the quantized operands it is
-    handed, rotating before quantization puts mean_k in the same rotated space as Q automatically. The
-    routing therefore sees the same proxy scores and picks the same blocks, up to the near-tau fp8
-    rounding _sol_attn_route documents. V is deliberately NOT rotated: mean_v is accumulated straight
-    into the output, so a rotation there would have to be undone afterwards.
     """
     from xfuser.core.distributed.attention_backend import (
         FP8_HADAMARD_MATRIX,
@@ -183,8 +130,9 @@ def _hadamard_rotate_qk(query, key):
     r = FP8_HADAMARD_MATRIX[query.device]
     if r is None:
         raise SolAttnUnsupported(
-            "XFUSER_SOL_ATTN_HADAMARD is set but no Hadamard matrix could be built. Set "
-            "XFUSER_SOL_ATTN_HADAMARD=0 to quantize the raw operands instead.")
+            "No Hadamard matrix could be built for this device. The rotation is required by the "
+            "AITER_SOL_FP8 backend rather than optional, so there is no flag to disable it; please "
+            "update AITER or select a different attention backend.")
     return (_fp8_hadamard_rotate(query, r).contiguous(),
             _fp8_hadamard_rotate(key, r).contiguous())
 
@@ -199,18 +147,6 @@ def sol_attn_routing_for(q_fp8, k_fp8, v_fp8, beta):
 
 def _head_cost_from_routing(prep):
     """Per-head count of exactly-computed KV blocks, float32 (nheads_q,).
-
-    This is what the Ulysses head balancer needs from a block-sparse backend, and it is the same
-    quantity the sparge backends publish, computed the same way. Sol-Attn's per-head cost is genuinely
-    data dependent: the routing threshold selects however many blocks a head's pooled proxy scores put
-    above tau, so heads differ in how much exact work they cost, which is the imbalance the balancer
-    corrects. The skipped blocks are ignored here because their pooled correction is a fixed, uniform
-    cost per head and so cannot contribute to imbalance.
-
-    The count must be summed here rather than outside the op: the routing lives inside the opaque custom
-    op (its LUT sizes are data dependent), so this is the only place the mask exists. Reducing it to a
-    (nheads,) tensor is what makes the cost expressible in the op's fake kernel, since that shape
-    depends only on the operand shapes.
     """
     mask = prep["block_attn_mask"]  # (batch, nheads_q, num_q_tiles, num_kv_blocks) bool
     return mask.to(torch.float32).sum(dim=(0, 2, 3))
@@ -380,20 +316,12 @@ def sol_attn_bhsd(query, key, value, is_causal=False, beta=1.0, softmax_scale=No
         dump_path or "", bool(hadamard))
 
 
-def sol_attn_settings():
-    """(beta, dump_path, hadamard) resolved from the environment, validated."""
+def sol_attn_dump_path():
+    """Operand dump path from the environment, or None. See XFUSER_SOL_ATTN_DUMP in xfuser/envs.py.
+
+    beta and hadamard are not read here: beta arrives per call through attention_kwargs from
+    --solattn_beta, and the rotation is a property of the selected backend rather than a user knob.
+    """
     from xfuser.envs import environment_variables
 
-    raw_beta = environment_variables["SOL_ATTN_BETA"]()
-    try:
-        beta = float(raw_beta)
-    except (TypeError, ValueError):
-        raise SolAttnUnsupported(
-            f"XFUSER_SOL_ATTN_BETA must be a float, got {raw_beta!r}") from None
-    dump_path = environment_variables["SOL_ATTN_DUMP"]() or None
-    raw_hadamard = str(environment_variables["SOL_ATTN_HADAMARD"]()).strip().lower()
-    if raw_hadamard not in _TRUTHY | _FALSY:
-        raise SolAttnUnsupported(
-            f"XFUSER_SOL_ATTN_HADAMARD must be one of {sorted(_TRUTHY | _FALSY)}, got "
-            f"{raw_hadamard!r}")
-    return beta, dump_path, raw_hadamard in _TRUTHY
+    return environment_variables["SOL_ATTN_DUMP"]() or None

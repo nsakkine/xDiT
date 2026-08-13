@@ -62,6 +62,7 @@ def _build_attention_kwargs(config: "xFuserArgs") -> dict:
         "spargeattn_cdfthreshold": config.spargeattn_cdfthreshold,
         "spargeattn_reorder_sequence": config.spargeattn_reorder_sequence,
         "use_spargeattn_static_block_mask": config.use_spargeattn_static_block_mask,
+        "solattn_beta": config.solattn_beta,
         "vsa_block_size": config.vsa_block_size,
         "vsa_top_k": config.vsa_top_k,
         "vsa_top_k_ratio": config.vsa_top_k_ratio,

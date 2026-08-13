@@ -178,6 +178,8 @@ class xFuserArgs:
     spargeattn_cdfthreshold: float = 0.92
     # Block-sparse Ulysses head balancing (not Sparge-specific)
     use_sparseattn_head_balance: bool = False
+    # Sol-Attn
+    solattn_beta: float = 0.5
     # AITER CK-Tile VSA attention
     vsa_block_size: int = 128
     vsa_top_k: int = 1
@@ -823,7 +825,16 @@ class xFuserArgs:
                  "permuting heads (block-sparse load balancing). Only has an "
                  "effect with ulysses_degree>1, equal query and KV head counts, "
                  "and a block-sparse attention backend that publishes a per-head "
-                 "cost (the Sparge backends or aiter_fp8_sol).",
+                 "cost (the Sparge backends or aiter_sol_fp8).",
+        )
+        parser.add_argument(
+            "--solattn_beta",
+            type=float,
+            default=0.5,
+            help="Routing threshold for the AITER Sol backends. A KV block is "
+                 "computed exactly when its pooled proxy score exceeds "
+                 "mean + beta*std over the blocks of that query tile, so larger "
+                 "beta keeps fewer blocks.",
         )
         parser.add_argument(
             "--vsa_block_size",
@@ -986,6 +997,7 @@ class xFuserArgs:
             spargeattn_simthreshold=self.spargeattn_simthreshold,
             spargeattn_cdfthreshold=self.spargeattn_cdfthreshold,
             use_sparseattn_head_balance=self.use_sparseattn_head_balance,
+            solattn_beta=self.solattn_beta,
             vsa_block_size=self.vsa_block_size,
             vsa_top_k=self.vsa_top_k,
             vsa_top_k_ratio=self.vsa_top_k_ratio,

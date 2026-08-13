@@ -546,7 +546,7 @@ class AttentionBackendType(Enum):
     AITER_SPARSE_SAGE = "AITER Sparse Sage"
     AITER_SAGE_V2 = "AITER Sage V2"
     AITER_SPARSE_SAGE_V2 = "AITER Sparse Sage V2"
-    AITER_FP8_SOL = "AITER FP8 Sol"
+    AITER_SOL_FP8 = "AITER Sol FP8"
     AITER_SPARGE = "AITER Sparge"
     AITER_SPARGE_V2 = "AITER Sparge V2"
     AITER_VSA = "AITER VSA CK"
@@ -1010,25 +1010,16 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
     output = torch.permute(output, [0, 2, 1, 3])
     return output, None
 
-@register_attention_function(AttentionBackendType.AITER_FP8_SOL)
-def _aiter_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
-    """Block-sparse fp8 attention that approximates the skipped blocks from pooled K/V.
+@register_attention_function(AttentionBackendType.AITER_SOL_FP8)
+def _aiter_sol_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    from xfuser.core.sparse_attention.sol import sol_attn_bhsd, sol_attn_dump_path
 
-    Unlike AITER_SPARSE_SAGE, the routing is derived from the operands themselves (a pooled-score
-    threshold at XFUSER_SOL_ATTN_BETA) rather than from a model-supplied mask, so this backend needs
-    nothing published in attention_kwargs. A caller that can identify the calling layer may still pass
-    attention_kwargs["sol_attn_routing"] to reuse routing across denoising steps; see
-    xfuser/core/sparse_attention/sol.py for why that is not done automatically.
-
-    Publishes this rank's per-head exact-block count into the head-balance cost sink when USP has
-    injected one, exactly as the sparge backends do from _build_sparge_block_mask.
-
-    Returns softmax_lse as None: LSE-merging partial outputs across ring ranks is not valid once each
-    rank has added a pooled correction, and check_sol_attn_supported rejects ring parallelism outright.
-    """
-    from xfuser.core.sparse_attention.sol import sol_attn_bhsd, sol_attn_settings
-
-    beta, dump_path, hadamard = sol_attn_settings()
+    beta = float((attention_kwargs or {}).get("solattn_beta", 0.5))
+    dump_path = sol_attn_dump_path()
+    # The Hadamard rotation is a property of this fp8 variant, not a user knob: it is orthonormal and
+    # applied to both Q and K, so scores and routing are unchanged while the per-tensor amax (and hence
+    # the fp8 quantization error) drops. AITER_SPARGE_V2 hardcodes its rotation the same way.
+    hadamard = True
     routing = (attention_kwargs or {}).get("sol_attn_routing")
     # Ring parallelism is rejected once, at setup, by
     # RuntimeState._check_if_backend_compatible_with_current_configuration, so it is not re-queried per
@@ -1137,7 +1128,7 @@ def _aiter_vsa_attn_call(
     if dropout_p not in (None, 0.0):
         raise ValueError("AITER VSA CK does not support attention dropout")
 
-    from xfuser.core.vsa_attention import (
+    from xfuser.core.sparse_attention.vsa import (
         aiter_vsa_attention,
         jenga_scheduled_drop_rate,
     )

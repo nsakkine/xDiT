@@ -41,7 +41,7 @@ _HEAD_BALANCE_BACKENDS = frozenset({
     AttentionBackendType.AITER_SPARGE,
     AttentionBackendType.AITER_SPARGE_V2,
     AttentionBackendType.FLEX_BLOCK_SPARGE,
-    AttentionBackendType.AITER_FP8_SOL,
+    AttentionBackendType.AITER_SOL_FP8,
 })
 
 

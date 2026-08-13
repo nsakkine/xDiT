@@ -48,18 +48,9 @@ environment_variables: Dict[str, Callable[[], Any]] = {
                 "XFUSER_AITER_FP8_STATIC_SCALE_WITH_DESCALE", None
             ),
     "AITER_SAGE_V2_BLOCK_R": lambda: os.environ.get("XFUSER_AITER_SAGE_V2_BLOCK_R", "128"),
-    # Sol-Attn routing threshold: a KV block is computed exactly when its pooled proxy score exceeds
-    # mean + beta * std over the blocks of that query tile, so larger beta keeps fewer blocks. Around
-    # 0.5 keeps ~35% of blocks and essentially all of the softmax mass at video shapes; 1.0 keeps ~13%
-    # and starts to lose mass, which the pooled correction only partly recovers.
-    "SOL_ATTN_BETA": lambda: os.environ.get("XFUSER_SOL_ATTN_BETA", "0.5"),
     # Write the first Sol-Attn call's q/k/v to this path, for replaying kernel benchmarks on real
-    # operands instead of synthetic tensors.
+    # operands instead of synthetic tensors. Debug-only, hence env rather than a CLI flag
     "SOL_ATTN_DUMP": lambda: os.environ.get("XFUSER_SOL_ATTN_DUMP", None),
-    # Hadamard-rotate Q and K along head_dim before fp8 quantization, as AITER_FP8 does. Orthonormal
-    # and applied to both, so scores and routing are unchanged while outliers are spread and the
-    # quantization error drops. Set to 0 to quantize the raw operands instead.
-    "SOL_ATTN_HADAMARD": lambda: os.environ.get("XFUSER_SOL_ATTN_HADAMARD", "1"),
     "XDIT_FBCACHE_THRESH": lambda: os.environ.get("XDIT_FBCACHE_THRESH", None),
 }
 
