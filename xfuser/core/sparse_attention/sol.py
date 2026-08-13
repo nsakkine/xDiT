@@ -3,15 +3,12 @@
 Plain block-sparse attention routes each query tile to a subset of KV blocks and DROPS the rest.
 Sol-Attn (arXiv 2607.24027) computes the same selected blocks exactly and additionally recovers the
 contribution of the skipped blocks from pooled (mean) K/V, so the mass outside the selection is
-approximated instead of discarded.s
+approximated instead of discarded.
 """
-import functools
-import typing
+from types import SimpleNamespace
 
 import torch
 
-_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-_SUPPORTED_HEAD_DIM = 128
 _SUPPORTED_ARCH = "gfx950"
 
 
@@ -19,37 +16,62 @@ class SolAttnUnsupported(RuntimeError):
     """Raised when the inputs or the environment cannot be served correctly by the Sol-Attn kernel."""
 
 
-def _is_pow2(n):
-    return n > 0 and (n & (n - 1)) == 0
-
-
-def _misrouted_heads(nheads_q, nheads_kv):
-    """Q heads that the kernel's shift-based GQA would send to the wrong KV head."""
-    ratio = max(nheads_q // max(nheads_kv, 1), 1)
-    shift = max(s for s in range(6) if (1 << s) <= ratio)
-    return [h for h in range(nheads_q) if (h >> shift) != h // ratio]
-
-
 def _probe_aiter():
-    """(entry points present, (BLOCK_M, BLOCK_N)) for the Sol-Attn kernel, resolved once at import.
+    """aiter's Sol-Attn entry points, or None when this build does not ship them.
 
-    The tile sizes come from aiter rather than being hardcoded, and are None when the entry points
-    are missing. This module is itself imported lazily, only once the backend is selected, so builds
-    that never touch Sol-Attn pay nothing for the probe.
+    Resolved at import. This module is imported lazily, only once the backend is selected, so builds
+    that never touch Sol-Attn pay nothing; binding the entry points once also keeps repeated imports
+    out of any traced graph. native_fp8_format is held as a function rather than called here because
+    it queries the device, which import time is too early for.
     """
     try:
-        from aiter.ops.mha import fmha_v3_fwd_sol_attn  # noqa: F401
-        from aiter.ops.triton.attention.utils import (  # noqa: F401
-            FMHA_FWD_V3_SOL_ATTN_TS_KV,
-            FMHA_FWD_V3_SOL_ATTN_TS_QO,
+        from aiter.ops.mha_v4 import (
+            AttentionScaleMode,
+            mha_v4_sol_attn,
+            mha_v4_sol_attn_packed,
+            native_fp8_format,
+            quantize_fp8,
+        )
+        from aiter.ops.triton.attention.utils import (
+            SOL_ATTN_TS_KV,
+            SOL_ATTN_TS_QO,
             sol_attn_prepare,
         )
     except ImportError:
-        return False, None
-    return True, (FMHA_FWD_V3_SOL_ATTN_TS_QO, FMHA_FWD_V3_SOL_ATTN_TS_KV)
+        return None
+    return SimpleNamespace(
+        sol_attn=mha_v4_sol_attn,
+        sol_attn_packed=mha_v4_sol_attn_packed,
+        quantize_fp8=quantize_fp8,
+        prepare=sol_attn_prepare,
+        native_fp8_format=native_fp8_format,
+        per_tensor_scale=AttentionScaleMode.F32_PER_TENSOR,
+        ts_qo=SOL_ATTN_TS_QO,
+        ts_kv=SOL_ATTN_TS_KV,
+    )
 
 
-SOL_ATTN_AVAILABLE, SOL_ATTN_BLOCK_SIZES = _probe_aiter()
+_AITER = _probe_aiter()
+SOL_ATTN_AVAILABLE = _AITER is not None
+
+
+def _probe_hadamard():
+    """(rotate fn, per-device matrix) for the fp8 rotation AITER_FP8 uses, or (None, None).
+
+    attention_backend builds the matrix table at its own import and has no module-level edge back
+    here, so resolving this at module scope is safe and keeps the lookup out of any traced graph.
+    """
+    try:
+        from xfuser.core.distributed.attention_backend import (
+            FP8_HADAMARD_MATRIX,
+            _fp8_hadamard_rotate,
+        )
+    except ImportError:
+        return None, None
+    return _fp8_hadamard_rotate, FP8_HADAMARD_MATRIX
+
+
+_HADAMARD_ROTATE, _HADAMARD_MATRIX = _probe_hadamard()
 
 
 def check_sol_attn_device(device=None):
@@ -61,7 +83,7 @@ def check_sol_attn_device(device=None):
     """
     if not SOL_ATTN_AVAILABLE:
         raise SolAttnUnsupported(
-            "Sol-Attn requires aiter with fmha_v3_fwd_sol_attn and sol_attn_prepare; "
+            "Sol-Attn requires aiter with mha_v4_sol_attn and sol_attn_prepare; "
             "please update AITER")
     if device is None:
         if not torch.cuda.is_available():
@@ -76,116 +98,50 @@ def check_sol_attn_device(device=None):
 
 
 def check_sol_attn_supported(query, key, value, is_causal, ring_world_size=1):
-    """Validate a call against the per-call constraints of the gfx950 Sol-Attn kernel.
-
-    query/key/value are BSHD here (batch, seqlen, nheads, head_dim), i.e. already permuted out of
-    xDiT's BHSD convention. Raises SolAttnUnsupported with an actionable message, never returns False,
-    because each of these misconfigurations produces wrong output rather than a clean failure. Build
-    and device are not rechecked here; check_sol_attn_device covers those once at setup.
+    """Validate the per-call constraints aiter's Sol-Attn contract does not already cover.
     """
-    if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
-        raise SolAttnUnsupported("Sol-Attn expects 4D query/key/value")
-
-    b, sq, hq, d = query.shape
-    bk, sk, hk, dk = key.shape
-    bv, sv, hv, dv = value.shape
-    if not (b == bk == bv):
-        raise SolAttnUnsupported(f"batch mismatch: q={b} k={bk} v={bv}")
-    if sk != sv:
-        raise SolAttnUnsupported(f"key and value must share seqlen, got k={sk} v={sv}")
-    if hk != hv:
-        raise SolAttnUnsupported(f"key and value must share head count, got k={hk} v={hv}")
-    if not (d == dk == dv == _SUPPORTED_HEAD_DIM):
+    if not query.dtype == key.dtype == value.dtype == torch.bfloat16:
         raise SolAttnUnsupported(
-            f"Sol-Attn is a head_dim={_SUPPORTED_HEAD_DIM} kernel, got q={d} k={dk} v={dv}")
-    if hq % hk:
-        raise SolAttnUnsupported(f"nheads_q {hq} must be divisible by nheads_kv {hk}")
-    if not _is_pow2(hq // hk):
-        raise SolAttnUnsupported(
-            f"Sol-Attn needs a power-of-2 GQA ratio, got nheads_q={hq} / nheads_kv={hk} = {hq // hk}. "
-            f"The kernel finds the KV head by shifting right by floor(log2(ratio)), so q-heads "
-            f"{_misrouted_heads(hq, hk)} would read the wrong (often out-of-bounds) KV head, giving "
-            f"silently wrong output, NaNs, or a page fault. Use a head count whose ratio is a power of "
-            f"two, or select a different attention backend.")
+            f"Sol-Attn's mha_v4 row takes bf16 Q/K/V and returns bf16, got q={query.dtype} "
+            f"k={key.dtype} v={value.dtype}. Select another attention backend for other dtypes.")
     if is_causal:
         raise SolAttnUnsupported(
-            "Sol-Attn has no causal variant: its pooled correction assumes every skipped block is fully "
-            "attendable, which a causal mask breaks. Use AITER_FP8 for causal attention.")
+            "Sol-Attn has no causal variant: its pooled correction assumes every skipped block is "
+            "fully attendable, which a causal mask breaks. Use AITER_FP8 for causal attention.")
     if ring_world_size > 1:
         raise SolAttnUnsupported(
             "Sol-Attn does not support ring parallelism: merging partial outputs by LSE is not valid "
-            "once each rank has added a pooled correction for the blocks it skipped. Use ulysses_degree "
-            "for sequence parallelism instead.")
-    return b, sq, sk, hq, hk, d
-
-
-def _sol_attn_output_strides(shape):
-    """Strides of the BHSD output, which are fixed by the implementation rather than by the caller.
-    """
-    _, h, s, d = shape
-    return (h * s * d, d, h * d, 1)
-
-
-def _per_tensor_quant_fp8(x):
-    """Per-tensor fp8 e4m3 quantization returning (quantized, descale) with a 1-element descale."""
-    import aiter
-
-    quant, descale = aiter.per_tensor_quant(
-        x, scale=None, quant_dtype=aiter.dtypes.fp8, dtypeMax=torch.finfo(aiter.dtypes.fp8).max)
-    return quant, descale.reshape(1).float()
-
-
-@functools.lru_cache(maxsize=None)
-def _fp8_hadamard_for(device):
-    """(rotate_fn, matrix) for this device. The import stays deferred to avoid a module-level cycle
-    with attention_backend, so it is cached rather than re-resolved on every attention call.
-    """
-    from xfuser.core.distributed.attention_backend import (
-        FP8_HADAMARD_MATRIX,
-        _fp8_hadamard_rotate,
-    )
-
-    r = FP8_HADAMARD_MATRIX.get(device)
-    if r is None:
-        raise SolAttnUnsupported(
-            "No Hadamard matrix could be built for this device. The rotation is required by the "
-            "AITER_SOL_FP8 backend rather than optional, so there is no flag to disable it; please "
-            "update AITER or select a different attention backend.")
-    return _fp8_hadamard_rotate, r
+            "once each rank has added a pooled correction for the blocks it skipped. Use "
+            "ulysses_degree for sequence parallelism instead.")
 
 
 def _hadamard_rotate_qk(query, key):
     """Rotate Q and K by the shared orthonormal Hadamard matrix AITER_FP8 uses, along head_dim.
     """
-    rotate, r = _fp8_hadamard_for(query.device)
-    return rotate(query, r).contiguous(), rotate(key, r).contiguous()
+    r = _HADAMARD_MATRIX.get(query.device) if _HADAMARD_MATRIX is not None else None
+    if r is None:
+        raise SolAttnUnsupported(
+            "No Hadamard matrix could be built for this device. The rotation is required by the "
+            "AITER_SOL_FP8 backend rather than optional, so there is no flag to disable it; please "
+            "update AITER or select a different attention backend.")
+    return _HADAMARD_ROTATE(query, r).contiguous(), _HADAMARD_ROTATE(key, r).contiguous()
 
 
 def sol_attn_routing_for(q_fp8, k_fp8, v_fp8, beta):
-    """Pooled K/V, ragged LUT and selection bitmap for one call, as the kernel consumes them."""
-    from aiter.ops.triton.attention.utils import sol_attn_prepare
-
-    block_m, block_n = SOL_ATTN_BLOCK_SIZES
-    return sol_attn_prepare(q_fp8, k_fp8, v_fp8, beta=beta, BLOCK_M=block_m, BLOCK_N=block_n)
-
-
-def _head_cost_from_routing(prep):
-    """Per-head count of exactly-computed KV blocks, float32 (nheads_q,).
-
-    Accumulating in float32 via the sum rather than casting first matters here: the mask is dense
-    over the full q_tiles x kv_blocks grid, so a cast would allocate and write a 4x larger copy of
-    it on every call, which is the cost the block-sparse routing exists to avoid.
+    """Pooled K/V, ragged LUT and selection bitmap for one call, as the kernel consumes them.
     """
-    mask = prep["block_attn_mask"]  # (batch, nheads_q, num_q_tiles, num_kv_blocks) bool
+    return _AITER.prepare(q_fp8, k_fp8, v_fp8, beta, _AITER.ts_qo, _AITER.ts_kv)
+
+
+def _head_cost_from_routing(routing):
+    """Per-head count of exactly-computed KV blocks, float32 (nheads_q,).
+    """
+    mask = routing["block_attn_mask"]  # (batch, nheads_q, num_q_tiles, num_kv_blocks) bool
     return mask.sum(dim=(0, 2, 3), dtype=torch.float32)
 
 
 def _maybe_dump(path, query, key, value):
     """Save one call's BSHD q/k/v so kernel benchmarks can be replayed on real tensors.
-
-    Sparse attention quality is governed almost entirely by how concentrated the attention is, which
-    synthetic tensors do not reproduce, so being able to re-run the microbenchmark on captured operands
-    is what makes its accuracy numbers trustworthy. Only the first call is written.
     """
     if not path or getattr(_maybe_dump, "_done", False):
         return
@@ -193,21 +149,26 @@ def _maybe_dump(path, query, key, value):
     torch.save({"q": query.detach().cpu(), "k": key.detach().cpu(), "v": value.detach().cpu()}, path)
 
 
-def _sol_attn_bhsd_eager(query, key, value, is_causal=False, beta=1.0, softmax_scale=None,
-                         routing=None, ring_world_size=1, dump_path=None, hadamard=True):
-    """Sol-Attn over BHSD tensors, returning (BHSD output in the input dtype, per-head cost).
+def sol_attn_bhsd(query, key, value, is_causal=False, beta=1.0, softmax_scale=None,
+                  routing=None, ring_world_size=1, dump_path=None, hadamard=True,
+                  return_head_cost=False):
+    """Sol-Attn over BHSD tensors, returning (BHSD bf16 output, per-head cost or None).
 
-    query/key/value are (batch, nheads, seqlen, head_dim) high-precision tensors; they are permuted to
-    BSHD, quantized per tensor to fp8 e4m3, routed, and handed to the ASM kernel. `routing` may carry a
-    precomputed sol_attn_prepare dict to skip routing, in which case it must have been built from the
-    same quantized operands this call produces.
+    query/key/value are (batch, nheads, seqlen, head_dim) bf16 tensors. They are permuted into the
+    BSHD layout the kernel takes, optionally rotated, and handed to aiter's mha_v4 Sol-Attn
+    entrypoint, which owns quantization, routing, format validation and the ASM launch.
 
-    The second return value is the per-head count of exactly-computed KV blocks, float32 (nheads,); see
-    _head_cost_from_routing.
+    return_head_cost asks for the per-head count of exactly-computed KV blocks, float32 (nheads_q,),
+    which the Ulysses head balancer consumes. It is opt-in rather than free: the routing dict it
+    reduces is internal to the raw entrypoint, so asking for it moves this call onto aiter's packed
+    API and makes quantization and routing explicit here. A caller-supplied `routing` takes the same
+    path. Both are traceable; neither graph-breaks.
     """
-    from aiter.ops.mha import fmha_v3_fwd_sol_attn
+    if _AITER is None:
+        raise SolAttnUnsupported(
+            "Sol-Attn requires aiter with mha_v4_sol_attn and sol_attn_prepare; "
+            "please update AITER")
 
-    out_dtype = query.dtype
     query = query.permute(0, 2, 1, 3).contiguous()
     key = key.permute(0, 2, 1, 3).contiguous()
     value = value.permute(0, 2, 1, 3).contiguous()
@@ -215,133 +176,36 @@ def _sol_attn_bhsd_eager(query, key, value, is_causal=False, beta=1.0, softmax_s
     check_sol_attn_supported(query, key, value, is_causal, ring_world_size=ring_world_size)
     _maybe_dump(dump_path, query, key, value)
 
-    if softmax_scale is None:
-        softmax_scale = query.shape[-1] ** -0.5
-
-    # After the dump, so a dump captures the model's own operands rather than this backend's rotation of
-    # them, and before quantization, which is the whole point: the rotation shrinks the per-tensor amax.
+    # After the dump, so it captures the model's own operands rather than this backend's rotation of
+    # them, and before aiter quantizes, which is the whole point of rotating.
     if hadamard:
         query, key = _hadamard_rotate_qk(query, key)
 
-    q_fp8, q_descale = _per_tensor_quant_fp8(query)
-    k_fp8, k_descale = _per_tensor_quant_fp8(key)
-    v_fp8, v_descale = _per_tensor_quant_fp8(value)
+    if routing is None and not return_head_cost:
+        out = _AITER.sol_attn(query, key, value, beta, softmax_scale=softmax_scale)
+        return out.permute(0, 2, 1, 3), None
 
-    prep = routing if routing is not None else sol_attn_routing_for(q_fp8, k_fp8, v_fp8, beta)
-
-    out, _ = fmha_v3_fwd_sol_attn(
-        q_fp8,
-        k_fp8,
-        v_fp8,
-        softmax_scale,
-        prep["kv_block_indices"],
-        prep["lut_start"],
-        prep["lut_count"],
-        prep["mean_k"],
-        prep["mean_v"],
-        prep["block_bitmap"],
-        q_descale,
-        k_descale,
-        v_descale,
+    q_fp8, q_descale = _AITER.quantize_fp8(query)
+    k_fp8, k_descale = _AITER.quantize_fp8(key)
+    v_fp8, v_descale = _AITER.quantize_fp8(value)
+    if routing is None:
+        routing = sol_attn_routing_for(q_fp8, k_fp8, v_fp8, beta)
+    # One fp8 row, so every operand shares the format and a per-tensor scale, and the pooled K/V
+    # inherit K's: pooling can reuse a descale only because mean(x) * descale == mean(x * descale),
+    # which holds for a per-tensor scale and not for a per-block one.
+    fp8, scale = _AITER.native_fp8_format(), _AITER.per_tensor_scale
+    out = _AITER.sol_attn_packed(
+        q_fp8, k_fp8, v_fp8,
+        q_descale, k_descale, v_descale,
+        routing["mean_k"], routing["mean_v"],
+        routing["kv_block_indices"], routing["lut_start"], routing["lut_count"],
+        routing["block_bitmap"],
+        fp8, fp8, fp8,
+        scale, scale, scale,
+        fp8, scale,
+        softmax_scale=softmax_scale,
     )
-    out = out.to(out_dtype).permute(0, 2, 1, 3)
-    # Honour the layout contract the fake kernel declares (see _sol_attn_output_strides). The kernel
-    # writes a contiguous BSHD tensor, so the permute above already yields exactly these strides; this
-    # only repairs the layout if a dtype conversion or a future aiter output layout changes that. Getting
-    # it wrong surfaces as an opaque Inductor assert_size_stride failure, so it is checked here instead.
-    expected = _sol_attn_output_strides(out.shape)
-    if tuple(out.stride()) != expected:
-        out = out.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
-    return out, _head_cost_from_routing(prep)
-
-
-# torch.compile support.
-#
-# Dynamo must NOT trace into this. Two independent reasons, either of which is fatal:
-#
-#   1. aiter's fmha_v3_fwd_sol_attn has no fake/meta implementation. aiter's compile_ops accepts a
-#      gen_fake hook but this op does not pass one, so fake-tensor propagation falls through to the
-#      python stub, whose body is `...` and therefore returns None against a schema declaring Tensor[].
-#      That surfaces as: TypeError("Object of type 'NoneType' is not an instance of 'sequence'").
-#   2. More fundamentally, the routing has DATA-DEPENDENT output shapes. kv_block_indices is sized by
-#      how many blocks the threshold selected, which is a property of the operand values, not of their
-#      shapes. No fake tensor can express that, so no amount of fixing (1) would make the routing
-#      traceable.
-#
-# The whole quantize -> route -> kernel sequence is therefore wrapped as one opaque custom op. Only its
-# OUTPUT needs a fake, and that is static: same shape, dtype and device as the query. This matches how
-# xDiT already handles the flydsl attention kernel.
-_SOL_ATTN_OP_NAME = "xfuser::sol_attn_fp8"
-_HAS_SOL_ATTN_OP = False
-
-try:
-    from torch.library import custom_op as _custom_op
-
-    @_custom_op(_SOL_ATTN_OP_NAME, mutates_args=())
-    def _sol_attn_fp8_op(
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        is_causal: bool,
-        beta: float,
-        softmax_scale: float,
-        ring_world_size: int,
-        dump_path: str,
-        hadamard: bool,
-    ) -> typing.Tuple[torch.Tensor, torch.Tensor]:
-        return _sol_attn_bhsd_eager(
-            query,
-            key,
-            value,
-            is_causal=is_causal,
-            beta=beta,
-            softmax_scale=softmax_scale,
-            routing=None,
-            ring_world_size=ring_world_size,
-            dump_path=dump_path or None,
-            hadamard=hadamard,
-        )
-
-    @_sol_attn_fp8_op.register_fake
-    def _sol_attn_fp8_fake(query, key, value, is_causal, beta, softmax_scale, ring_world_size,
-                           dump_path, hadamard):
-        return (
-            torch.empty_strided(
-                tuple(query.shape), _sol_attn_output_strides(query.shape),
-                dtype=query.dtype, device=query.device),
-            torch.empty(query.shape[1], dtype=torch.float32, device=query.device),
-        )
-
-    _HAS_SOL_ATTN_OP = True
-except (ImportError, AttributeError):
-    # Older torch without torch.library.custom_op: the eager path still works, callers just cannot
-    # torch.compile through it.
-    pass
-
-
-def sol_attn_bhsd(query, key, value, is_causal=False, beta=1.0, softmax_scale=None,
-                  routing=None, ring_world_size=1, dump_path=None, hadamard=True):
-    """Sol-Attn over BHSD tensors, returning (BHSD output in the input dtype, per-head cost).
-
-    The per-head cost is float32 (nheads_q,), the number of exactly-computed KV blocks per head, for the
-    Ulysses head balancer; callers that do not balance can ignore it. It is returned unconditionally
-    rather than behind a flag because the op's schema is fixed, and it is cheap: a reduction over a mask
-    the routing has already materialized.
-
-    Routes through the opaque custom op so that torch.compile can call it without tracing the routing.
-    Caller-supplied `routing` cannot cross an op boundary (it is a dict of tensors with data-dependent
-    sizes), so that path stays eager and will graph-break under torch.compile.
-    """
-    if softmax_scale is None:
-        softmax_scale = query.shape[-1] ** -0.5
-    if routing is not None or not _HAS_SOL_ATTN_OP:
-        return _sol_attn_bhsd_eager(
-            query, key, value, is_causal=is_causal, beta=beta, softmax_scale=softmax_scale,
-            routing=routing, ring_world_size=ring_world_size, dump_path=dump_path,
-            hadamard=hadamard)
-    return torch.ops.xfuser.sol_attn_fp8(
-        query, key, value, is_causal, float(beta), float(softmax_scale), int(ring_world_size),
-        dump_path or "", bool(hadamard))
+    return out.permute(0, 2, 1, 3), _head_cost_from_routing(routing)
 
 
 def sol_attn_dump_path():

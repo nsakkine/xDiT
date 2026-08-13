@@ -1021,6 +1021,11 @@ def _aiter_sol_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_
     # the fp8 quantization error) drops. AITER_SPARGE_V2 hardcodes its rotation the same way.
     hadamard = True
     routing = (attention_kwargs or {}).get("sol_attn_routing")
+    # Per-head selected-block cost for the Ulysses head-balancer. USP injects a scratch "cost sink"
+    # tensor into attention_kwargs only when balancing is active, and its presence is what asks
+    # sol_attn_bhsd for the cost: computing it means routing explicitly instead of letting aiter's
+    # raw entrypoint route internally, so it is not free.
+    cost_sink = (attention_kwargs or {}).get(COST_SINK_KEY)
     # Ring parallelism is rejected once, at setup, by
     # RuntimeState._check_if_backend_compatible_with_current_configuration, so it is not re-queried per
     # call. That is not just to save the lookup: get_sp_group() asserts the group exists, and Dynamo
@@ -1037,8 +1042,8 @@ def _aiter_sol_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_
         ring_world_size=ring_world_size,
         dump_path=dump_path,
         hadamard=hadamard,
+        return_head_cost=cost_sink is not None,
     )
-    cost_sink = (attention_kwargs or {}).get(COST_SINK_KEY)
     if cost_sink is not None:
         cost_sink.copy_(head_cost)
     return output, None
