@@ -5,6 +5,7 @@ Sol-Attn (arXiv 2607.24027) computes the same selected blocks exactly and additi
 contribution of the skipped blocks from pooled (mean) K/V, so the mass outside the selection is
 approximated instead of discarded.s
 """
+import functools
 import typing
 
 import torch
@@ -29,44 +30,59 @@ def _misrouted_heads(nheads_q, nheads_kv):
     return [h for h in range(nheads_q) if (h >> shift) != h // ratio]
 
 
-def sol_attn_block_sizes():
-    """(BLOCK_M, BLOCK_N) the kernel's routing must be built with, taken from aiter, not hardcoded."""
-    from aiter.ops.triton.attention.utils import (
-        FMHA_FWD_V3_SOL_ATTN_TS_KV,
-        FMHA_FWD_V3_SOL_ATTN_TS_QO,
-    )
+def _probe_aiter():
+    """(entry points present, (BLOCK_M, BLOCK_N)) for the Sol-Attn kernel, resolved once at import.
 
-    return FMHA_FWD_V3_SOL_ATTN_TS_QO, FMHA_FWD_V3_SOL_ATTN_TS_KV
-
-
-def sol_attn_available():
-    """True when the aiter entry points and the gfx950 kernel are importable on this build."""
+    The tile sizes come from aiter rather than being hardcoded, and are None when the entry points
+    are missing. This module is itself imported lazily, only once the backend is selected, so builds
+    that never touch Sol-Attn pay nothing for the probe.
+    """
     try:
         from aiter.ops.mha import fmha_v3_fwd_sol_attn  # noqa: F401
-        from aiter.ops.triton.attention.utils import sol_attn_prepare  # noqa: F401
+        from aiter.ops.triton.attention.utils import (  # noqa: F401
+            FMHA_FWD_V3_SOL_ATTN_TS_KV,
+            FMHA_FWD_V3_SOL_ATTN_TS_QO,
+            sol_attn_prepare,
+        )
     except ImportError:
-        return False
-    return True
+        return False, None
+    return True, (FMHA_FWD_V3_SOL_ATTN_TS_QO, FMHA_FWD_V3_SOL_ATTN_TS_KV)
 
 
-def check_sol_attn_supported(query, key, value, is_causal, ring_world_size=1):
-    """Validate a call against every constraint of the gfx950 Sol-Attn kernel.
+SOL_ATTN_AVAILABLE, SOL_ATTN_BLOCK_SIZES = _probe_aiter()
 
-    query/key/value are BSHD here (batch, seqlen, nheads, head_dim), i.e. already permuted out of
-    xDiT's BHSD convention. Raises SolAttnUnsupported with an actionable message, never returns False,
-    because each of these misconfigurations produces wrong output rather than a clean failure.
+
+def check_sol_attn_device(device=None):
+    """Raise unless this build and device can run Sol-Attn. Defaults to the current CUDA device.
+
+    Both facts are fixed for the process, so runtime_state calls this once during backend setup and
+    the per-call path does not repeat it. Callers reaching sol_attn_bhsd directly, outside xDiT's
+    setup, should call it themselves.
     """
-    if not sol_attn_available():
+    if not SOL_ATTN_AVAILABLE:
         raise SolAttnUnsupported(
-            "Sol-Attn requires aiter with fmha_v3_fwd_sol_attn and sol_attn_prepare; please update AITER")
-
-    if query.device.type != "cuda":
-        raise SolAttnUnsupported(f"Sol-Attn is a GPU kernel, got device {query.device}")
-    arch = torch.cuda.get_device_properties(query.device).gcnArchName or ""
+            "Sol-Attn requires aiter with fmha_v3_fwd_sol_attn and sol_attn_prepare; "
+            "please update AITER")
+    if device is None:
+        if not torch.cuda.is_available():
+            raise SolAttnUnsupported("Sol-Attn is a GPU kernel and no CUDA device is available")
+        device = torch.device("cuda", torch.cuda.current_device())
+    if device.type != "cuda":
+        raise SolAttnUnsupported(f"Sol-Attn is a GPU kernel, got device {device}")
+    arch = torch.cuda.get_device_properties(device).gcnArchName or ""
     if not arch.startswith(_SUPPORTED_ARCH):
         raise SolAttnUnsupported(
             f"Sol-Attn ships only a {_SUPPORTED_ARCH} kernel, this device reports '{arch}'")
 
+
+def check_sol_attn_supported(query, key, value, is_causal, ring_world_size=1):
+    """Validate a call against the per-call constraints of the gfx950 Sol-Attn kernel.
+
+    query/key/value are BSHD here (batch, seqlen, nheads, head_dim), i.e. already permuted out of
+    xDiT's BHSD convention. Raises SolAttnUnsupported with an actionable message, never returns False,
+    because each of these misconfigurations produces wrong output rather than a clean failure. Build
+    and device are not rechecked here; check_sol_attn_device covers those once at setup.
+    """
     if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
         raise SolAttnUnsupported("Sol-Attn expects 4D query/key/value")
 
@@ -119,37 +135,49 @@ def _per_tensor_quant_fp8(x):
     return quant, descale.reshape(1).float()
 
 
-def _hadamard_rotate_qk(query, key):
-    """Rotate Q and K by the shared orthonormal Hadamard matrix AITER_FP8 uses, along head_dim.
+@functools.lru_cache(maxsize=None)
+def _fp8_hadamard_for(device):
+    """(rotate_fn, matrix) for this device. The import stays deferred to avoid a module-level cycle
+    with attention_backend, so it is cached rather than re-resolved on every attention call.
     """
     from xfuser.core.distributed.attention_backend import (
         FP8_HADAMARD_MATRIX,
         _fp8_hadamard_rotate,
     )
 
-    r = FP8_HADAMARD_MATRIX[query.device]
+    r = FP8_HADAMARD_MATRIX.get(device)
     if r is None:
         raise SolAttnUnsupported(
             "No Hadamard matrix could be built for this device. The rotation is required by the "
             "AITER_SOL_FP8 backend rather than optional, so there is no flag to disable it; please "
             "update AITER or select a different attention backend.")
-    return (_fp8_hadamard_rotate(query, r).contiguous(),
-            _fp8_hadamard_rotate(key, r).contiguous())
+    return _fp8_hadamard_rotate, r
+
+
+def _hadamard_rotate_qk(query, key):
+    """Rotate Q and K by the shared orthonormal Hadamard matrix AITER_FP8 uses, along head_dim.
+    """
+    rotate, r = _fp8_hadamard_for(query.device)
+    return rotate(query, r).contiguous(), rotate(key, r).contiguous()
 
 
 def sol_attn_routing_for(q_fp8, k_fp8, v_fp8, beta):
     """Pooled K/V, ragged LUT and selection bitmap for one call, as the kernel consumes them."""
     from aiter.ops.triton.attention.utils import sol_attn_prepare
 
-    block_m, block_n = sol_attn_block_sizes()
+    block_m, block_n = SOL_ATTN_BLOCK_SIZES
     return sol_attn_prepare(q_fp8, k_fp8, v_fp8, beta=beta, BLOCK_M=block_m, BLOCK_N=block_n)
 
 
 def _head_cost_from_routing(prep):
     """Per-head count of exactly-computed KV blocks, float32 (nheads_q,).
+
+    Accumulating in float32 via the sum rather than casting first matters here: the mask is dense
+    over the full q_tiles x kv_blocks grid, so a cast would allocate and write a 4x larger copy of
+    it on every call, which is the cost the block-sparse routing exists to avoid.
     """
     mask = prep["block_attn_mask"]  # (batch, nheads_q, num_q_tiles, num_kv_blocks) bool
-    return mask.to(torch.float32).sum(dim=(0, 2, 3))
+    return mask.sum(dim=(0, 2, 3), dtype=torch.float32)
 
 
 def _maybe_dump(path, query, key, value):
