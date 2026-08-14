@@ -58,6 +58,19 @@ def _check_aiter_fp8_has_descale():
         AITER_FP8_HAS_DESCALE = False
     return AITER_FP8_HAS_DESCALE
 
+def _check_aiter_mha_v4():
+    """aiter's dense mha_v4 entry point and native fp8 format, or (None, None) on older builds.
+
+    native_fp8_format is kept as a callable rather than called here because it queries the
+    device, which import time is too early for. It is lru_cached inside aiter, so calling it
+    per attention call is free.
+    """
+    try:
+        from aiter.ops.mha_v4 import mha_v4, native_fp8_format
+    except ImportError:
+        return None, None
+    return mha_v4, native_fp8_format
+
 def _check_aiter_sage_supports_ring():
     try:
         parameters = inspect.signature(fav3_sage_wrapper_func).parameters
@@ -376,6 +389,7 @@ if env_info["has_aiter"]:
     AITER_FP8_STATIC_SCALE_WITH_DESCALE, AITER_FP8_STATIC_SCALE_NO_DESCALE, AITER_SAGE_V2_BLOCK_R = _setup_aiter_environment_variables()
     AITER_HAS_ROUND_MODE, HOW_V3_BF16_CVT = _check_aiter_round_mode()
     AITER_FP8_HAS_DESCALE = _check_aiter_fp8_has_descale()
+    AITER_MHA_V4_DENSE, AITER_MHA_V4_FP8_FORMAT = _check_aiter_mha_v4()
     AITER_SAGE_SUPPORTS_RING = _check_aiter_sage_supports_ring()
     AITER_SAGE_V2_SUPPORTS_RING = _check_aiter_sage_v2_supports_ring()
     AITER_FLYDSL_GENERALIZED = _check_aiter_flydsl_generalized()
@@ -958,6 +972,25 @@ def _aiter_fp8_varlen_attention_kernel_fake(
     return torch.empty_like(query)
 
 
+def _aiter_mha_v4_fp8_eligible(query_bshd, key_bshd, value_bshd, is_causal):
+    """Whether aiter's dense mha_v4 fp8 row can serve this call.
+
+    mha_v4 quantizes internally and ships a fake for every op it launches, so eligible calls
+    skip xfuser::aiter_fp8_attention and stay traceable under fullgraph compile. The row is
+    bf16-in/bf16-out, dense, non-causal, head_dim 128 and equal Q/K/V head counts, so causal
+    and GQA calls keep going through the v3 kernel. The head_dim and dtype guards cannot fire
+    today because the Hadamard pre-pass above already needs bf16 at head_dim 128, but they
+    keep v4 off shapes it cannot serve if that pre-pass is ever generalized.
+    """
+    if AITER_MHA_V4_DENSE is None or is_causal:
+        return False
+    if not query_bshd.shape[-1] == key_bshd.shape[-1] == value_bshd.shape[-1] == 128:
+        return False
+    if not query_bshd.shape[2] == key_bshd.shape[2] == value_bshd.shape[2]:
+        return False
+    return query_bshd.dtype == key_bshd.dtype == value_bshd.dtype == torch.bfloat16
+
+
 @register_attention_function(AttentionBackendType.AITER_FP8)
 def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
     """
@@ -998,6 +1031,17 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
             head_dim**-0.5,
             is_causal,
         ).reshape(batch_size, sequence_length, num_heads, head_dim)
+    elif _aiter_mha_v4_fp8_eligible(query, key, value, is_causal):
+        fp8 = AITER_MHA_V4_FP8_FORMAT()
+        output = AITER_MHA_V4_DENSE(
+            query,
+            key,
+            value,
+            fp8,
+            fp8,
+            fp8,
+            softmax_scale=query.shape[-1] ** -0.5,
+        )
     else:
         output = _aiter_fp8_attention_kernel(
             query,
