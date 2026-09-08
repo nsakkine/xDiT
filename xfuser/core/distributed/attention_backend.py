@@ -1,29 +1,65 @@
 import functools
+from dataclasses import dataclass, replace
 import torch
 import inspect
 import math
 import torch.nn.functional as F
 from enum import Enum
 from xfuser.envs import PACKAGES_CHECKER, environment_variables
-from xfuser.core.sparse_attention.ssta import (
+from xfuser.core.distributed.ssta import (
     setup_ssta,
     get_sparse_mask,
     untile_ssta_output,
     expand_block_mask,
 )
 from xfuser.core.distributed import get_ulysses_parallel_world_size, get_ring_parallel_world_size
-from xfuser.core.sparse_attention.sparge import (
+from xfuser.core.sparge_attention.sparge import (
     setup_sparge,
     compute_sparge_block_mask,
     restore_sparge_output,
     mask_padded_kv_blocks,
 )
-from xfuser.core.sparse_attention.head_balance import COST_SINK_KEY
+from xfuser.core.sparge_attention.head_balance import COST_SINK_KEY
 from xfuser.logger import init_logger
 
 logger = init_logger(__name__)
 
 ATTENTION_FUNCTION_REGISTRY = {}
+
+
+@dataclass(frozen=True)
+class _AiterMhaV4Capabilities:
+    enabled: bool = False
+    is_gfx942: bool = False
+    block_mask: bool = False
+    mxfp8_block_mask: bool = False
+    kv_tile: int = 128
+
+
+_AITER_MHA_V4 = _AiterMhaV4Capabilities()
+
+
+def _probe_aiter_mha_v4_capabilities(mha_v4_fn) -> _AiterMhaV4Capabilities:
+    arch_name = (
+        torch.cuda.get_device_properties(0).gcnArchName
+        if torch.cuda.is_available()
+        else ""
+    )
+    is_gfx942 = "gfx942" in arch_name
+    enabled = is_gfx942 or "gfx950" in arch_name
+    block_mask = inspect.signature(mha_v4_fn).parameters.get("block_mask") is not None
+    try:
+        from aiter.ops.mha_v4 import mha_v4_kv_tile as _aiter_mha_v4_kv_tile
+        kv_tile = int(_aiter_mha_v4_kv_tile())
+    except ImportError:
+        kv_tile = 64 if is_gfx942 else 128
+    return _AiterMhaV4Capabilities(
+        enabled=enabled,
+        is_gfx942=is_gfx942,
+        block_mask=block_mask,
+        kv_tile=kv_tile,
+    )
+
 
 def _setup_aiter_environment_variables():
     AITER_FP8_STATIC_SCALE_WITH_DESCALE = environment_variables["AITER_FP8_STATIC_SCALE_WITH_DESCALE"]()
@@ -57,19 +93,6 @@ def _check_aiter_fp8_has_descale():
     except (AttributeError, TypeError):
         AITER_FP8_HAS_DESCALE = False
     return AITER_FP8_HAS_DESCALE
-
-def _check_aiter_mha_v4():
-    """aiter's dense mha_v4 entry point and native fp8 format, or (None, None) on older builds.
-
-    native_fp8_format is kept as a callable rather than called here because it queries the
-    device, which import time is too early for. It is lru_cached inside aiter, so calling it
-    per attention call is free.
-    """
-    try:
-        from aiter.ops.mha_v4 import mha_v4, native_fp8_format
-    except ImportError:
-        return None, None
-    return mha_v4, native_fp8_format
 
 def _check_aiter_sage_supports_ring():
     try:
@@ -386,19 +409,62 @@ if env_info["has_aiter"]:
     except ImportError:
         pass # Error is rasied in runtime_state.py if AITER_SPARSE_SAGE is not available.
 
+    try:
+        from aiter.ops.mha_v4 import (
+            AttentionFormat as _AiterAttentionFormat,
+            AttentionScaleMode as _AiterAttentionScaleMode,
+            mha_v4 as _aiter_mha_v4,
+            mha_v4_packed as _aiter_mha_v4_packed,
+            mha_v4_q_multiplier as _aiter_mha_v4_q_multiplier,
+            native_fp8_format as _aiter_native_fp8_format,
+            quantize_fp8 as _aiter_quantize_fp8,
+            quantize_mxfp8_k as _aiter_quantize_mxfp8_k,
+            quantize_mxfp8_q as _aiter_quantize_mxfp8_q,
+        )
+        _AITER_MHA_V4 = _probe_aiter_mha_v4_capabilities(_aiter_mha_v4)
+    except ImportError:
+        pass # Error is raised in runtime_state.py when an MHA v4 backend is selected.
+
+    # MXFP8 shipped after the base MHA v4 API; keep it optional for older AITER builds.
+    try:
+        from aiter.ops.mha_v4 import (
+            mha_v4_mxfp8 as _aiter_mha_v4_mxfp8,
+        )
+        _AITER_MHA_V4 = replace(
+            _AITER_MHA_V4,
+            mxfp8_block_mask=(
+                inspect.signature(_aiter_mha_v4_mxfp8).parameters.get("block_mask")
+                is not None
+            ),
+        )
+    except ImportError:
+        pass # Error is raised in runtime_state.py when AITER_MXFP8 is selected.
+
     AITER_FP8_STATIC_SCALE_WITH_DESCALE, AITER_FP8_STATIC_SCALE_NO_DESCALE, AITER_SAGE_V2_BLOCK_R = _setup_aiter_environment_variables()
     AITER_HAS_ROUND_MODE, HOW_V3_BF16_CVT = _check_aiter_round_mode()
     AITER_FP8_HAS_DESCALE = _check_aiter_fp8_has_descale()
-    AITER_MHA_V4_DENSE, AITER_MHA_V4_FP8_FORMAT = _check_aiter_mha_v4()
     AITER_SAGE_SUPPORTS_RING = _check_aiter_sage_supports_ring()
     AITER_SAGE_V2_SUPPORTS_RING = _check_aiter_sage_v2_supports_ring()
     AITER_FLYDSL_GENERALIZED = _check_aiter_flydsl_generalized()
     # sage_v2 relies on aiter's own matrix and has no Sylvester fallback (None
     # disables hadamard_rotation when create_hadamard_matrix is unavailable).
     HADAMARD_MATRIX = _aiter_hadamard_matrix(AITER_SAGE_V2_BLOCK_R, allow_sylvester_fallback=False)
-    # Own Hadamard matrix for the fp8 paths (separate from sage_v2's);
-    # block_r = 128 = head_dim (full-head rotation). Sylvester fallback allowed.
+    # 128-blocked FP8 Hadamard matrix (per-device), used by every model with
+    # head_dim a multiple of 128.
     FP8_HADAMARD_MATRIX = _aiter_hadamard_matrix(128)
+    # Extra FP8 Hadamard matrices for smaller power-of-two head dims (e.g. LTX-2.5
+    # audio head_dim=64), built lazily and keyed by head_dim.
+    _FP8_HADAMARD_MATRICES: dict = {}
+
+    def _get_fp8_hadamard_matrix(head_dim: int, device: torch.device) -> torch.Tensor:
+        # 128-blocked rotation for head_dim that is a multiple of 128 (all existing
+        # models); full-head rotation for smaller power-of-two dims (audio=64).
+        if head_dim % 128 == 0:
+            return FP8_HADAMARD_MATRIX[device]
+        if head_dim not in _FP8_HADAMARD_MATRICES:
+            _FP8_HADAMARD_MATRICES[head_dim] = _aiter_hadamard_matrix(head_dim)
+        return _FP8_HADAMARD_MATRICES[head_dim][device]
+
     _TRITON_SSTA_BLOCK_SIZE = 128
     
 
@@ -554,13 +620,27 @@ class AttentionBackendType(Enum):
     SAGE = "Sage Attention"
     FLEX_BLOCK_ATTN = "Flex Block Attention"
     AITER = "AITER"
+    AITER_MLA = "AITER MLA" # deprecated, use AITER_FP8
+    AITER_I8FP8 = "AITER I8FP8"
     AITER_FP8 = "AITER FP8"
-    AITER_MLA = "AITER MLA"
+    AITER_MXFP8 = "AITER MXFP8"
+    AITER_F8F6 = "AITER F8F6"
+    AITER_MXFP6 = "AITER MXFP6"
+    AITER_F6F4 = "AITER F6F4"
+    AITER_MXFP4 = "AITER MXFP4"
+    AITER_F4F4 = "AITER F4F4"
+    AITER_I8FP8_SPARGE = "AITER I8FP8 Sparge"
+    AITER_FP8_SPARGE = "AITER FP8 Sparge"
+    AITER_MXFP8_SPARGE = "AITER MXFP8 Sparge"
+    AITER_F8F6_SPARGE = "AITER F8F6 Sparge"
+    AITER_MXFP6_SPARGE = "AITER MXFP6 Sparge"
+    AITER_F6F4_SPARGE = "AITER F6F4 Sparge"
+    AITER_MXFP4_SPARGE = "AITER MXFP4 Sparge"
+    AITER_F4F4_SPARGE = "AITER F4F4 Sparge"
     AITER_SAGE = "AITER Sage"
     AITER_SPARSE_SAGE = "AITER Sparse Sage"
     AITER_SAGE_V2 = "AITER Sage V2"
     AITER_SPARSE_SAGE_V2 = "AITER Sparse Sage V2"
-    AITER_SOL_FP8 = "AITER Sol FP8"
     AITER_SPARGE = "AITER Sparge"
     AITER_SPARGE_V2 = "AITER Sparge V2"
     AITER_VSA = "AITER VSA CK"
@@ -568,6 +648,46 @@ class AttentionBackendType(Enum):
     AITER_FLYDSL = "AITER FlyDSL"
     AITER_FLYDSL_FP8 = "AITER FlyDSL FP8"
     NPU = "NPU"
+
+
+AITER_LOW_PRECISION_BACKENDS = (
+    AttentionBackendType.AITER_I8FP8,
+    AttentionBackendType.AITER_FP8,
+    AttentionBackendType.AITER_MXFP8,
+    AttentionBackendType.AITER_F8F6,
+    AttentionBackendType.AITER_MXFP6,
+    AttentionBackendType.AITER_F6F4,
+    AttentionBackendType.AITER_MXFP4,
+    AttentionBackendType.AITER_F4F4,
+)
+AITER_MHA_V4_SPARGE_BACKENDS = (
+    AttentionBackendType.AITER_I8FP8_SPARGE,
+    AttentionBackendType.AITER_FP8_SPARGE,
+    AttentionBackendType.AITER_MXFP8_SPARGE,
+    AttentionBackendType.AITER_F8F6_SPARGE,
+    AttentionBackendType.AITER_MXFP6_SPARGE,
+    AttentionBackendType.AITER_F6F4_SPARGE,
+    AttentionBackendType.AITER_MXFP4_SPARGE,
+    AttentionBackendType.AITER_F4F4_SPARGE,
+)
+AITER_MHA_V4_ONLY_BACKENDS = tuple(
+    backend
+    for backend in AITER_LOW_PRECISION_BACKENDS
+    if backend != AttentionBackendType.AITER_FP8
+)
+AITER_MHA_V4_ONLY_BACKEND_SET = frozenset(AITER_MHA_V4_ONLY_BACKENDS)
+AITER_MHA_V4_SPARGE_BACKEND_SET = frozenset(AITER_MHA_V4_SPARGE_BACKENDS)
+AITER_MHA_V4_GFX942_SPARGE_BACKENDS = (
+    AttentionBackendType.AITER_I8FP8_SPARGE,
+    AttentionBackendType.AITER_FP8_SPARGE,
+)
+AITER_MHA_V4_GFX942_SPARGE_BACKEND_SET = frozenset(AITER_MHA_V4_GFX942_SPARGE_BACKENDS)
+
+
+def _mha_v4_sparge_tile():
+    """Return Sparge tile sizes matching the active MHA v4 sparse KV geometry."""
+    return {"BLOCK_M": 256, "BLOCK_N": _AITER_MHA_V4.kv_tile}
+
 
 def register_attention_function(backend_type):
     """
@@ -589,8 +709,9 @@ def _varlen_pack_keys(query_bshd, key_bshd, value_bshd, attention_kwargs):
     if indices_k is None:
         return None
     B, S, H, D = query_bshd.shape
-    k_flat = key_bshd.reshape(B * S, H, D)
-    v_flat = value_bshd.reshape(B * S, H, D)
+    Sk = key_bshd.shape[1]  # key seqlen may differ from query in cross-attention
+    k_flat = key_bshd.reshape(B * Sk, H, D)
+    v_flat = value_bshd.reshape(B * Sk, H, D)
     k_packed = torch.index_select(k_flat, 0, indices_k)
     v_packed = torch.index_select(v_flat, 0, indices_k)
     cu_seqlens_q = torch.arange(0, B + 1, dtype=torch.int32, device=query_bshd.device) * S
@@ -877,14 +998,7 @@ def _quantize_aiter_fp8_inputs(query, key, value):
     )
 
 
-@torch.library.custom_op("xfuser::aiter_fp8_attention", mutates_args=())
-def _aiter_fp8_attention_kernel(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    softmax_scale: float,
-    is_causal: bool,
-) -> torch.Tensor:
+def _aiter_fp8_dense_attention(query, key, value, softmax_scale, is_causal):
     quant_q, quant_k, quant_v, q_descale, k_descale, v_descale = (
         _quantize_aiter_fp8_inputs(query, key, value)
     )
@@ -903,17 +1017,6 @@ def _aiter_fp8_attention_kernel(
         softmax_scale=softmax_scale,
         **kwargs,
     )
-
-
-@_aiter_fp8_attention_kernel.register_fake
-def _aiter_fp8_attention_kernel_fake(
-    query,
-    key,
-    value,
-    softmax_scale,
-    is_causal,
-):
-    return torch.empty_like(query)
 
 
 @torch.library.custom_op("xfuser::aiter_fp8_varlen_attention", mutates_args=())
@@ -972,23 +1075,24 @@ def _aiter_fp8_varlen_attention_kernel_fake(
     return torch.empty_like(query)
 
 
-def _aiter_mha_v4_fp8_eligible(query_bshd, key_bshd, value_bshd, is_causal):
-    """Whether aiter's dense mha_v4 fp8 row can serve this call.
+def _validate_aiter_low_precision_dropout(dropout_p):
+    if dropout_p != 0.0:
+        raise NotImplementedError("AITER low-precision attention does not support dropout")
 
-    mha_v4 quantizes internally and ships a fake for every op it launches, so eligible calls
-    skip xfuser::aiter_fp8_attention and stay traceable under fullgraph compile. The row is
-    bf16-in/bf16-out, dense, non-causal, head_dim 128 and equal Q/K/V head counts, so causal
-    and GQA calls keep going through the v3 kernel. The head_dim and dtype guards cannot fire
-    today because the Hadamard pre-pass above already needs bf16 at head_dim 128, but they
-    keep v4 off shapes it cannot serve if that pre-pass is ever generalized.
-    """
-    if AITER_MHA_V4_DENSE is None or is_causal:
-        return False
-    if not query_bshd.shape[-1] == key_bshd.shape[-1] == value_bshd.shape[-1] == 128:
-        return False
-    if not query_bshd.shape[2] == key_bshd.shape[2] == value_bshd.shape[2]:
-        return False
-    return query_bshd.dtype == key_bshd.dtype == value_bshd.dtype == torch.bfloat16
+
+def _validate_aiter_mha_v4_request(dropout_p, is_causal):
+    _validate_aiter_low_precision_dropout(dropout_p)
+    if is_causal:
+        raise NotImplementedError("MHA v4 does not support causal masking")
+
+
+def _use_aiter_mha_v4_fp8(query, is_causal):
+    return (
+        _AITER_MHA_V4.enabled
+        and query.is_cuda
+        and query.shape[-1] == 128
+        and not is_causal
+    )
 
 
 @register_attention_function(AttentionBackendType.AITER_FP8)
@@ -997,100 +1101,436 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
     Performs the necessary tensor permutes and
     then calls attention through AITER
     """
+    _validate_aiter_low_precision_dropout(dropout_p)
     query = torch.permute(query, [0, 2, 1, 3]).contiguous()
     key = torch.permute(key, [0, 2, 1, 3]).contiguous()
     value = torch.permute(value, [0, 2, 1, 3]).contiguous()
 
-    # Hadamard-rotate Q,K before quant: QK-preserving (kernel unchanged), cuts fp8 quant error.
-    R = FP8_HADAMARD_MATRIX[query.device]
-    query = _fp8_hadamard_rotate(query, R).contiguous()
-    key = _fp8_hadamard_rotate(key, R).contiguous()
-
     packed = _varlen_pack_keys(query, key, value, attention_kwargs)
-    if packed is not None:
-        (
+    use_mha_v4 = packed is None and _use_aiter_mha_v4_fp8(query, is_causal)
+    if use_mha_v4:
+        # The raw MHA v4 API owns canonical Q/K rotation and FP8 quantization.
+        fp8_format = _aiter_native_fp8_format()
+        output = _aiter_mha_v4(
             query,
             key,
             value,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_k,
-            batch_size,
-            sequence_length,
-            num_heads,
-            head_dim,
-        ) = packed
-        output = _aiter_fp8_varlen_attention_kernel(
-            query,
-            key,
-            value,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            sequence_length,
-            max_seqlen_k,
-            head_dim**-0.5,
-            is_causal,
-        ).reshape(batch_size, sequence_length, num_heads, head_dim)
-    elif _aiter_mha_v4_fp8_eligible(query, key, value, is_causal):
-        fp8 = AITER_MHA_V4_FP8_FORMAT()
-        output = AITER_MHA_V4_DENSE(
-            query,
-            key,
-            value,
-            fp8,
-            fp8,
-            fp8,
-            softmax_scale=query.shape[-1] ** -0.5,
+            fp8_format,
+            fp8_format,
+            fp8_format,
         )
     else:
-        output = _aiter_fp8_attention_kernel(
-            query,
-            key,
-            value,
-            query.shape[-1] ** -0.5,
-            is_causal,
-        )
+        if packed is not None:
+            (
+                query,
+                key,
+                value,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_k,
+                batch_size,
+                sequence_length,
+                num_heads,
+                head_dim,
+            ) = packed
+
+        # Varlen and legacy FP8 attention expect pre-rotated Q/K.
+        R = _get_fp8_hadamard_matrix(query.shape[-1], query.device)
+        query = _fp8_hadamard_rotate(query, R).contiguous()
+        key = _fp8_hadamard_rotate(key, R).contiguous()
+
+        if packed is not None:
+            output = _aiter_fp8_varlen_attention_kernel(
+                query,
+                key,
+                value,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                sequence_length,
+                max_seqlen_k,
+                head_dim**-0.5,
+                is_causal,
+            ).reshape(batch_size, sequence_length, num_heads, head_dim)
+        else:
+            output = _aiter_fp8_dense_attention(
+                query,
+                key,
+                value,
+                query.shape[-1] ** -0.5,
+                is_causal,
+            )
 
     output = torch.permute(output, [0, 2, 1, 3])
     return output, None
 
-@register_attention_function(AttentionBackendType.AITER_SOL_FP8)
-def _aiter_sol_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
-    from xfuser.core.sparse_attention.sol import sol_attn_bhsd, sol_attn_dump_path
 
-    beta = float((attention_kwargs or {}).get("solattn_beta", 0.5))
-    dump_path = sol_attn_dump_path()
-    # The Hadamard rotation is a property of this fp8 variant, not a user knob: it is orthonormal and
-    # applied to both Q and K, so scores and routing are unchanged while the per-tensor amax (and hence
-    # the fp8 quantization error) drops. AITER_SPARGE_V2 hardcodes its rotation the same way.
-    hadamard = True
-    routing = (attention_kwargs or {}).get("sol_attn_routing")
-    # Per-head selected-block cost for the Ulysses head-balancer. USP injects a scratch "cost sink"
-    # tensor into attention_kwargs only when balancing is active, and its presence is what asks
-    # sol_attn_bhsd for the cost: computing it means routing explicitly instead of letting aiter's
-    # raw entrypoint route internally, so it is not free.
-    cost_sink = (attention_kwargs or {}).get(COST_SINK_KEY)
-    # Ring parallelism is rejected once, at setup, by
-    # RuntimeState._check_if_backend_compatible_with_current_configuration, so it is not re-queried per
-    # call. That is not just to save the lookup: get_sp_group() asserts the group exists, and Dynamo
-    # refuses to compile a graph containing an assertion it cannot prove, which would break
-    # torch.compile for every model using this backend.
-    ring_world_size = 1
-    output, head_cost = sol_attn_bhsd(
+def _aiter_mixed_attn_call(
+    query, key, value, qk_format, v_format, dropout_p, is_causal
+):
+    _validate_aiter_mha_v4_request(dropout_p, is_causal)
+    query = torch.permute(query, [0, 2, 1, 3]).contiguous()
+    key = torch.permute(key, [0, 2, 1, 3]).contiguous()
+    value = torch.permute(value, [0, 2, 1, 3]).contiguous()
+
+    output = _aiter_mha_v4(
         query,
         key,
         value,
-        is_causal=is_causal,
-        beta=beta,
-        routing=routing,
-        ring_world_size=ring_world_size,
-        dump_path=dump_path,
-        hadamard=hadamard,
-        return_head_cost=cost_sink is not None,
+        qk_format,
+        qk_format,
+        v_format,
     )
-    if cost_sink is not None:
-        cost_sink.copy_(head_cost)
+    output = torch.permute(output, [0, 2, 1, 3])
     return output, None
+
+
+@register_attention_function(AttentionBackendType.AITER_I8FP8)
+def _aiter_i8fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Run the AITER INT8 Q/K and FP8 V recipe."""
+    return _aiter_mixed_attn_call(
+        query,
+        key,
+        value,
+        _AiterAttentionFormat.INT8,
+        _aiter_native_fp8_format(),
+        dropout_p,
+        is_causal,
+    )
+
+
+@register_attention_function(AttentionBackendType.AITER_MXFP8)
+def _aiter_mxfp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Run the AITER MXFP8 Q/K and per-tensor FP8 V recipe."""
+    _validate_aiter_mha_v4_request(dropout_p, is_causal)
+    query = torch.permute(query, [0, 2, 1, 3]).contiguous()
+    key = torch.permute(key, [0, 2, 1, 3]).contiguous()
+    value = torch.permute(value, [0, 2, 1, 3]).contiguous()
+    output = _aiter_mha_v4_mxfp8(query, key, value)
+    return torch.permute(output, [0, 2, 1, 3]), None
+
+
+@register_attention_function(AttentionBackendType.AITER_F8F6)
+def _aiter_f8f6_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Run the AITER per-tensor FP8 Q/K and MXFP6 V recipe."""
+    fp8_format = _aiter_native_fp8_format()
+    return _aiter_mixed_attn_call(
+        query,
+        key,
+        value,
+        fp8_format,
+        _AiterAttentionFormat.MXFP6,
+        dropout_p,
+        is_causal,
+    )
+
+
+@register_attention_function(AttentionBackendType.AITER_MXFP4)
+def _aiter_mxfp4_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Run the AITER MXFP4 Q/K and FP8 V recipe."""
+    return _aiter_mixed_attn_call(
+        query,
+        key,
+        value,
+        _AiterAttentionFormat.MXFP4,
+        _aiter_native_fp8_format(),
+        dropout_p,
+        is_causal,
+    )
+
+
+@register_attention_function(AttentionBackendType.AITER_F4F4)
+def _aiter_f4f4_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Run the AITER MXFP4 Q/K/V recipe."""
+    return _aiter_mixed_attn_call(
+        query,
+        key,
+        value,
+        _AiterAttentionFormat.MXFP4,
+        _AiterAttentionFormat.MXFP4,
+        dropout_p,
+        is_causal,
+    )
+
+
+@register_attention_function(AttentionBackendType.AITER_MXFP6)
+def _aiter_mxfp6_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Run the AITER MXFP6 Q/K and FP8 V recipe."""
+    return _aiter_mixed_attn_call(
+        query,
+        key,
+        value,
+        _AiterAttentionFormat.MXFP6,
+        _aiter_native_fp8_format(),
+        dropout_p,
+        is_causal,
+    )
+
+
+@register_attention_function(AttentionBackendType.AITER_F6F4)
+def _aiter_f6f4_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Run the AITER MXFP6 Q/K and MXFP4 V recipe."""
+    return _aiter_mixed_attn_call(
+        query,
+        key,
+        value,
+        _AiterAttentionFormat.MXFP6,
+        _AiterAttentionFormat.MXFP4,
+        dropout_p,
+        is_causal,
+    )
+
+
+def _validate_aiter_mha_v4_sparge_request(
+    query,
+    key,
+    value,
+    dropout_p,
+    is_causal,
+    attention_kwargs,
+    *,
+    qk_format=None,
+    v_format=None,
+    mxfp8=False,
+):
+    _validate_aiter_mha_v4_request(dropout_p, is_causal)
+    if not _AITER_MHA_V4.block_mask:
+        raise RuntimeError(
+            "MHA v4 Sparge requires an AITER build whose mha_v4 accepts block_mask"
+        )
+    if not _AITER_MHA_V4.enabled:
+        raise RuntimeError("MHA v4 Sparge attention requires gfx950 or gfx942")
+    if _AITER_MHA_V4.is_gfx942 and (
+        mxfp8
+        or qk_format not in (
+            _aiter_native_fp8_format(),
+            _AiterAttentionFormat.INT8,
+        )
+        or v_format != _aiter_native_fp8_format()
+    ):
+        raise NotImplementedError(
+            "MHA v4 Sparge on gfx942 currently supports native FP8/FP8 and INT8/FP8 only"
+        )
+    if query.shape[-1] != 128 or key.shape[-1] != 128 or value.shape[-1] != 128:
+        raise NotImplementedError("MHA v4 Sparge currently supports head dimension 128 only")
+    if query.shape[1] != key.shape[1] or query.shape[1] != value.shape[1]:
+        raise NotImplementedError("MHA v4 Sparge currently supports MHA only")
+    if (attention_kwargs or {}).get("indices_k") is not None:
+        raise NotImplementedError("MHA v4 Sparge does not support varlen packed keys")
+
+
+def _aiter_launch_mxfp8_sparse(query, key, value, block_mask):
+    try:
+        lut_fn = block_attn_mask_to_ragged_lut
+    except NameError as exc:
+        raise RuntimeError(
+            "MHA v4 MXFP8 Sparge requires AITER block_attn_mask_to_ragged_lut"
+        ) from exc
+    lut = lut_fn(block_mask, return_none_if_dense=False)
+    if lut is None:
+        raise RuntimeError("block_attn_mask_to_ragged_lut returned None")
+    kv_block_indices, lut_start, lut_count = lut
+    softmax_scale = query.shape[-1] ** -0.5
+    query_q, query_scale = _aiter_quantize_mxfp8_q(
+        query, _aiter_mha_v4_q_multiplier(softmax_scale)
+    )
+    key_q, key_scale = _aiter_quantize_mxfp8_k(key)
+    value_q, value_scale = _aiter_quantize_fp8(value)
+    fp8_format = _aiter_native_fp8_format()
+    return _aiter_mha_v4_packed(
+        query_q,
+        key_q,
+        value_q,
+        query_scale,
+        key_scale,
+        value_scale,
+        fp8_format,
+        fp8_format,
+        fp8_format,
+        _AiterAttentionScaleMode.E8M0_PER_1X32,
+        _AiterAttentionScaleMode.E8M0_PER_1X32,
+        _AiterAttentionScaleMode.F32_PER_TENSOR,
+        softmax_scale=softmax_scale,
+        kv_block_indices=kv_block_indices,
+        lut_start=lut_start,
+        lut_count=lut_count,
+    )
+
+
+def _aiter_mha_v4_sparge_call(
+    query,
+    key,
+    value,
+    qk_format,
+    v_format,
+    dropout_p,
+    is_causal,
+    attention_kwargs=None,
+    *,
+    mxfp8=False,
+):
+    """Build a Sparge mask at the MHA v4 sparse tile and run the matching sparse row."""
+    _validate_aiter_mha_v4_sparge_request(
+        query,
+        key,
+        value,
+        dropout_p,
+        is_causal,
+        attention_kwargs,
+        qk_format=qk_format,
+        v_format=v_format,
+        mxfp8=mxfp8,
+    )
+    q, k, v, state, block_mask, _ = _build_sparge_block_mask(
+        query,
+        key,
+        value,
+        is_causal,
+        attention_kwargs,
+        _mha_v4_sparge_tile(),
+        pad_block_divisible=True,
+    )
+    q = torch.permute(q, [0, 2, 1, 3]).contiguous()
+    k = torch.permute(k, [0, 2, 1, 3]).contiguous()
+    v = torch.permute(v, [0, 2, 1, 3]).contiguous()
+    if mxfp8:
+        if _AITER_MHA_V4.mxfp8_block_mask:
+            output = _aiter_mha_v4_mxfp8(q, k, v, block_mask=block_mask)
+        else:
+            output = _aiter_launch_mxfp8_sparse(q, k, v, block_mask)
+    else:
+        output = _aiter_mha_v4(
+            q,
+            k,
+            v,
+            qk_format,
+            qk_format,
+            v_format,
+            block_mask=block_mask,
+        )
+    output = torch.permute(output, [0, 2, 1, 3])
+    return restore_sparge_output(output, state), None
+
+
+@register_attention_function(AttentionBackendType.AITER_I8FP8_SPARGE)
+def _aiter_i8fp8_sparge_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Run Sparge + the AITER INT8 Q/K and FP8 V MHA v4 row."""
+    return _aiter_mha_v4_sparge_call(
+        query,
+        key,
+        value,
+        _AiterAttentionFormat.INT8,
+        _aiter_native_fp8_format(),
+        dropout_p,
+        is_causal,
+        attention_kwargs,
+    )
+
+
+@register_attention_function(AttentionBackendType.AITER_FP8_SPARGE)
+def _aiter_fp8_sparge_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Run Sparge + the AITER per-tensor FP8 MHA v4 row."""
+    fp8_format = _aiter_native_fp8_format()
+    return _aiter_mha_v4_sparge_call(
+        query,
+        key,
+        value,
+        fp8_format,
+        fp8_format,
+        dropout_p,
+        is_causal,
+        attention_kwargs,
+    )
+
+
+@register_attention_function(AttentionBackendType.AITER_MXFP8_SPARGE)
+def _aiter_mxfp8_sparge_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Run Sparge + the AITER MXFP8 Q/K and per-tensor FP8 V MHA v4 row."""
+    return _aiter_mha_v4_sparge_call(
+        query,
+        key,
+        value,
+        None,
+        None,
+        dropout_p,
+        is_causal,
+        attention_kwargs,
+        mxfp8=True,
+    )
+
+
+@register_attention_function(AttentionBackendType.AITER_F8F6_SPARGE)
+def _aiter_f8f6_sparge_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Run Sparge + the AITER per-tensor FP8 Q/K and MXFP6 V MHA v4 row."""
+    return _aiter_mha_v4_sparge_call(
+        query,
+        key,
+        value,
+        _aiter_native_fp8_format(),
+        _AiterAttentionFormat.MXFP6,
+        dropout_p,
+        is_causal,
+        attention_kwargs,
+    )
+
+
+@register_attention_function(AttentionBackendType.AITER_MXFP4_SPARGE)
+def _aiter_mxfp4_sparge_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Run Sparge + the AITER MXFP4 Q/K and FP8 V MHA v4 row."""
+    return _aiter_mha_v4_sparge_call(
+        query,
+        key,
+        value,
+        _AiterAttentionFormat.MXFP4,
+        _aiter_native_fp8_format(),
+        dropout_p,
+        is_causal,
+        attention_kwargs,
+    )
+
+
+@register_attention_function(AttentionBackendType.AITER_F4F4_SPARGE)
+def _aiter_f4f4_sparge_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Run Sparge + the AITER MXFP4 Q/K/V MHA v4 row."""
+    return _aiter_mha_v4_sparge_call(
+        query,
+        key,
+        value,
+        _AiterAttentionFormat.MXFP4,
+        _AiterAttentionFormat.MXFP4,
+        dropout_p,
+        is_causal,
+        attention_kwargs,
+    )
+
+
+@register_attention_function(AttentionBackendType.AITER_MXFP6_SPARGE)
+def _aiter_mxfp6_sparge_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Run Sparge + the AITER MXFP6 Q/K and FP8 V MHA v4 row."""
+    return _aiter_mha_v4_sparge_call(
+        query,
+        key,
+        value,
+        _AiterAttentionFormat.MXFP6,
+        _aiter_native_fp8_format(),
+        dropout_p,
+        is_causal,
+        attention_kwargs,
+    )
+
+
+@register_attention_function(AttentionBackendType.AITER_F6F4_SPARGE)
+def _aiter_f6f4_sparge_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Run Sparge + the AITER MXFP6 Q/K and MXFP4 V MHA v4 row."""
+    return _aiter_mha_v4_sparge_call(
+        query,
+        key,
+        value,
+        _AiterAttentionFormat.MXFP6,
+        _AiterAttentionFormat.MXFP4,
+        dropout_p,
+        is_causal,
+        attention_kwargs,
+    )
 
 
 @register_attention_function(AttentionBackendType.AITER)
@@ -1177,7 +1617,7 @@ def _aiter_vsa_attn_call(
     if dropout_p not in (None, 0.0):
         raise ValueError("AITER VSA CK does not support attention dropout")
 
-    from xfuser.core.sparse_attention.vsa import (
+    from xfuser.core.vsa_attention import (
         aiter_vsa_attention,
         jenga_scheduled_drop_rate,
     )
@@ -1368,7 +1808,7 @@ def _aiter_sage_attn_call(query, key, value, dropout_p, is_causal, attention_kwa
 
 @register_attention_function(AttentionBackendType.AITER_SAGE_V2)
 def _aiter_sage_v2_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
-    # Contiguous is needed for Sage v2 in older AITER versions. 
+    # Contiguous is needed for Sage v2 in older AITER versions.
     # This has been fixed in newer version of AITER, meaning the
     # contiguous calls can be removed in the future.
     query = query.contiguous()
