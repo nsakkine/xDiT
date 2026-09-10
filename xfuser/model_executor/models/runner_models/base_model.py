@@ -41,6 +41,7 @@ from xfuser.core.distributed import (
     init_distributed_environment,
 )
 from xfuser.core.distributed.attention_backend import (
+    AITER_MHA_V4_SOL_BACKEND_SET,
     AITER_MHA_V4_SPARGE_BACKEND_SET,
     AttentionBackendType,
 )
@@ -81,7 +82,14 @@ _SPARGE_ATTENTION_BACKENDS = frozenset({
     AttentionBackendType.AITER_SPARGE_V2,
     AttentionBackendType.AITER_VSA,
     AttentionBackendType.FLEX_BLOCK_SPARGE,
-}) | AITER_MHA_V4_SPARGE_BACKEND_SET
+    # The Sol-Attn rows route their own mask rather than building a Sparge one, but they belong
+    # here for what this set gates: they are wired for Wan only, and must not be left to serve
+    # cross-attention. Cross-attention falls back to the main backend when
+    # --cross_attention_backend is unset, and Wan's text KV is 512 tokens, i.e. four
+    # KV blocks -- too few for a per-tile threshold to select meaningfully and too few
+    # for a pooled correction to carry the mass it skips. It would not fail, it would
+    # quietly answer with a worse number.
+}) | AITER_MHA_V4_SPARGE_BACKEND_SET | AITER_MHA_V4_SOL_BACKEND_SET
 
 
 def _parse_attention_backend(name: Optional[str], kind: str) -> Optional[AttentionBackendType]:
@@ -368,8 +376,8 @@ class xFuserModel(abc.ABC):
 
     def _enable_options(self) -> None:
         """ Enable model options based on config"""
-        if getattr(self.config, "use_spargeattn_head_balance", False):
-            log("Enabling Sparge block-sparse head balancing...")
+        if getattr(self.config, "use_sparseattn_head_balance", False):
+            log("Enabling block-sparse head balancing...")
 
         self._vae_manager.enable_options(self._decoding_vaes())
 

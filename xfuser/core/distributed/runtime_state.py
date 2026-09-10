@@ -28,6 +28,8 @@ from xfuser.core.distributed.attention_backend import (
     AITER_LOW_PRECISION_BACKENDS,
     AITER_MHA_V4_GFX942_SPARGE_BACKEND_SET,
     AITER_MHA_V4_ONLY_BACKEND_SET,
+    AITER_MHA_V4_SOL_BACKENDS,
+    AITER_MHA_V4_SOL_BACKEND_SET,
     AITER_MHA_V4_SPARGE_BACKENDS,
     AITER_MHA_V4_SPARGE_BACKEND_SET,
     AttentionBackendType,
@@ -237,7 +239,7 @@ class RuntimeState(metaclass=ABCMeta):
                                  AttentionBackendType.AITER_MLA,
                                  AttentionBackendType.AITER_SAGE,
                                  AttentionBackendType.AITER_SPARSE_SAGE,
-                                 AttentionBackendType.AITER_SOL_FP8,
+                                 *AITER_MHA_V4_SOL_BACKENDS,
                                  AttentionBackendType.AITER_SPARGE,
                                  AttentionBackendType.AITER_SAGE_V2,
                                  AttentionBackendType.AITER_SPARSE_SAGE_V2,
@@ -354,7 +356,7 @@ class RuntimeState(metaclass=ABCMeta):
                 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
             except ImportError:
                 raise RuntimeError("AITER Sparse Sage attention is not available, please update AITER") from None
-        elif attention_backend == AttentionBackendType.AITER_SOL_FP8:
+        elif attention_backend in AITER_MHA_V4_SOL_BACKEND_SET:
             from xfuser.core.sparse_attention.sol import check_sol_attn_device
             # Fail here rather than on the first attention call: the kernel is gfx950-only, and the
             # per-call check cannot be reached early enough to give a useful message during setup.

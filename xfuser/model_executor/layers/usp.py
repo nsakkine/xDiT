@@ -24,24 +24,29 @@ from xfuser.core.distributed import (
 from xfuser.compat import version_at_least
 from xfuser.core.cache_manager.cache_manager import get_cache_manager
 from xfuser.core.distributed.attention_backend import (
+    AITER_MHA_V4_SOL_BACKEND_SET,
     AITER_MHA_V4_SPARGE_BACKEND_SET,
     ATTENTION_FUNCTION_REGISTRY,
     AttentionBackendType,
 )
-from xfuser.core.sparge_attention.head_balance import (
+from xfuser.core.sparse_attention.head_balance import (
     apply_head_balance,
     revert_head_balance,
 )
 
-# Sparge backends whose kernel cost can be load-balanced across Ulysses ranks.
-# These all build a block mask via _build_sparge_block_mask and write the
-# per-head cost into the head-balance "cost sink". Non-sparge backends are
-# excluded so head balancing is a clean no-op for them.
+# Backends whose kernel cost can be load-balanced across Ulysses ranks, i.e. the
+# ones that write a per-head cost into the head-balance "cost sink". Most get
+# there through _build_sparge_block_mask; Sol-Attn instead reduces the mask its
+# own routing returned, which is why membership is about publishing a cost
+# rather than about how the mask was built. Backends absent here publish no
+# cost, so head balancing is a clean no-op for them.
 _HEAD_BALANCE_BACKENDS = frozenset({
     AttentionBackendType.AITER_SPARGE,
     AttentionBackendType.AITER_SPARGE_V2,
     AttentionBackendType.FLEX_BLOCK_SPARGE,
-}) | AITER_MHA_V4_SPARGE_BACKEND_SET
+    # Sol-Attn routes for itself rather than through _build_sparge_block_mask, but it publishes the
+    # same per-head selected-block count, so the balancer treats it like the rest.
+}) | AITER_MHA_V4_SPARGE_BACKEND_SET | AITER_MHA_V4_SOL_BACKEND_SET
 
 
 def ring_attn(attention_function, query, key, value, dropout_p=0.0, is_causal=False, joint_attn_kwargs=None, attention_kwargs=None):
@@ -267,7 +272,7 @@ def USP(
     Explicit backend can be provided to specify the attention backend to use.
 
     ``head_balance_layer`` (optional): a stable per-layer handle (e.g. the
-    attention module). When provided and --use_spargeattn_head_balance is set, the
+    attention module). When provided and --use_sparseattn_head_balance is set, the
     Ulysses head dimension is permuted so each rank gets a cost-balanced subset
     of heads (block-sparse load balancing); the permutation is inverted on the
     output. No-op for non-sparse backends (no cost is published) and for ring/
@@ -282,10 +287,10 @@ def USP(
     hb_backend = backend if backend is not None else get_runtime_state().attention_backend
     query, key, value, hb_applied, attention_kwargs = apply_head_balance(
         query, key, value, head_balance_layer,
-        enabled=get_runtime_state().runtime_config.use_spargeattn_head_balance,
+        enabled=get_runtime_state().runtime_config.use_sparseattn_head_balance,
         ulysses_world_size=hb_uly,
         ring_world_size=get_ring_parallel_world_size(),
-        is_sparge_backend=hb_backend in _HEAD_BALANCE_BACKENDS,
+        backend_publishes_head_cost=hb_backend in _HEAD_BALANCE_BACKENDS,
         joint_strategy=joint_strategy,
         attention_kwargs=attention_kwargs,
     )

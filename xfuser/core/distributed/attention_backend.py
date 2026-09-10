@@ -6,20 +6,20 @@ import math
 import torch.nn.functional as F
 from enum import Enum
 from xfuser.envs import PACKAGES_CHECKER, environment_variables
-from xfuser.core.distributed.ssta import (
+from xfuser.core.sparse_attention.ssta import (
     setup_ssta,
     get_sparse_mask,
     untile_ssta_output,
     expand_block_mask,
 )
 from xfuser.core.distributed import get_ulysses_parallel_world_size, get_ring_parallel_world_size
-from xfuser.core.sparge_attention.sparge import (
+from xfuser.core.sparse_attention.sparge import (
     setup_sparge,
     compute_sparge_block_mask,
     restore_sparge_output,
     mask_padded_kv_blocks,
 )
-from xfuser.core.sparge_attention.head_balance import COST_SINK_KEY
+from xfuser.core.sparse_attention.head_balance import COST_SINK_KEY
 from xfuser.logger import init_logger
 
 logger = init_logger(__name__)
@@ -637,6 +637,10 @@ class AttentionBackendType(Enum):
     AITER_F6F4_SPARGE = "AITER F6F4 Sparge"
     AITER_MXFP4_SPARGE = "AITER MXFP4 Sparge"
     AITER_F4F4_SPARGE = "AITER F4F4 Sparge"
+    AITER_I8FP8_SOL = "AITER I8FP8 Sol"
+    AITER_FP8_SOL = "AITER FP8 Sol"
+    AITER_MXFP8_SOL = "AITER MXFP8 Sol"
+    AITER_MXFP4_SOL = "AITER MXFP4 Sol"
     AITER_SAGE = "AITER Sage"
     AITER_SPARSE_SAGE = "AITER Sparse Sage"
     AITER_SAGE_V2 = "AITER Sage V2"
@@ -677,6 +681,15 @@ AITER_MHA_V4_ONLY_BACKENDS = tuple(
 )
 AITER_MHA_V4_ONLY_BACKEND_SET = frozenset(AITER_MHA_V4_ONLY_BACKENDS)
 AITER_MHA_V4_SPARGE_BACKEND_SET = frozenset(AITER_MHA_V4_SPARGE_BACKENDS)
+# The mode-2 (Sol-Attn) rows. A subset of the recipes above: Sol-Attn needs a manifest row of its
+# own per recipe, and only these four are built.
+AITER_MHA_V4_SOL_BACKENDS = (
+    AttentionBackendType.AITER_I8FP8_SOL,
+    AttentionBackendType.AITER_FP8_SOL,
+    AttentionBackendType.AITER_MXFP8_SOL,
+    AttentionBackendType.AITER_MXFP4_SOL,
+)
+AITER_MHA_V4_SOL_BACKEND_SET = frozenset(AITER_MHA_V4_SOL_BACKENDS)
 AITER_MHA_V4_GFX942_SPARGE_BACKENDS = (
     AttentionBackendType.AITER_I8FP8_SPARGE,
     AttentionBackendType.AITER_FP8_SPARGE,
@@ -1500,6 +1513,70 @@ def _aiter_f4f4_sparge_attn_call(query, key, value, dropout_p, is_causal, attent
         dropout_p,
         is_causal,
         attention_kwargs,
+    )
+
+
+def _aiter_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs, recipe):
+    """Run Sol-Attn on one of the AITER MHA v4 mode-2 rows.
+
+    Unlike the Sparge backends this does not build a Sparge block mask: Sol-Attn's own
+    adaptive-threshold routing is part of the algorithm, and aiter derives the LUT, the pooled K/V
+    and the selection bitmap together from one mask so they cannot disagree. That is also why there
+    is no setup_sparge/restore_sparge_output pair here.
+
+    The four rows differ only in how Q/K/V are quantized; the routing, the pooled correction and
+    the head cost are identical, so they all come through here with recipe naming the row.
+    """
+    _validate_aiter_low_precision_dropout(dropout_p)
+    from xfuser.core.sparse_attention.sol import sol_attn_bhsd, sol_attn_dump_path
+
+    kwargs = attention_kwargs or {}
+    cost_sink = kwargs.get(COST_SINK_KEY)
+    output, head_cost = sol_attn_bhsd(
+        query,
+        key,
+        value,
+        is_causal=is_causal,
+        beta=float(kwargs.get("solattn_beta", 0.5)),
+        ring_world_size=get_ring_parallel_world_size(),
+        dump_path=sol_attn_dump_path(),
+        return_head_cost=cost_sink is not None,
+        recipe=recipe,
+    )
+    if cost_sink is not None:
+        cost_sink.copy_(head_cost)
+    return output, None
+
+
+@register_attention_function(AttentionBackendType.AITER_FP8_SOL)
+def _aiter_fp8_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Sol-Attn on the per-tensor FP8 row."""
+    return _aiter_sol_attn_call(
+        query, key, value, dropout_p, is_causal, attention_kwargs, "fp8"
+    )
+
+
+@register_attention_function(AttentionBackendType.AITER_I8FP8_SOL)
+def _aiter_i8fp8_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Sol-Attn on the INT8 Q/K and FP8 V row."""
+    return _aiter_sol_attn_call(
+        query, key, value, dropout_p, is_causal, attention_kwargs, "i8fp8"
+    )
+
+
+@register_attention_function(AttentionBackendType.AITER_MXFP8_SOL)
+def _aiter_mxfp8_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Sol-Attn on the MXFP8 Q/K and per-tensor FP8 V row."""
+    return _aiter_sol_attn_call(
+        query, key, value, dropout_p, is_causal, attention_kwargs, "mxfp8"
+    )
+
+
+@register_attention_function(AttentionBackendType.AITER_MXFP4_SOL)
+def _aiter_mxfp4_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Sol-Attn on the all-MXFP4 row, the only one where Q, K and V are all block scaled."""
+    return _aiter_sol_attn_call(
+        query, key, value, dropout_p, is_causal, attention_kwargs, "mxfp4"
     )
 
 

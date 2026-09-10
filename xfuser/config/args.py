@@ -986,7 +986,7 @@ class xFuserArgs:
                  "permuting heads (block-sparse load balancing). Only has an "
                  "effect with ulysses_degree>1, equal query and KV head counts, "
                  "and a block-sparse attention backend that publishes a per-head "
-                 "cost (the Sparge backends or aiter_sol_fp8).",
+                 "cost (the Sparge backends or the Sol backends).",
         )
         parser.add_argument(
             "--solattn_beta",
