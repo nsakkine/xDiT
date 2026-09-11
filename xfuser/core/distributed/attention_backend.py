@@ -690,6 +690,14 @@ AITER_MHA_V4_SOL_BACKENDS = (
     AttentionBackendType.AITER_MXFP4_SOL,
 )
 AITER_MHA_V4_SOL_BACKEND_SET = frozenset(AITER_MHA_V4_SOL_BACKENDS)
+# Which recipe each backend asks for, so setup can check the device has that row. The MX two are
+# gfx950-only; gfx942 builds the per-tensor pair.
+AITER_MHA_V4_SOL_RECIPE = {
+    AttentionBackendType.AITER_I8FP8_SOL: "i8fp8",
+    AttentionBackendType.AITER_FP8_SOL: "fp8",
+    AttentionBackendType.AITER_MXFP8_SOL: "mxfp8",
+    AttentionBackendType.AITER_MXFP4_SOL: "mxfp4",
+}
 AITER_MHA_V4_GFX942_SPARGE_BACKENDS = (
     AttentionBackendType.AITER_I8FP8_SPARGE,
     AttentionBackendType.AITER_FP8_SPARGE,

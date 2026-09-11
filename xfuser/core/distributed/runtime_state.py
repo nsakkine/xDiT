@@ -30,6 +30,7 @@ from xfuser.core.distributed.attention_backend import (
     AITER_MHA_V4_ONLY_BACKEND_SET,
     AITER_MHA_V4_SOL_BACKENDS,
     AITER_MHA_V4_SOL_BACKEND_SET,
+    AITER_MHA_V4_SOL_RECIPE,
     AITER_MHA_V4_SPARGE_BACKENDS,
     AITER_MHA_V4_SPARGE_BACKEND_SET,
     AttentionBackendType,
@@ -357,11 +358,12 @@ class RuntimeState(metaclass=ABCMeta):
             except ImportError:
                 raise RuntimeError("AITER Sparse Sage attention is not available, please update AITER") from None
         elif attention_backend in AITER_MHA_V4_SOL_BACKEND_SET:
-            from xfuser.core.sparse_attention.sol import check_sol_attn_device
-            # Fail here rather than on the first attention call: the kernel is gfx950-only, and the
-            # per-call check cannot be reached early enough to give a useful message during setup.
+            from xfuser.core.sparse_attention.sol import check_sol_attn_recipe
+            # Fail here rather than on the first attention call: which recipes exist depends on the
+            # device (gfx942 builds the per-tensor pair, gfx950 all four), and the per-call check
+            # cannot be reached early enough to give a useful message during setup.
             # SolAttnUnsupported is a RuntimeError, matching the other branches.
-            check_sol_attn_device()
+            check_sol_attn_recipe(AITER_MHA_V4_SOL_RECIPE[attention_backend])
         elif attention_backend == AttentionBackendType.AITER_SAGE_V2:
             try:
                 from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import fav3_sage_mxfp4_wrapper

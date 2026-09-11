@@ -10,7 +10,10 @@ from typing import NamedTuple
 
 import torch
 
-_SUPPORTED_ARCH = "gfx950"
+# gfx950 carries a mode-2 manifest row for every recipe below; gfx942 carries only the two
+# per-tensor ones, so the rest are refused per recipe rather than per device.
+_SUPPORTED_ARCHS = ("gfx942", "gfx950")
+_ARCH_RECIPES = {"gfx942": ("fp8", "i8fp8")}
 
 
 class SolAttnUnsupported(RuntimeError):
@@ -160,10 +163,37 @@ def check_sol_attn_device(device=None):
         device = torch.device("cuda", torch.cuda.current_device())
     if device.type != "cuda":
         raise SolAttnUnsupported(f"Sol-Attn is a GPU kernel, got device {device}")
-    arch = torch.cuda.get_device_properties(device).gcnArchName or ""
-    if not arch.startswith(_SUPPORTED_ARCH):
+    arch = _device_arch(device)
+    if arch is None:
+        reported = torch.cuda.get_device_properties(device).gcnArchName or ""
         raise SolAttnUnsupported(
-            f"Sol-Attn ships only a {_SUPPORTED_ARCH} kernel, this device reports '{arch}'")
+            f"Sol-Attn ships kernels for {', '.join(_SUPPORTED_ARCHS)}, "
+            f"this device reports '{reported}'")
+
+
+def _device_arch(device=None):
+    """The supported arch this device is, or None. gcnArchName carries a target-feature suffix."""
+    if device is None:
+        if not torch.cuda.is_available():
+            return None
+        device = torch.device("cuda", torch.cuda.current_device())
+    name = torch.cuda.get_device_properties(device).gcnArchName or ""
+    return next((arch for arch in _SUPPORTED_ARCHS if name.startswith(arch)), None)
+
+
+def check_sol_attn_recipe(recipe_id, device=None):
+    """Raise unless this device has a Sol-Attn manifest row for recipe_id.
+
+    Separate from check_sol_attn_device because the answer is per recipe: gfx942 runs the two
+    per-tensor rows and has no MX ones, so selecting aiter_mxfp8_sol_attn there has to fail at
+    setup with the reason rather than at the first launch with a missing-kernel error.
+    """
+    check_sol_attn_device(device)
+    allowed = _ARCH_RECIPES.get(_device_arch(device))
+    if allowed is not None and recipe_id not in allowed:
+        raise SolAttnUnsupported(
+            f"Sol-Attn '{recipe_id}' has no {_device_arch(device)} manifest row; "
+            f"this device serves {', '.join(allowed)}")
 
 
 def check_sol_attn_supported(query, key, value, is_causal, ring_world_size=1):
@@ -255,7 +285,11 @@ def sol_attn_routing_for(q, k, v, beta, recipe=_RECIPES["fp8"]):
         v[0],
         beta,
         _AITER.ts_qo,
-        _AITER.ts_kv,
+        # From the manifest, not aiter's SOL_ATTN_TS_KV default, which is the gfx950 tile: gfx942
+        # pools 64 rows per block against gfx950's 128. Pooling at the wrong one is not a rounding
+        # difference, it hands the kernel pooled tensors of the wrong height. The pad above already
+        # reads the same source, so taking the two from one place keeps them from drifting apart.
+        _kv_tile(),
         num_heads=(q[2] if packed is not None else q[0]).shape[2],
         # A packed operand pools from its source and is quantized again, so it has no stored scale
         # to pool and offering one is an error.

@@ -28,8 +28,9 @@ def _require_sol_attn():
         pytest.skip("Sol-Attn requires a ROCm GPU.")
 
     arch_name = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
-    if "gfx950" not in arch_name:
-        pytest.skip(f"Sol-Attn ships only a gfx950 kernel, got {arch_name}.")
+    arch = next((a for a in ("gfx942", "gfx950") if arch_name.startswith(a)), None)
+    if arch is None:
+        pytest.skip(f"Sol-Attn ships gfx942 and gfx950 kernels, got {arch_name}.")
 
     try:
         import aiter
@@ -38,12 +39,35 @@ def _require_sol_attn():
     except ImportError:
         pytest.skip("AITER does not expose the Sol-Attn API.")
 
-    kernel = (
-        Path(aiter.__file__).resolve().parent.parent
-        / "hsa" / "gfx950" / "fmha_v4_fwd" / "fwd_hd128_fp8_sol_attn.co"
-    )
-    if not kernel.exists():
-        pytest.skip("AITER does not include the gfx950 Sol-Attn FMHA kernel.")
+    # gfx942 keeps its code objects one level down, in an MI300 subdirectory.
+    fwd_dir = Path(aiter.__file__).resolve().parent.parent / "hsa" / arch / "fmha_v4_fwd"
+    if arch == "gfx942":
+        fwd_dir = fwd_dir / "MI300"
+    if not (fwd_dir / "fwd_hd128_fp8_sol_attn.co").exists():
+        pytest.skip(f"AITER does not include the {arch} Sol-Attn FMHA kernel.")
+
+
+def _require_sol_recipe(recipe):
+    """Skip unless this device has a Sol-Attn row for recipe.
+
+    A plain skip, not an expected failure: aiter's MX quantizer aborts the process rather than
+    raising on an unsupported device, so reaching one of those rows here takes the whole session
+    down instead of failing a test.
+    """
+    from xfuser.core.sparse_attention.sol import SolAttnUnsupported, check_sol_attn_recipe
+
+    try:
+        check_sol_attn_recipe(recipe)
+    except SolAttnUnsupported as error:
+        pytest.skip(str(error))
+
+
+def _kv_block(key):
+    """Number of pooled KV blocks in a BHSD key, at the tile this device's manifest row uses."""
+    from xfuser.core.sparse_attention.sol import _kv_tile
+
+    tile = _kv_tile()
+    return -(-key.shape[2] // tile)
 
 
 def _operands(seqlen=1024, heads=2, head_dim=128, seed=1234, sharpness=2.0):
@@ -312,7 +336,7 @@ def test_sol_attn_publishes_a_head_cost_without_changing_the_output(monkeypatch)
         "the packed path taken for head cost must reproduce the raw path exactly"
     )
     assert (cost_sink > 0).all(), "every head should select at least one block"
-    num_kv_blocks = key.shape[2] // 128
+    num_kv_blocks = _kv_block(key)
     num_q_tiles = (query.shape[2] + 255) // 256
     assert (cost_sink <= num_q_tiles * num_kv_blocks).all()
 
@@ -336,6 +360,7 @@ def test_every_sol_recipe_tracks_its_own_dense_sibling(recipe, dense_backend):
     loses accuracy, and only the comparison against the matched dense row makes that visible.
     """
     _require_sol_attn()
+    _require_sol_recipe(recipe)
 
     from xfuser.core.distributed import attention_backend as ab
     from xfuser.core.distributed.attention_backend import (
@@ -368,6 +393,7 @@ def test_every_sol_recipe_tracks_its_own_dense_sibling(recipe, dense_backend):
 def test_every_sol_recipe_publishes_a_head_cost(recipe):
     """The balancer consumes this for every row, not just the one with a raw entry point."""
     _require_sol_attn()
+    _require_sol_recipe(recipe)
 
     from xfuser.core.sparse_attention.sol import sol_attn_bhsd
 
@@ -401,6 +427,7 @@ def test_sol_attn_holds_one_graph(recipe, seqlen, head_cost):
     could not see it, which is exactly why it is worth a test.
     """
     _require_sol_attn()
+    _require_sol_recipe(recipe)
 
     from xfuser.core.sparse_attention.sol import sol_attn_bhsd
 
