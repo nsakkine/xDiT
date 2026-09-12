@@ -291,6 +291,12 @@ class xFuserFlux2Model(xFuserModel):
         pipefusion_parallel_degree=True,
         supports_step_caching=True,
         profile_capture_phase=True,
+        # Both block streams attend text and image jointly, so there is no short text-only call.
+        # Being an image model, though, it sits at the bottom of Sol-Attn's useful range: 1024px
+        # is 4096 image tokens, tens of KV blocks rather than the hundreds a video model gives,
+        # and pipefusion divides that again by the patch count. sol_attn_bhsd warns when a call
+        # is too short to route over.
+        supports_sol_attention_backends=True,
     )
     default_input_values = DefaultInputValues(
         height=1024,
@@ -435,6 +441,9 @@ class xFuserFlux2Klein9BModel(xFuserModel):
         pipefusion_parallel_degree=True,
         supports_step_caching=True,
         profile_capture_phase=True,
+        # As for FLUX.2-dev, and this one is the better fit of the two: its 2048px default is
+        # ~16k image tokens, which is a KV long enough for the routing to mean something.
+        supports_sol_attention_backends=True,
     )
 
     default_input_values = DefaultInputValues(

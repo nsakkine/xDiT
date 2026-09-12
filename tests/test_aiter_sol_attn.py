@@ -62,6 +62,162 @@ def _require_sol_recipe(recipe):
         pytest.skip(str(error))
 
 
+def test_sol_attn_drops_a_caller_alignment_pad():
+    """key_seqlen must reproduce attention over the real tokens, whatever the pad holds.
+
+    MiniMax-H3 pads its packed sequence to 64 rows and reports the real count as varlen metadata.
+    Sol-Attn takes no mask, so the pad is dropped rather than attended. With a zero pad this
+    changes nothing, because zero is what the tile pad would have added anyway; the test pins
+    both that and the non-zero case, which is the one a bias on the QKV projection would produce.
+    """
+    _require_sol_attn()
+    import torch
+
+    from xfuser.core.sparse_attention.sol import sol_attn_bhsd
+
+    real, align = 3970, 64
+    padded = -(-real // align) * align
+    torch.manual_seed(0)
+
+    def bhsd(seq):
+        return torch.randn(1, 4, seq, 128, device="cuda", dtype=torch.bfloat16)
+
+    query = bhsd(512)
+    for fill in ("zeros", "nonzero"):
+        key, value = bhsd(padded), bhsd(padded)
+        if fill == "zeros":
+            key[:, :, real:] = 0
+            value[:, :, real:] = 0
+        dropped, _ = sol_attn_bhsd(query, key, value, beta=0.5, key_seqlen=real)
+        unpadded, _ = sol_attn_bhsd(
+            query, key[:, :, :real], value[:, :, :real], beta=0.5
+        )
+        assert torch.equal(dropped, unpadded), (
+            f"dropping a {fill} pad did not reproduce attention over the real tokens"
+        )
+
+
+def test_forced_blocks_are_added_to_what_routing_picked():
+    """A named token's block must be computed exactly however routing scored it.
+
+    This is the lever for a packed multimodal sequence, where a small modality is thresholded
+    against statistics the large one writes. Forcing can only add blocks, never remove them, so
+    the result moves toward dense rather than away.
+    """
+    _require_sol_attn()
+    import torch
+
+    from xfuser.core.sparse_attention.sol import (
+        _force_blocks_from_tokens,
+        _kv_tile,
+        _quantize,
+        _RECIPES,
+        sol_attn_routing_for,
+    )
+
+    tile = _kv_tile()
+    query, key, value = _operands(seqlen=8 * tile, heads=2)
+    recipe = _RECIPES["fp8"]
+    q, k, v = _quantize(
+        recipe,
+        *(x.permute(0, 2, 1, 3).contiguous() for x in (query, key, value)),
+        query.shape[-1] ** -0.5,
+    )
+
+    # A band the size of one block, as a minority modality would be.
+    exact_tokens = torch.zeros(8 * tile, dtype=torch.bool, device="cuda")
+    exact_tokens[3 * tile : 4 * tile] = True
+    forced = _force_blocks_from_tokens(exact_tokens, None, 8 * tile)
+    assert forced.tolist() == [False, False, False, True, False, False, False, False]
+
+    routed = sol_attn_routing_for(q, k, v, 0.5, recipe)["block_attn_mask"]
+    pinned = sol_attn_routing_for(q, k, v, 0.5, recipe, force_blocks=forced)[
+        "block_attn_mask"
+    ]
+
+    assert pinned[..., 3].all(), "the named block must be exact for every query tile"
+    assert (pinned | routed).equal(pinned), "forcing must only ever add blocks"
+    assert pinned.sum() >= routed.sum()
+
+
+def test_forced_blocks_follow_the_same_trim_and_pad_as_kv():
+    """The token mask has to stay in step with K/V or it names the wrong blocks."""
+    # _kv_tile() reads the manifest for the device, so this needs one even though the check below
+    # is pure tensor bookkeeping.
+    _require_sol_attn()
+
+    from xfuser.core.sparse_attention.sol import _force_blocks_from_tokens, _kv_tile
+
+    import torch
+
+    tile = _kv_tile()
+    # Two real blocks plus a partial third, trimmed from a caller pad, then padded back to tile.
+    tokens = torch.zeros(3 * tile, dtype=torch.bool)
+    tokens[2 * tile : 2 * tile + 5] = True
+    forced = _force_blocks_from_tokens(tokens, 2 * tile + 5, 3 * tile)
+    assert forced.tolist() == [False, False, True]
+
+
+def test_the_backend_hands_named_tokens_to_the_routing(monkeypatch):
+    """The last link: the dispatch has to pass the model's mask on to sol_attn_bhsd.
+
+    Tested because the bug this pairs with was of exactly this shape -- every piece correct on its
+    own, and one connection between them never made.
+    """
+    import torch
+
+    from xfuser.core.distributed import attention_backend as backend_module
+    from xfuser.core.distributed.attention_backend import (
+        SOL_EXACT_TOKENS_KEY,
+        _aiter_sol_attn_call,
+    )
+    from xfuser.core.sparse_attention import sol as sol_module
+
+    seen = {}
+
+    def _record(query, key, value, **kwargs):
+        seen.update(kwargs)
+        return torch.zeros_like(query), None
+
+    monkeypatch.setattr(sol_module, "sol_attn_bhsd", _record)
+    monkeypatch.setattr(backend_module, "get_ring_parallel_world_size", lambda: 1)
+
+    exact_tokens = torch.zeros(256, dtype=torch.bool)
+    exact_tokens[:8] = True
+    q = torch.zeros(1, 2, 256, 8)
+    _aiter_sol_attn_call(
+        q, q, q, 0.0, False,
+        {SOL_EXACT_TOKENS_KEY: exact_tokens, "solattn_beta": 0.25},
+        "fp8",
+    )
+
+    assert seen.get("exact_tokens") is exact_tokens, (
+        "the named tokens did not reach the routing"
+    )
+    # The beta the caller asked for has to arrive too, rather than the default.
+    assert seen.get("beta") == 0.25
+
+
+def test_sol_attn_refuses_multi_sequence_varlen():
+    """One packed sequence is fine; several in one call are not, and must not be approximated."""
+    import torch
+
+    from xfuser.core.distributed.attention_backend import _sol_attn_key_seqlen
+    from xfuser.core.sparse_attention.sol import SolAttnUnsupported
+
+    assert _sol_attn_key_seqlen({}) is None
+    assert (
+        _sol_attn_key_seqlen(
+            {"cu_seqlens_k": torch.tensor([0, 4000]), "max_seqlen_k": 4000}
+        )
+        == 4000
+    )
+    with pytest.raises(SolAttnUnsupported, match="one sequence per call"):
+        _sol_attn_key_seqlen(
+            {"cu_seqlens_k": torch.tensor([0, 1000, 4000]), "max_seqlen_k": 3000}
+        )
+
+
 def _kv_block(key):
     """Number of pooled KV blocks in a BHSD key, at the tile this device's manifest row uses."""
     from xfuser.core.sparse_attention.sol import _kv_tile
@@ -109,6 +265,75 @@ def _fp32_attention(query, key, value):
 
 def _cosine(a, b):
     return F.cosine_similarity(a.float().flatten(), b.float().flatten(), dim=0).item()
+
+
+def _packed_modalities(seqlen, heads, band, majority_gain, seed=99):
+    """BHSD operands shaped like a packed multimodal sequence, plus the minority's token mask.
+
+    Clustered per block as _operands is, so there is a block to find, with two departures that
+    together reproduce what a small modality runs into. The minority band sits inside a query tile
+    rather than on its boundary, so the one averaged query that decides the tile's selection is
+    mostly majority rows; and the majority carries the larger activations, which is what lets it
+    outvote the band in that average. majority_gain is that imbalance.
+    """
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    tile = 128
+    centers = torch.randn(-(-seqlen // tile), 128, generator=g, device="cuda") * 2.0
+
+    def _spread(rows):
+        x = rows[:seqlen] + torch.randn(seqlen, 128, generator=g, device="cuda")
+        return x.unsqueeze(0).unsqueeze(0).expand(1, heads, seqlen, 128).contiguous()
+
+    key = _spread(centers.repeat_interleave(tile, 0))
+    value = torch.randn(1, heads, seqlen, 128, generator=g, device="cuda")
+
+    # Every query targets its own block, so the band's rows do want the band's keys.
+    query = _spread(centers.repeat_interleave(tile, 0))
+    gain = torch.full((seqlen,), majority_gain, device="cuda")
+    gain[band] = 1.0
+    query = query * gain.view(1, 1, seqlen, 1)
+
+    exact_tokens = torch.zeros(seqlen, dtype=torch.bool, device="cuda")
+    exact_tokens[band] = True
+    return query.bfloat16(), key.bfloat16(), value.bfloat16(), exact_tokens
+
+
+def test_pinning_recovers_a_band_that_routing_outvotes():
+    """The point of forcing blocks, measured: a minority modality gets its own keys back.
+
+    Selection for a 256-row query tile is decided by one averaged query and a threshold taken over
+    every KV block, so a band that is a fraction of its tile and quieter than its neighbours loses
+    the blocks it most needed, and falls back to pooled means covering the whole sequence. Naming
+    it restores it. The majority is checked too: forcing only ever adds blocks, so it must not
+    move.
+    """
+    _require_sol_attn()
+
+    from xfuser.core.sparse_attention.sol import sol_attn_bhsd
+
+    seqlen, heads = 4096, 4
+    # One 128-row band, a few percent of the sequence, buried mid query tile.
+    band = slice(2048 + 128, 2048 + 256)
+    query, key, value, exact_tokens = _packed_modalities(
+        seqlen, heads, band, majority_gain=8.0
+    )
+    reference = _fp32_attention(query, key, value)
+
+    routed, _ = sol_attn_bhsd(query, key, value, beta=1.0)
+    pinned, _ = sol_attn_bhsd(query, key, value, beta=1.0, exact_tokens=exact_tokens)
+
+    band_routed = _cosine(routed[:, :, band], reference[:, :, band])
+    band_pinned = _cosine(pinned[:, :, band], reference[:, :, band])
+    assert band_pinned > band_routed + 0.01, (
+        f"pinning the band did not improve it: {band_routed:.5f} -> {band_pinned:.5f}"
+    )
+
+    rest = slice(3072, 3584)
+    rest_routed = _cosine(routed[:, :, rest], reference[:, :, rest])
+    rest_pinned = _cosine(pinned[:, :, rest], reference[:, :, rest])
+    assert rest_pinned >= rest_routed - 1e-4, (
+        f"pinning a band cost the majority accuracy: {rest_routed:.5f} -> {rest_pinned:.5f}"
+    )
 
 
 def test_sol_attn_backends_are_registered():

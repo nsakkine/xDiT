@@ -547,6 +547,230 @@ def test_minimax_h3_supports_hybrid_attention_capability():
     )
 
 
+@pytest.mark.parametrize("backend", ["aiter_fp8_sol", "aiter_i8fp8_sol"])
+def test_minimax_h3_accepts_sol_attn_backends(backend):
+    """H3 is the shape Sol-Attn is for, and nothing in the Sparge gate applies to it.
+
+    That gate keeps a routed backend from being left to serve cross-attention over a short text
+    KV. H3 index_copies text, video and audio into one packed sequence and attends it as
+    non-causal self-attention, so there is no second call to fall back. Whether the device has
+    the row is a separate question, settled against the manifest in runtime_state.
+    """
+    from xfuser.config import xFuserArgs
+    from xfuser.model_executor.models.runner_models.minimax_h3 import (
+        xFuserMiniMaxH3Model,
+    )
+
+    xFuserMiniMaxH3Model(
+        xFuserArgs(model="MiniMax-H3", task="t2va", attention_backend=backend)
+    )
+
+
+@pytest.mark.parametrize("backend", ["aiter_sparge", "aiter_fp8_sparge"])
+def test_minimax_h3_still_rejects_sparge_backends(backend):
+    """Sol-Attn being allowed must not drag the Sparge rows in with it.
+
+    The two have separate capabilities, so this is refused by the Sparge gate before H3's own
+    backend list is consulted; either layer saying no is fine, but one of them has to.
+    """
+    from xfuser.config import xFuserArgs
+    from xfuser.model_executor.models.runner_models.minimax_h3 import (
+        xFuserMiniMaxH3Model,
+    )
+
+    with pytest.raises(ValueError, match="does not support Sparge"):
+        xFuserMiniMaxH3Model(
+            xFuserArgs(model="MiniMax-H3", task="t2va", attention_backend=backend)
+        )
+
+
+def test_minimax_h3_keeps_the_token_refiner_off_sol_attn(monkeypatch):
+    """The refiner attends text alone, which is far too short for a routed backend.
+
+    This is the site that was missed when Sol-Attn was first allowed for H3: the main blocks
+    attend the whole packed sequence, but the refiner does not, and it was handed the same
+    backend.
+    """
+    from xfuser.core.distributed.attention_backend import AttentionBackendType
+    from xfuser.model_executor.models.transformers.transformer_minimax_h3 import (
+        _dense_backend_for,
+    )
+
+    _patch_minimax_runtime_state(monkeypatch)
+    for sol in (
+        AttentionBackendType.AITER_FP8_SOL,
+        AttentionBackendType.AITER_I8FP8_SOL,
+        AttentionBackendType.AITER_MXFP8_SOL,
+    ):
+        assert _dense_backend_for(sol) is AttentionBackendType.AITER
+
+    # Anything that is not routed is left exactly as the user asked for it.
+    for dense in (
+        AttentionBackendType.AITER,
+        AttentionBackendType.AITER_FP8,
+        AttentionBackendType.SDPA,
+        None,
+    ):
+        assert _dense_backend_for(dense) is dense
+
+
+def test_minimax_h3_refiner_substitution_survives_an_unnamed_backend(monkeypatch):
+    """The runner builds this wrapper without naming a backend, so None is the case that ships.
+
+    None means "ask the runtime state", so a refiner that trusted the constructor argument stayed
+    on whatever --attention_backend selected, Sol-Attn included. Resolve it per call instead.
+    """
+    from xfuser.core.distributed.attention_backend import AttentionBackendType
+    from xfuser.model_executor.models.transformers.transformer_minimax_h3 import (
+        _dense_backend_for,
+    )
+
+    _patch_minimax_runtime_state(monkeypatch)
+    from xfuser.model_executor.models.transformers import transformer_minimax_h3
+
+    runtime_state = transformer_minimax_h3.get_runtime_state()
+    runtime_state.attention_backend = AttentionBackendType.AITER_FP8_SOL
+    assert _dense_backend_for(None) is AttentionBackendType.AITER
+
+    # And a runtime backend that is not routed is still left to the runtime state to supply.
+    runtime_state.attention_backend = AttentionBackendType.SDPA
+    assert _dense_backend_for(None) is None
+
+
+def _run_tiny_forward_capturing_attention(monkeypatch, backend, attention_kwargs=None):
+    """Run one tiny forward and return the attention_kwargs each wrapped attention call saw.
+
+    Goes through the real processors rather than inspecting the wrapper, because the defect this
+    guards was a constructor argument that was never passed: every piece was individually correct.
+    """
+    from xfuser.model_executor.models.transformers import transformer_minimax_h3
+    from xfuser.model_executor.models.transformers.transformer_minimax_h3 import (
+        xFuserMiniMaxH3Transformer3DWrapper,
+    )
+
+    monkeypatch.setattr(
+        transformer_minimax_h3, "get_ulysses_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(transformer_minimax_h3, "get_ulysses_parallel_rank", lambda: 0)
+    _patch_minimax_runtime_state(monkeypatch)
+    transformer_minimax_h3.get_runtime_state().attention_backend = backend
+
+    seen = []
+
+    def _record(query, key, value, **kwargs):
+        seen.append((kwargs.get("backend"), kwargs.get("attention_kwargs")))
+        return torch.zeros_like(query)
+
+    monkeypatch.setattr(transformer_minimax_h3, "attention", _record)
+    monkeypatch.setattr(transformer_minimax_h3, "USP", _record)
+
+    wrapper = xFuserMiniMaxH3Transformer3DWrapper(**_tiny_config()).eval()
+    inputs = _tiny_inputs(torch.device("cpu"))
+    if attention_kwargs is not None:
+        inputs["attention_kwargs"] = attention_kwargs
+    with torch.no_grad():
+        wrapper(**inputs)
+    return seen
+
+
+def test_minimax_h3_names_its_small_modalities_to_sol_attn(monkeypatch):
+    """The pinning is worthless if the key never reaches the backend, which is what shipped.
+
+    It was built only when the constructor was told the backend was a Sol row, and the runner
+    never tells it, so the routing never learned which tokens it must not drop.
+    """
+    from xfuser.core.distributed.attention_backend import (
+        SOL_EXACT_TOKENS_KEY,
+        AttentionBackendType,
+    )
+
+    seen = _run_tiny_forward_capturing_attention(
+        monkeypatch, AttentionBackendType.AITER_FP8_SOL
+    )
+    assert seen, "no attention call was made"
+
+    main_calls = [kwargs for _, kwargs in seen if kwargs is not None]
+    assert main_calls, "the packed-sequence blocks were handed no attention_kwargs at all"
+    for kwargs in main_calls:
+        exact = kwargs.get(SOL_EXACT_TOKENS_KEY)
+        assert exact is not None, "Sol-Attn was not told which tokens must stay exact"
+        # Text and audio named, video left to the routing, and the tile pad left alone.
+        text, audio, video = 4, 12, 48
+        assert exact.dtype is torch.bool
+        assert exact[:text].all() and exact[text : text + audio].all()
+        assert not exact[text + audio : text + audio + video].any()
+        assert int(exact.sum()) == text + audio
+
+
+def test_minimax_h3_refiner_runs_dense_in_a_sol_attn_run(monkeypatch):
+    """Same run, the other half: the refiner's own calls must not be routed.
+
+    Checked through a real forward rather than through _dense_backend_for, since the helper was
+    right all along and the wiring was what sent Sol-Attn to the refiner anyway.
+    """
+    from xfuser.core.distributed.attention_backend import (
+        AITER_MHA_V4_SOL_BACKEND_SET,
+        AttentionBackendType,
+    )
+
+    seen = _run_tiny_forward_capturing_attention(
+        monkeypatch, AttentionBackendType.AITER_FP8_SOL
+    )
+    # The refiner is the site handed no attention_kwargs; it attends the text embeddings alone.
+    refiner_backends = [backend for backend, kwargs in seen if kwargs is None]
+    assert refiner_backends, "the token refiner made no attention call"
+    for backend in refiner_backends:
+        assert backend is AttentionBackendType.AITER, (
+            f"the refiner ran on {backend}, which resolves to a routed backend"
+        )
+        assert backend not in AITER_MHA_V4_SOL_BACKEND_SET
+
+
+def test_minimax_h3_forwards_the_callers_attention_kwargs(monkeypatch):
+    """solattn_beta and friends travel in the caller's dict, which the processors never read.
+
+    The wrapper hands the processors a dict of its own, so without an explicit merge the caller's
+    keys were dropped and beta silently stayed at its default.
+    """
+    from xfuser.core.distributed.attention_backend import AttentionBackendType
+
+    seen = _run_tiny_forward_capturing_attention(
+        monkeypatch,
+        AttentionBackendType.AITER_FP8_SOL,
+        attention_kwargs={"solattn_beta": 0.25},
+    )
+    main_calls = [kwargs for _, kwargs in seen if kwargs is not None]
+    assert main_calls
+    for kwargs in main_calls:
+        assert kwargs.get("solattn_beta") == 0.25
+
+    # And it does not outlive the caller that set it.
+    seen = _run_tiny_forward_capturing_attention(
+        monkeypatch, AttentionBackendType.AITER_FP8_SOL
+    )
+    for kwargs in (k for _, k in seen if k is not None):
+        assert "solattn_beta" not in kwargs
+
+
+def test_minimax_h3_sol_attn_hybrid_needs_no_cross_attention_backend():
+    """A model with no cross-attention should not have to name a cross-attention backend."""
+    from xfuser.config import xFuserArgs
+    from xfuser.model_executor.models.runner_models.minimax_h3 import (
+        xFuserMiniMaxH3Model,
+    )
+
+    xFuserMiniMaxH3Model(
+        xFuserArgs(
+            model="MiniMax-H3",
+            task="t2va",
+            use_hybrid_attn_schedule=True,
+            hybrid_attn_high_precision_backend="cudnn",
+            hybrid_attn_low_precision_backend="aiter_fp8_sol",
+            num_hybrid_attn_high_precision_steps=5,
+        )
+    )
+
+
 def test_minimax_h3_accepts_hybrid_attention_backends():
     from xfuser.config import xFuserArgs
     from xfuser.model_executor.models.runner_models.minimax_h3 import (

@@ -56,6 +56,11 @@ class xFuserHunyuanvideoModel(xFuserModel):
         use_fp8_text_encoder=True,
         fully_shard_degree=True,
         use_parallel_vae=True,
+        # Both block streams attend text and video jointly in one sequence, so every call
+        # Sol-Attn would serve is the long one. The text token refiner is not wrapped -- it keeps
+        # the diffusers processor -- so the short-KV path stays off this backend. Ring is refused
+        # at config time when a Sol row is selected; ulysses is unaffected.
+        supports_sol_attention_backends=True,
     )
     default_input_values = DefaultInputValues(
         height=720,
@@ -189,6 +194,10 @@ class xFuserHunyuanvideo15Model(xFuserModel):
         supports_step_caching=True,
         use_parallel_vae=True,
         use_parallel_vae_encoder=True,
+        # As above: joint text+video attention in the wrapped blocks, refiner left on diffusers.
+        # The encoder mask this variant carries is only read by the SSTA sparse backends; Sol-Attn
+        # takes no mask, so the padded condition tokens are attended as ordinary tokens.
+        supports_sol_attention_backends=True,
     )
     default_input_values = DefaultInputValues(
         height=720,

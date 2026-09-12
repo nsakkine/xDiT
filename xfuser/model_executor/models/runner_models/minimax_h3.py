@@ -32,6 +32,15 @@ _SUPPORTED_ATTN_BACKENDS = frozenset({
     AttentionBackendType.CUDNN,
     AttentionBackendType.SDPA,
     AttentionBackendType.NVTE_FP8,
+    # Sol-Attn rows. H3's attention is non-causal self-attention over one long packed sequence,
+    # which is the shape the pooled correction is for, and its head-balance hook already matches
+    # the per-head cost Sol-Attn publishes. The alignment pad is dropped from K/V through the
+    # varlen metadata rather than attended; see _sol_attn_key_seqlen. Which of these rows a device
+    # actually has is checked against the manifest in runtime_state, not here.
+    AttentionBackendType.AITER_FP8_SOL,
+    AttentionBackendType.AITER_I8FP8_SOL,
+    AttentionBackendType.AITER_MXFP8_SOL,
+    AttentionBackendType.AITER_MXFP4_SOL,
 })
 _SUPPORTED_ULYSSES_DEGREES = frozenset({1, 2, 4, 8})
 _SUPPORTED_TASKS = frozenset({"t2va", "i2va", "l2va", "fl2va", "ref2va"})
@@ -174,6 +183,11 @@ class xFuserMiniMaxH3Model(xFuserModel):
         use_fp8_gemms=True,
         use_fp4_gemms=True,
         use_hybrid_attn_schedule=True,
+        # Sol-Attn only; no Sparge backend is wired for this model. The cross-attention hazard the
+        # shared gate guards does not arise here either, since H3 index_copies text, video and
+        # audio into one packed sequence and attends them together rather than calling out to a
+        # short text KV.
+        supports_sol_attention_backends=True,
         enable_slicing=False,
         enable_tiling=False,
     )

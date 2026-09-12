@@ -19,10 +19,46 @@ from xfuser.core.distributed import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
+from xfuser.core.distributed.attention_backend import (
+    AITER_MHA_V4_SOL_BACKEND_SET,
+    SOL_EXACT_TOKENS_KEY,
+    AttentionBackendType,
+)
 from xfuser.model_executor.layers.usp import USP, attention
 
 
 MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT = 64
+
+
+def _effective_backend(backend):
+    """The backend a call will actually run on.
+
+    None does not mean "no backend" anywhere in this file: the attention entrypoints read it as
+    "ask the runtime state", which is how the runner selects one -- it constructs this wrapper
+    without naming a backend at all. So anything deciding behaviour from the backend has to
+    resolve it the same way, and has to do it per call rather than at construction, since a hybrid
+    schedule can hand different steps different backends.
+    """
+    if backend is not None:
+        return backend
+    return get_runtime_state().attention_backend
+
+
+def _dense_backend_for(backend):
+    """The backend the token refiner should use, given the one chosen for the packed sequence.
+
+    The refiner attends the text embeddings alone, a few hundred tokens, which is nothing for a
+    routed backend to route over: a per-tile threshold drawn from a handful of KV blocks says
+    little, and what it declines to select is then replaced by block means covering much of the
+    sequence. The main blocks are a different question -- they attend the whole packed sequence --
+    so this substitutes only here rather than refusing the backend outright.
+
+    Returns the argument unchanged when it is not routed, which leaves None as None so the call
+    keeps deferring to the runtime state rather than pinning today's answer.
+    """
+    if _effective_backend(backend) in AITER_MHA_V4_SOL_BACKEND_SET:
+        return AttentionBackendType.AITER
+    return backend
 
 
 class xFuserMiniMaxH3AttnProcessor(MiniMaxH3AttnProcessor):
@@ -31,11 +67,15 @@ class xFuserMiniMaxH3AttnProcessor(MiniMaxH3AttnProcessor):
         use_ulysses_parallel_attention: bool,
         attention_kwargs: dict[str, Any] | None = None,
         backend=None,
+        substitute_dense_for_sol: bool = False,
     ) -> None:
         super().__init__()
         self.use_ulysses_parallel_attention = use_ulysses_parallel_attention
         self.attention_kwargs = attention_kwargs
         self.backend = backend
+        # Set for the token refiner, whose sequence is too short to route over. Resolved per call
+        # rather than here because backend is usually None; see _effective_backend.
+        self.substitute_dense_for_sol = substitute_dense_for_sol
 
     def __call__(
         self,
@@ -78,7 +118,11 @@ class xFuserMiniMaxH3AttnProcessor(MiniMaxH3AttnProcessor):
             "is_causal": False,
             "attention_kwargs": self.attention_kwargs,
             "head_balance_layer": attn,
-            "backend": self.backend,
+            "backend": (
+                _dense_backend_for(self.backend)
+                if self.substitute_dense_for_sol
+                else self.backend
+            ),
         }
         if use_ulysses:
             attention_args["combine_qkv_a2a"] = True
@@ -99,12 +143,16 @@ class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
     def __init__(self, *args, attention_backend=None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._usp_attention_kwargs: dict[str, Any] = {}
+        # Keys the caller's attention_kwargs contributed on the previous forward, so they can be
+        # cleared before the next one merges its own.
+        self._caller_attention_keys: tuple[str, ...] = ()
 
         for block in self.token_refiner.refiner_blocks:
             block.attn.set_processor(
                 xFuserMiniMaxH3AttnProcessor(
                     use_ulysses_parallel_attention=False,
                     backend=attention_backend,
+                    substitute_dense_for_sol=True,
                 )
             )
 
@@ -267,6 +315,17 @@ class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
             + local_token_tags.clamp(min=0)
         )
 
+        # The processors read self._usp_attention_kwargs, not the argument, so anything the caller
+        # asked for has to be copied across or it is silently dropped -- solattn_beta being the
+        # one that matters. Merged before this model's own metadata so the model's packing wins a
+        # collision, and last call's contributions are cleared first so nothing outlives the
+        # caller that set it.
+        for stale in self._caller_attention_keys:
+            self._usp_attention_kwargs.pop(stale, None)
+        self._caller_attention_keys = tuple(attention_kwargs or ())
+        if attention_kwargs:
+            self._usp_attention_kwargs.update(attention_kwargs)
+
         if pad_amount:
             indices_k = torch.arange(
                 sequence_length,
@@ -288,6 +347,22 @@ class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
             self._usp_attention_kwargs.pop("indices_k", None)
             self._usp_attention_kwargs.pop("cu_seqlens_k", None)
             self._usp_attention_kwargs.pop("max_seqlen_k", None)
+
+        # Audio and text are a fraction of a percent and a few percent of this sequence; video is
+        # the rest. Sol-Attn thresholds each KV block against statistics taken over every block,
+        # so the two small modalities are judged against a distribution video writes, and their
+        # own queries lose the blocks they most needed -- audio worst, being the smaller. Name
+        # them and routing adds them to whatever it picked. Cost is one exact block per block they
+        # occupy, and it cannot make the answer worse: a forced block moves from the pooled
+        # approximation to the exact pass.
+        #
+        # Set unconditionally. Only Sol-Attn looks the key up and every other backend ignores it,
+        # which is cheaper than being clever: deciding here would mean resolving the backend, and
+        # the wrapper is built without one.
+        exact_tokens = packed_hidden_states.new_zeros(padded_length, dtype=torch.bool)
+        exact_tokens[text_indices] = True
+        exact_tokens[audio_indices] = True
+        self._usp_attention_kwargs[SOL_EXACT_TOKENS_KEY] = exact_tokens
 
         for block in self.transformer_blocks:
             if torch.is_grad_enabled() and self.gradient_checkpointing:

@@ -690,6 +690,10 @@ AITER_MHA_V4_SOL_BACKENDS = (
     AttentionBackendType.AITER_MXFP4_SOL,
 )
 AITER_MHA_V4_SOL_BACKEND_SET = frozenset(AITER_MHA_V4_SOL_BACKENDS)
+# attention_kwargs key a model uses to name the KV tokens routing must not drop. See
+# sol_attn_bhsd's exact_tokens argument for what it is for. It lives here rather than beside that
+# argument so a model can set it without importing sol.py, whose import is deliberately lazy.
+SOL_EXACT_TOKENS_KEY = "_sol_exact_tokens"
 # Which recipe each backend asks for, so setup can check the device has that row. The MX two are
 # gfx950-only; gfx942 builds the per-tensor pair.
 AITER_MHA_V4_SOL_RECIPE = {
@@ -1524,6 +1528,27 @@ def _aiter_f4f4_sparge_attn_call(query, key, value, dropout_p, is_causal, attent
     )
 
 
+def _sol_attn_key_seqlen(kwargs):
+    """Real KV token count from a caller's varlen metadata, or None when it padded nothing.
+
+    Only the single-segment form is accepted, which is what a model padding one packed sequence to
+    its own alignment produces. Genuinely packed multi-sequence varlen is refused rather than
+    approximated: Sol-Attn has no mask, so it would attend across the segment boundaries, and its
+    pooled blocks would straddle them too. Only shapes and the python int are read, never the
+    tensor's values, so this stays traceable.
+    """
+    cu_seqlens_k = kwargs.get("cu_seqlens_k")
+    if cu_seqlens_k is not None and cu_seqlens_k.numel() > 2:
+        from xfuser.core.sparse_attention.sol import SolAttnUnsupported
+
+        raise SolAttnUnsupported(
+            f"Sol-Attn takes one sequence per call, got cu_seqlens_k with "
+            f"{cu_seqlens_k.numel() - 1} segments. Select another attention backend for packed "
+            "multi-sequence batches.")
+    max_seqlen_k = kwargs.get("max_seqlen_k")
+    return int(max_seqlen_k) if max_seqlen_k is not None else None
+
+
 def _aiter_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs, recipe):
     """Run Sol-Attn on one of the AITER MHA v4 mode-2 rows.
 
@@ -1550,6 +1575,10 @@ def _aiter_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
         dump_path=sol_attn_dump_path(),
         return_head_cost=cost_sink is not None,
         recipe=recipe,
+        key_seqlen=_sol_attn_key_seqlen(kwargs),
+        # Set by a model that packs several modalities into one sequence, naming the tokens whose
+        # blocks routing must not be allowed to drop. See sol_attn_bhsd.
+        exact_tokens=kwargs.get(SOL_EXACT_TOKENS_KEY),
     )
     if cost_sink is not None:
         cost_sink.copy_(head_cost)

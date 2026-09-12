@@ -267,7 +267,24 @@ def _quantize(recipe, query, key, value, softmax_scale):
             (v, v_descale, value if packed else None))
 
 
-def sol_attn_routing_for(q, k, v, beta, recipe=_RECIPES["fp8"]):
+def _force_blocks_from_tokens(exact_tokens, key_seqlen, padded_seqlen):
+    """Per-KV-block "compute this exactly" flags from a per-token mask.
+
+    A block is forced on when it holds any flagged token, because the block is the finest thing
+    the selection can express. Follows K/V through the same trim and tile pad so the two cannot
+    fall out of step, and is pure tensor work -- no host-side read of device data -- so it stays
+    traceable.
+    """
+    if key_seqlen is not None and key_seqlen < exact_tokens.shape[0]:
+        exact_tokens = exact_tokens[:key_seqlen]
+    pad = padded_seqlen - exact_tokens.shape[0]
+    if pad > 0:
+        # The tile pad is zero keys, which nothing needs computed exactly.
+        exact_tokens = torch.nn.functional.pad(exact_tokens, (0, pad))
+    return exact_tokens.reshape(-1, _kv_tile()).any(dim=1)
+
+
+def sol_attn_routing_for(q, k, v, beta, recipe=_RECIPES["fp8"], force_blocks=None):
     """Pooled K/V, ragged LUT and selection bitmap for one call, as the kernel consumes them.
 
     q/k/v are the (tensor, descale, source) triples _quantize returns. num_heads is passed
@@ -299,6 +316,7 @@ def sol_attn_routing_for(q, k, v, beta, recipe=_RECIPES["fp8"]):
         v_source=v[2],
         k_packed_format=packed,
         v_packed_format=packed,
+        force_block_mask=force_blocks,
     )
 
 
@@ -307,6 +325,45 @@ def _head_cost_from_routing(routing):
     """
     mask = routing["block_attn_mask"]  # (batch, nheads_q, num_q_tiles, num_kv_blocks) bool
     return mask.sum(dim=(0, 2, 3), dtype=torch.float32)
+
+
+# Below this many KV blocks, routing has too few samples to say anything. tau is a mean plus a
+# multiple of a standard deviation taken across the blocks, so with a handful of them the
+# threshold is noise, and whatever it does not select is replaced by block means that are then a
+# large fraction of the whole sequence. 16 is a judgement call, not a measured cliff.
+_MIN_USEFUL_KV_BLOCKS = 16
+_short_kv_warned = set()
+
+
+def _warn_if_kv_too_short(seqlen_k):
+    """Say something when a call is too short for Sol-Attn to be worth routing.
+
+    This is the failure mode that does not announce itself: nothing raises, the answer is just
+    quietly worse than the dense backend would have given, which is easy to ship by accident when
+    a model turns out to have a second attention site on a short sequence.
+
+    Skipped under torch.compile. The branch folds away at trace time, which keeps the warning from
+    being a side effect in a traced region -- so a fully compiled run will not see it, and this is
+    a backstop for eager runs rather than a guarantee.
+    """
+    if torch.compiler.is_compiling():
+        return
+    blocks = seqlen_k // _kv_tile()
+    if blocks >= _MIN_USEFUL_KV_BLOCKS or blocks in _short_kv_warned:
+        return
+    _short_kv_warned.add(blocks)
+    import warnings
+
+    warnings.warn(
+        f"Sol-Attn was handed a {seqlen_k}-token KV, i.e. {blocks} blocks of {_kv_tile()}. Its "
+        f"routing threshold is a mean plus a multiple of a standard deviation over the blocks, "
+        f"which says little at that count, and the pooled correction is then standing in for much "
+        f"of the sequence. Expect a worse result than a dense backend, not a faster one. If this "
+        f"is a short text-only attention inside a model whose main attention is long, that site "
+        f"should be on a dense backend.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
 
 
 def _pad_kv_to_tile(key, value):
@@ -344,7 +401,8 @@ def _maybe_dump(path, query, key, value):
 
 def sol_attn_bhsd(query, key, value, is_causal=False, beta=1.0, softmax_scale=None,
                   routing=None, ring_world_size=1, dump_path=None,
-                  return_head_cost=False, recipe="fp8"):
+                  return_head_cost=False, recipe="fp8", key_seqlen=None,
+                  exact_tokens=None):
     """Sol-Attn over BHSD tensors, returning (BHSD bf16 output, per-head cost or None).
 
     query/key/value are (batch, nheads, seqlen, head_dim) bf16 tensors. They are permuted into the
@@ -358,6 +416,20 @@ def sol_attn_bhsd(query, key, value, is_causal=False, beta=1.0, softmax_scale=No
     onto aiter's packed API and makes quantization and routing explicit here. The MX recipes have no
     raw entrypoint and take that path always. A caller-supplied `routing` also forces it. Every path
     is traceable; none graph-break.
+
+    key_seqlen is the number of real KV tokens when the caller has already padded the sequence for
+    its own alignment, as MiniMax-H3 does to pack one request into one audiovisual sequence. Sol-Attn
+    takes no attention mask, so the padded tail is dropped here rather than attended: left in, it
+    would draw softmax weight and also enter the routing threshold's per-tile mean and standard
+    deviation, which is a quieter error than the weight itself. Defaults to the whole tensor.
+
+    exact_tokens is a per-KV-token bool mask, (seqlen_k,), naming tokens that must be computed
+    exactly rather than left to the pooled approximation. Routing still runs; these are added to
+    what it picked. A caller whose sequence is one modality does not need this. A caller packing
+    several into one sequence does: the threshold is built from statistics over every block, so a
+    modality holding a small share of the sequence is judged against a distribution the majority
+    wrote, and its own queries lose the blocks they needed. Flagging the minority costs about one
+    exact block per block it occupies, which is few by the same token.
     """
     if _AITER is None:
         raise SolAttnUnsupported(
@@ -371,12 +443,25 @@ def sol_attn_bhsd(query, key, value, is_causal=False, beta=1.0, softmax_scale=No
 
     check_sol_attn_supported(query, key, value, is_causal, ring_world_size=ring_world_size)
     _maybe_dump(dump_path, query, key, value)
+    # Before the tile pad, so the two do not stack: the caller's alignment is dropped and only the
+    # kernel's own remainder is padded back, which is at most one block of zero tokens.
+    if key_seqlen is not None and key_seqlen < key.shape[1]:
+        key, value = key[:, :key_seqlen], value[:, :key_seqlen]
     key, value = _pad_kv_to_tile(key, value)
+    _warn_if_kv_too_short(key.shape[1])
 
     if softmax_scale is None:
         softmax_scale = query.shape[-1] ** -0.5
 
-    if routing is None and not return_head_cost and recipe.routes_through_raw:
+    force_blocks = (
+        None if exact_tokens is None
+        else _force_blocks_from_tokens(exact_tokens, key_seqlen, key.shape[1])
+    )
+
+    # The raw entrypoint routes internally from beta alone, so it cannot be told about forced
+    # blocks any more than it can be asked for the head cost.
+    if (routing is None and not return_head_cost and force_blocks is None
+            and recipe.routes_through_raw):
         qk, v_fmt = _format(recipe.qk_format), _format(recipe.v_format)
         out = _AITER.sol_attn(query, key, value, qk, qk, v_fmt, beta=beta,
                               softmax_scale=softmax_scale)
@@ -389,7 +474,7 @@ def sol_attn_bhsd(query, key, value, is_causal=False, beta=1.0, softmax_scale=No
     # numerically identical to the raw one, so asking for the head cost cannot change the output.
     q, k, v = _quantize(recipe, query, key, value, softmax_scale)
     if routing is None:
-        routing = sol_attn_routing_for(q, k, v, beta, recipe)
+        routing = sol_attn_routing_for(q, k, v, beta, recipe, force_blocks=force_blocks)
     qk_fmt, v_fmt = _format(recipe.qk_format), _format(recipe.v_format)
     qk_scale, v_scale = _scale_mode(recipe.qk_scale_mode), _scale_mode(recipe.v_scale_mode)
     out = _AITER.packed(
