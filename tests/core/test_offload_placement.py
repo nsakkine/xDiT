@@ -34,7 +34,7 @@ def _model(*, local_rank, monkeypatch, **offload_flags):
         components={},
     )
     flags = {
-        "use_spargeattn_head_balance": False,
+        "use_sparseattn_head_balance": False,
         "enable_slicing": False,
         "enable_tiling": False,
         "enable_group_cpu_offload": False,
@@ -47,6 +47,10 @@ def _model(*, local_rank, monkeypatch, **offload_flags):
         config=SimpleNamespace(**flags),
         pipe=pipe,
         _get_compiled_pipe_components=lambda: [],
+        # _enable_options hands slicing and tiling to the VAE manager before it gets to the
+        # offloading these tests are about, so it needs to be here, but it needs to do nothing.
+        _vae_manager=SimpleNamespace(enable_options=lambda vaes: None),
+        _decoding_vaes=lambda: [],
     )
     model._local_onload_device = lambda: xFuserModel._local_onload_device(model)
     return model, calls
