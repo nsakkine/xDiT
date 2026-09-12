@@ -20,6 +20,7 @@ except ModuleNotFoundError:
 
 import xfuser.envs as envs
 from xfuser.envs import PACKAGES_CHECKER
+
 if envs._is_npu():
     from torch.npu import manual_seed as device_manual_seed
     from torch.npu import manual_seed_all as device_manual_seed_all
@@ -36,6 +37,7 @@ from xfuser.core.distributed.attention_backend import (
     AttentionBackendType,
 )
 from xfuser.core.distributed.attention_schedule import AttentionSchedule, GemmPrecisionSchedule
+from xfuser.core.distributed.fp8_comms import Fp8CommsState
 from xfuser.config.config import (
     ParallelConfig,
     RuntimeConfig,
@@ -59,6 +61,7 @@ logger = init_logger(__name__)
 
 env_info = PACKAGES_CHECKER.get_packages_info()
 
+
 def set_random_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -70,6 +73,7 @@ def set_random_seed(seed: int):
 class RuntimeState(metaclass=ABCMeta):
     attention_backend: AttentionBackendType = AttentionBackendType.SDPA_FLASH
     cross_attention_backend: Optional[AttentionBackendType] = None
+    fp8_comms: Optional[Fp8CommsState] = None
     parallel_config: ParallelConfig
     runtime_config: RuntimeConfig
     input_config: InputConfig
@@ -88,6 +92,7 @@ class RuntimeState(metaclass=ABCMeta):
         self.set_attention_backend(attention_backend)
         cross_attention_backend = self._select_cross_attention_backend(config)
         self.set_cross_attention_backend(cross_attention_backend)
+        self.fp8_comms = Fp8CommsState.from_config(config)
 
     def is_ready(self):
         return self.ready
@@ -235,6 +240,8 @@ class RuntimeState(metaclass=ABCMeta):
                                  AttentionBackendType.SDPA_MATH,
                                  AttentionBackendType.FLASH_4,
                                  AttentionBackendType.FLASH_4_FP4,
+                                 AttentionBackendType.AITER_BF16,
+                                 AttentionBackendType.AITER_BF16FP8,
                                  *AITER_LOW_PRECISION_BACKENDS,
                                  *AITER_MHA_V4_SPARGE_BACKENDS,
                                  AttentionBackendType.AITER_MLA,
@@ -322,12 +329,20 @@ class RuntimeState(metaclass=ABCMeta):
                 raise RuntimeError("AITER fp8 flash attention is not available, please update AITER")
         elif attention_backend == AttentionBackendType.AITER_MXFP8:
             try:
-                from aiter.ops.mha_v4 import mha_v4_mxfp8
+                from aiter.ops.mha_v4 import mha_v4
             except ImportError:
                 raise RuntimeError(
                     f"{attention_backend.value} attention is not available, "
                     "please update AITER"
                 ) from None
+            try:
+                from aiter.ops.mha_v4 import mha_v4_mxfp8
+            except ImportError:
+                if inspect.signature(mha_v4).parameters.get("q_scale_mode") is None:
+                    raise RuntimeError(
+                        f"{attention_backend.value} attention is not available, "
+                        "please update AITER"
+                    ) from None
         elif attention_backend in AITER_MHA_V4_ONLY_BACKEND_SET:
             try:
                 from aiter.ops.mha_v4 import mha_v4
@@ -566,6 +581,7 @@ class DiTRuntimeState(RuntimeState):
             self.use_high_precision_gemm = self.gemm_schedule.is_high_precision(current_step)
 
         self.step_counter = self.step_counter + 1
+
         if self.step_counter >= active_total_steps:
             self.step_counter = 0
 

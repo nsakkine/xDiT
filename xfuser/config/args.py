@@ -1,6 +1,7 @@
-import sys
 import argparse
 import dataclasses
+import os
+import sys
 import warnings
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Union
@@ -11,6 +12,7 @@ import torch.distributed
 from xfuser.logger import init_logger
 from xfuser.core.distributed import init_distributed_environment
 from xfuser.config.config import (
+    DEFAULT_FP8_COMMS_SAFETY_FACTOR,
     EngineConfig,
     FastAttnConfig,
     ParallelConfig,
@@ -67,6 +69,72 @@ def nullable_str(val: str):
     if not val or val == "None":
         return None
     return val
+
+
+_DETERMINISM_CHECK_HELP = (
+    "Set to a positive failure threshold to compare every timed iteration with "
+    "the first using exact equality, not a tolerance. The failure handler is "
+    "called for each rank enabled by --determinism_check_report_ranks on each "
+    "divergence until the threshold is reached. "
+    "Disabled at 0 or below. Enabling retains and compares full output payloads, "
+    "which adds memory, synchronization, and transfer overhead."
+)
+
+_DETERMINISM_CHECK_REPORT_RANKS_DEFAULT = "last"
+
+_DETERMINISM_CHECK_REPORT_RANKS_HELP = (
+    "Ranks on which determinism failures save serialized outputs. Accepts a "
+    "comma-separated list of integers, an empty value, or one of: all, first, "
+    "last, none. Empty and none select no ranks. "
+    f"Defaults to {_DETERMINISM_CHECK_REPORT_RANKS_DEFAULT}. Many failures "
+    "may produce many large output files; restrict output to selected ranks "
+    "based on model specifics. The none value is useful with a positive "
+    "--determinism_check when only log messages, but no files, are needed."
+)
+
+
+def _normalize_determinism_check_report_ranks(value: str) -> frozenset[int]:
+    """Resolve a rank string; ``none`` and empty values select no ranks."""
+    try:
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    except ValueError as exc:
+        raise ValueError("WORLD_SIZE must be a positive integer") from exc
+    if world_size <= 0:
+        raise ValueError("WORLD_SIZE must be a positive integer")
+    if not isinstance(value, str):
+        raise TypeError("determinism_check_report_ranks must be a string")
+
+    value = value.strip()
+    if value == "all":
+        ranks = frozenset(range(world_size))
+    elif value == "first":
+        ranks = frozenset({0})
+    elif value == "last":
+        ranks = frozenset({world_size - 1})
+    elif value in ("none", ""):
+        ranks = frozenset()
+    else:
+        parts = [p.strip() for p in value.split(",")]
+        if any(not part for part in parts):
+            raise ValueError(
+                "determinism_check_report_ranks must be a comma-separated list "
+                "of integers, empty, or one of: all, first, last, none"
+            )
+        try:
+            ranks = frozenset(int(part) for part in parts)
+        except ValueError as exc:
+            raise ValueError(
+                "determinism_check_report_ranks must be a comma-separated list "
+                "of integers, empty, or one of: all, first, last, none"
+            ) from exc
+
+    invalid_ranks = sorted(rank for rank in ranks if rank < 0 or rank >= world_size)
+    if invalid_ranks:
+        raise ValueError(
+            "determinism_check_report_ranks contains ranks outside "
+            f"0..{world_size - 1}: {invalid_ranks}"
+        )
+    return ranks
 
 
 @dataclass
@@ -152,8 +220,13 @@ class xFuserArgs:
     use_fp4_gemms: bool = False
     fp8_precision_override_prefix_patterns: Optional[str] = None
     fp8_precision_override_suffix_patterns: Optional[str] = None
+    use_fp8_comms: bool = False
+    fp8_comms_scale: Optional[float] = None
+    fp8_comms_safety_factor: float = DEFAULT_FP8_COMMS_SAFETY_FACTOR
     # Model runner specific
     num_iterations: int = 1
+    determinism_check: int = 0
+    determinism_check_report_ranks: str | frozenset[int] = "all"
     profile: bool = False
     profile_capture_phase: bool = False
     profile_with_stack: bool = False
@@ -208,6 +281,11 @@ class xFuserArgs:
     distilled_transformer_2_path: Optional[str] = None
 
     def __post_init__(self):
+        self.determinism_check_report_ranks = (
+            _normalize_determinism_check_report_ranks(
+                self.determinism_check_report_ranks
+            )
+        )
         if self.profile_with_stack and not self.profile:
             logger.warning(
                 "--profile_with_stack has no effect without --profile; "
@@ -520,6 +598,25 @@ class xFuserArgs:
             action="store_true",
             help="Quantize the transformer linear layers (selected models only).",
         )
+        runtime_group.add_argument(
+            "--use_fp8_comms",
+            action="store_true",
+            help="Quantize Ulysses all-to-all communication to FP8.",
+        )
+        runtime_group.add_argument(
+            "--fp8_comms_scale",
+            type=float,
+            default=None,
+            help="Override the model-specific FP8 communication scale.",
+        )
+        runtime_group.add_argument(
+            "--fp8_comms_safety_factor",
+            type=float,
+            default=DEFAULT_FP8_COMMS_SAFETY_FACTOR,
+            help="Safety factor for the calibrated FP8 comms scale: scale = amax / "
+                 "(FP8_MAX * safety_factor). LOWER it (e.g. 0.4) to enlarge the scale and "
+                 "leave more headroom before fp8 saturation. Default 0.85.",
+        )
 
         # DiTFastAttn arguments
         fast_attn_group = parser.add_argument_group("DiTFastAttn Options")
@@ -556,6 +653,18 @@ class xFuserArgs:
             "--use_cache",
             action="store_true",
             help="Use cache config for attention compression.",
+        )
+        runtime_group.add_argument(
+            "--determinism_check",
+            type=int,
+            default=0,
+            help=_DETERMINISM_CHECK_HELP,
+        )
+        runtime_group.add_argument(
+            "--determinism_check_report_ranks",
+            type=str,
+            default=_DETERMINISM_CHECK_REPORT_RANKS_DEFAULT,
+            help=_DETERMINISM_CHECK_REPORT_RANKS_HELP,
         )
 
         return parser
@@ -817,12 +926,42 @@ class xFuserArgs:
             default=None,
             help="Comma-delimited FQN suffix patterns to keep in FP8 during FP4 GEMMs.",
         )
-
+        parser.add_argument(
+            "--use_fp8_comms",
+            action="store_true",
+            help="Quantize Ulysses all-to-all communication to FP8.",
+        )
+        parser.add_argument(
+            "--fp8_comms_scale",
+            type=float,
+            default=None,
+            help="Override the model-specific FP8 communication scale.",
+        )
+        parser.add_argument(
+            "--fp8_comms_safety_factor",
+            type=float,
+            default=DEFAULT_FP8_COMMS_SAFETY_FACTOR,
+            help="Safety factor for the calibrated FP8 comms scale: scale = amax / "
+                 "(FP8_MAX * safety_factor). LOWER it (e.g. 0.4) to enlarge the scale and "
+                 "leave more headroom before fp8 saturation. Default 0.85.",
+        )
         parser.add_argument(
             "--num_iterations",
             type=int,
             default=1,
             help="Number of iterations to run the model."
+        )
+        parser.add_argument(
+            "--determinism_check",
+            type=int,
+            default=0,
+            help=_DETERMINISM_CHECK_HELP,
+        )
+        parser.add_argument(
+            "--determinism_check_report_ranks",
+            type=str,
+            default=_DETERMINISM_CHECK_REPORT_RANKS_DEFAULT,
+            help=_DETERMINISM_CHECK_REPORT_RANKS_HELP,
         )
         parser.add_argument(
             "--profile",
@@ -1216,6 +1355,9 @@ class xFuserArgs:
             use_vsa_static_block_mask=self.use_vsa_static_block_mask,
             use_vsa_first_frame_mask=self.use_vsa_first_frame_mask,
             vsa_collect_density=self.vsa_collect_density,
+            use_fp8_comms=self.use_fp8_comms,
+            fp8_comms_scale=self.fp8_comms_scale,
+            fp8_comms_safety_factor=self.fp8_comms_safety_factor,
         )
 
         parallel_config = ParallelConfig(
