@@ -109,6 +109,8 @@ def _patch_minimax_runtime_state(monkeypatch, *, track_steps=False):
 
     class _RuntimeState:
         attention_backend = AttentionBackendType.SDPA
+        # The model reads --solattn_beta from here, nothing upstream of it passing one.
+        runtime_config = SimpleNamespace(solattn_beta=0.5)
 
         def has_attention_schedule(self):
             return False
@@ -881,7 +883,9 @@ def test_minimax_h3_refiner_substitution_survives_an_unnamed_backend(monkeypatch
     assert _dense_backend_for(None) is None
 
 
-def _run_tiny_forward_capturing_attention(monkeypatch, backend, attention_kwargs=None):
+def _run_tiny_forward_capturing_attention(
+    monkeypatch, backend, attention_kwargs=None, solattn_beta=None
+):
     """Run one tiny forward and return the attention_kwargs each wrapped attention call saw.
 
     Goes through the real processors rather than inspecting the wrapper, because the defect this
@@ -897,7 +901,10 @@ def _run_tiny_forward_capturing_attention(monkeypatch, backend, attention_kwargs
     )
     monkeypatch.setattr(transformer_minimax_h3, "get_ulysses_parallel_rank", lambda: 0)
     _patch_minimax_runtime_state(monkeypatch)
-    transformer_minimax_h3.get_runtime_state().attention_backend = backend
+    runtime_state = transformer_minimax_h3.get_runtime_state()
+    runtime_state.attention_backend = backend
+    if solattn_beta is not None:
+        runtime_state.runtime_config.solattn_beta = solattn_beta
 
     seen = []
 
@@ -946,6 +953,43 @@ def test_minimax_h3_names_its_small_modalities_to_sol_attn(monkeypatch):
         assert int(exact.sum()) == text + audio
 
 
+def test_minimax_h3_honours_the_configured_solattn_beta(monkeypatch):
+    """--solattn_beta has to reach the attention call, and for this model nothing else carries it.
+
+    Wan builds an attention_kwargs dict in its runner and hands it to the wrapper's constructor.
+    H3's runners call from_pretrained with neither that dict nor a backend, so every launch got the
+    backend's own 0.5 fallback no matter what was asked for, and the one knob that trades quality
+    against speed did nothing at all.
+    """
+    from xfuser.core.distributed.attention_backend import AttentionBackendType
+
+    seen = _run_tiny_forward_capturing_attention(
+        monkeypatch, AttentionBackendType.AITER_FP8_SOL, solattn_beta=0.125
+    )
+    main_calls = [kwargs for _, kwargs in seen if kwargs is not None]
+    assert main_calls, "the packed-sequence blocks were handed no attention_kwargs at all"
+    for kwargs in main_calls:
+        assert kwargs.get("solattn_beta") == 0.125, (
+            "the launch config's beta never reached the routing, so it ran at the fallback"
+        )
+
+
+def test_minimax_h3_lets_a_caller_override_the_configured_beta(monkeypatch):
+    """An explicitly passed beta outranks the launch config, so the seeding cannot shadow a caller."""
+    from xfuser.core.distributed.attention_backend import AttentionBackendType
+
+    seen = _run_tiny_forward_capturing_attention(
+        monkeypatch,
+        AttentionBackendType.AITER_FP8_SOL,
+        attention_kwargs={"solattn_beta": 0.75},
+        solattn_beta=0.125,
+    )
+    main_calls = [kwargs for _, kwargs in seen if kwargs is not None]
+    assert main_calls, "the packed-sequence blocks were handed no attention_kwargs at all"
+    for kwargs in main_calls:
+        assert kwargs.get("solattn_beta") == 0.75
+
+
 def test_minimax_h3_refiner_runs_dense_in_a_sol_attn_run(monkeypatch):
     """Same run, the other half: the refiner's own calls must not be routed.
 
@@ -974,7 +1018,7 @@ def test_minimax_h3_forwards_the_callers_attention_kwargs(monkeypatch):
     """solattn_beta and friends travel in the caller's dict, which the processors never read.
 
     The wrapper hands the processors a dict of its own, so without an explicit merge the caller's
-    keys were dropped and beta silently stayed at its default.
+    keys were dropped and beta silently stayed at whatever the backend defaulted to.
     """
     from xfuser.core.distributed.attention_backend import AttentionBackendType
 
@@ -982,18 +1026,20 @@ def test_minimax_h3_forwards_the_callers_attention_kwargs(monkeypatch):
         monkeypatch,
         AttentionBackendType.AITER_FP8_SOL,
         attention_kwargs={"solattn_beta": 0.25},
+        solattn_beta=0.125,
     )
     main_calls = [kwargs for _, kwargs in seen if kwargs is not None]
     assert main_calls
     for kwargs in main_calls:
         assert kwargs.get("solattn_beta") == 0.25
 
-    # And it does not outlive the caller that set it.
+    # And it does not outlive the caller that set it: the next call falls back to the launch
+    # config's beta rather than carrying 0.25 over.
     seen = _run_tiny_forward_capturing_attention(
-        monkeypatch, AttentionBackendType.AITER_FP8_SOL
+        monkeypatch, AttentionBackendType.AITER_FP8_SOL, solattn_beta=0.125
     )
     for kwargs in (k for _, k in seen if k is not None):
-        assert "solattn_beta" not in kwargs
+        assert kwargs.get("solattn_beta") == 0.125
 
 
 def test_minimax_h3_sol_attn_hybrid_needs_no_cross_attention_backend():

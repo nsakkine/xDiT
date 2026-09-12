@@ -44,6 +44,20 @@ def _effective_backend(backend):
     return get_runtime_state().attention_backend
 
 
+def _configured_solattn_beta():
+    """The routing threshold offset the run was launched with.
+
+    Read from the runtime state for the same reason the backend is: this model's runners build the
+    wrapper straight from from_pretrained and pass neither an attention_kwargs dict nor a backend,
+    so --solattn_beta reaches the attention call only if the model fetches it. Wan instead hands
+    its runner's dict to the wrapper's constructor, which is why it never needed this.
+
+    Only a python float is read, so this stays traceable; a change to it would retrace, but it is
+    fixed for the life of a run.
+    """
+    return get_runtime_state().runtime_config.solattn_beta
+
+
 def _dense_backend_for(backend):
     """The backend the token refiner should use, given the one chosen for the packed sequence.
 
@@ -315,11 +329,15 @@ class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
             + local_token_tags.clamp(min=0)
         )
 
+        # Seeded from the launch config, not from the caller: nothing upstream of this model passes
+        # an attention_kwargs dict, so the backend's own default is what applied before this and
+        # --solattn_beta did nothing. Set before the caller's merge so an explicit value still wins.
+        self._usp_attention_kwargs["solattn_beta"] = _configured_solattn_beta()
+
         # The processors read self._usp_attention_kwargs, not the argument, so anything the caller
-        # asked for has to be copied across or it is silently dropped -- solattn_beta being the
-        # one that matters. Merged before this model's own metadata so the model's packing wins a
-        # collision, and last call's contributions are cleared first so nothing outlives the
-        # caller that set it.
+        # asked for has to be copied across or it is silently dropped. Merged before this model's
+        # own metadata so the model's packing wins a collision, and last call's contributions are
+        # cleared first so nothing outlives the caller that set it.
         for stale in self._caller_attention_keys:
             self._usp_attention_kwargs.pop(stale, None)
         self._caller_attention_keys = tuple(attention_kwargs or ())
