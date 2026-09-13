@@ -51,7 +51,7 @@ from xfuser.core.distributed.attention_backend import (
     AttentionBackendType,
 )
 from xfuser.core.distributed.fp8_comms import setup_fp8_comms, validate_fp8_comms_config
-from xfuser.core.distributed.attention_schedule import AttentionSchedule, create_hybrid_attn_schedule, create_hybrid_gemm_schedule
+from xfuser.core.distributed.attention_schedule import AttentionSchedule, SolAttnBetaSchedule, create_hybrid_attn_schedule, create_hybrid_gemm_schedule
 from xfuser.model_executor.models.runner_models.loading.contracts import (
     LoadSupport,
     LoadRoute,
@@ -1063,6 +1063,9 @@ class xFuserModel(abc.ABC):
         if self.config.use_hybrid_gemm_schedule:
             self._setup_hybrid_gemm_schedule(input_args)
 
+        if getattr(self.config, "solattn_beta_schedule", None) is not None:
+            self._setup_solattn_beta_schedule(input_args)
+
         if self.config.use_vae_channels_last_format:
             self._convert_vae_to_channels_last()
 
@@ -1099,6 +1102,28 @@ class xFuserModel(abc.ABC):
         log("Enabling hybrid attention schedule")
         log(f"Hybrid attention schedule: {attention_schedule.backends}", debug=True)
         get_runtime_state().set_attention_schedule(attention_schedule, total_steps=total_steps)
+
+    def _setup_solattn_beta_schedule(self, input_args: dict) -> None:
+        """
+        Setup a per-step Sol-Attn routing threshold from --solattn_beta_schedule.
+
+        The spec is read per denoising step and held across that step's forwards, which is the
+        same multiplier the hybrid schedules use. The step counter advances per forward, so the
+        expansion is what makes a step's conditional and unconditional branch share a beta;
+        spreading the ramp over forwards instead would route one branch more exactly than the
+        other for the whole run, and guidance subtracts the two rather than averaging them.
+        """
+        forwards_per_step = self._calculate_hybrid_attention_step_multiplier(input_args)
+        denoising_steps = input_args["num_inference_steps"]
+        beta_schedule = SolAttnBetaSchedule.from_spec(
+            self.config.solattn_beta_schedule, denoising_steps,
+            forwards_per_step=forwards_per_step,
+        )
+
+        log("Enabling per-step Sol-Attn beta schedule")
+        log(f"Sol-Attn beta schedule: {beta_schedule.per_denoising_step}", debug=True)
+        get_runtime_state().set_solattn_beta_schedule(
+            beta_schedule, total_steps=denoising_steps * forwards_per_step)
 
     def _setup_hybrid_gemm_schedule(self, input_args: dict) -> None:
         """

@@ -5,6 +5,8 @@ Sol-Attn (arXiv 2607.24027) computes the same selected blocks exactly and additi
 contribution of the skipped blocks from pooled (mean) K/V, so the mass outside the selection is
 approximated instead of discarded.
 """
+import functools
+import os
 from types import SimpleNamespace
 from typing import NamedTuple
 
@@ -284,12 +286,17 @@ def _force_blocks_from_tokens(exact_tokens, key_seqlen, padded_seqlen):
     return exact_tokens.reshape(-1, _kv_tile()).any(dim=1)
 
 
-def sol_attn_routing_for(q, k, v, beta, recipe=_RECIPES["fp8"], force_blocks=None):
+def sol_attn_routing_for(q, k, v, beta, recipe=_RECIPES["fp8"], force_blocks=None,
+                         block_attn_mask=None):
     """Pooled K/V, ragged LUT and selection bitmap for one call, as the kernel consumes them.
 
     q/k/v are the (tensor, descale, source) triples _quantize returns. num_heads is passed
     explicitly because the routing is per query head under GQA, while the pooled K/V it returns
     carry the KV head count instead.
+
+    block_attn_mask supplies an already chosen selection instead of routing from beta, which is
+    what lets a caller measure some other rule's selection through this same kernel and pooled
+    correction. Pass exactly one of it and beta.
     """
     packed = recipe.packed_format
     block_scaled = recipe.qk_scale_mode == "block"
@@ -317,6 +324,7 @@ def sol_attn_routing_for(q, k, v, beta, recipe=_RECIPES["fp8"], force_blocks=Non
         k_packed_format=packed,
         v_packed_format=packed,
         force_block_mask=force_blocks,
+        block_attn_mask=block_attn_mask,
     )
 
 
@@ -390,13 +398,37 @@ def _pad_kv_to_tile(key, value):
             torch.nn.functional.pad(value, widths))
 
 
+@functools.cache
+def _dump_call_indices():
+    """Which call indices SOL_ATTN_DUMP saves. See XFUSER_SOL_ATTN_DUMP_CALLS in xfuser/envs.py."""
+    from xfuser.envs import environment_variables
+
+    spec = environment_variables["SOL_ATTN_DUMP_CALLS"]()
+    return frozenset(int(part) for part in spec.split(",") if part.strip())
+
+
 def _maybe_dump(path, query, key, value):
-    """Save one call's BSHD q/k/v so kernel benchmarks can be replayed on real tensors.
+    """Save selected calls' BSHD q/k/v so kernel benchmarks can be replayed on real tensors.
+
+    A single requested call index writes `path` itself; several write `path` with the index inserted
+    before the suffix, so a set of samples lands beside each other and stays attributable to the
+    call it came from.
     """
-    if not path or getattr(_maybe_dump, "_done", False):
+    if not path:
         return
-    _maybe_dump._done = True
-    torch.save({"q": query.detach().cpu(), "k": key.detach().cpu(), "v": value.detach().cpu()}, path)
+    call_indices = _dump_call_indices()
+    index = _maybe_dump._calls
+    _maybe_dump._calls = index + 1
+    if index not in call_indices:
+        return
+    if len(call_indices) > 1:
+        root, ext = os.path.splitext(path)
+        path = f"{root}.call{index}{ext}"
+    torch.save({"q": query.detach().cpu(), "k": key.detach().cpu(), "v": value.detach().cpu(),
+                "call": index}, path)
+
+
+_maybe_dump._calls = 0
 
 
 def sol_attn_bhsd(query, key, value, is_causal=False, beta=1.0, softmax_scale=None,

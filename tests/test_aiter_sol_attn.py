@@ -738,3 +738,58 @@ def test_sol_attn_beta_controls_sparsity(monkeypatch):
         costs[beta] = sink.sum().item()
 
     assert costs[1.5] < costs[0.0], f"beta did not tighten the selection: {costs}"
+
+
+def test_a_scheduled_beta_routes_exactly_as_the_same_number_would(monkeypatch):
+    """--solattn_beta_schedule hands the backends a 0-d tensor where --solattn_beta hands a float.
+
+    It has to be the same threshold to the last bit, or a schedule would silently mean something
+    other than the betas it was given, and the flat-beta runs it gets compared against would not be
+    a baseline. A tensor is what the schedule passes because reading it as a number happens inside
+    the compiled forward, where it costs a graph break and a recompile per distinct beta; routing
+    consumes it as a scalar operand of tau = mean_j(proxy) + beta * std_j(proxy), which is why the
+    substitution is possible at all.
+    """
+    _require_sol_attn()
+
+    from types import SimpleNamespace
+
+    from xfuser.core.distributed import attention_backend as ab
+    from xfuser.core.distributed import runtime_state
+    from xfuser.core.distributed.attention_backend import (
+        ATTENTION_FUNCTION_REGISTRY,
+        AttentionBackendType,
+    )
+    from xfuser.core.sparse_attention.head_balance import COST_SINK_KEY
+
+    monkeypatch.setattr(ab, "get_ulysses_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(ab, "get_ring_parallel_world_size", lambda: 1)
+
+    heads = 2
+    query, key, value = _operands(heads=heads, sharpness=0.0)
+    call = ATTENTION_FUNCTION_REGISTRY[AttentionBackendType.AITER_FP8_SOL]
+
+    def run(scheduled):
+        """One call, routed either from the flag or from a schedule standing in for it."""
+        monkeypatch.setattr(runtime_state, "_RUNTIME",
+                            SimpleNamespace(scheduled_solattn_beta=scheduled), raising=False)
+        sink = torch.zeros(heads, device="cuda", dtype=torch.float32)
+        with torch.no_grad():
+            out, _ = call(
+                query, key, value, dropout_p=0.0, is_causal=False,
+                attention_kwargs={"solattn_beta": 0.25, COST_SINK_KEY: sink},
+            )
+        return out, sink
+
+    # Before comparing anything: the first Sol-Attn call of a process autotunes the pooling kernels,
+    # and a config picked on timing noise moves a near-threshold block, which reads as a difference
+    # between the two betas when it is a difference between a cold and a warm cache.
+    run(None)
+
+    from_flag, cost_from_flag = run(None)
+    from_schedule, cost_from_schedule = run(torch.tensor(0.25, dtype=torch.float32))
+
+    assert torch.equal(cost_from_flag, cost_from_schedule), (
+        "the scheduled beta selected a different number of blocks than the float: "
+        f"{cost_from_flag.tolist()} vs {cost_from_schedule.tolist()}")
+    assert torch.equal(from_flag, from_schedule), "same threshold, so the output must be identical"

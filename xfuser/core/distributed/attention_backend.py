@@ -1697,6 +1697,27 @@ def _sol_attn_key_seqlen(kwargs):
     return int(max_seqlen_k) if max_seqlen_k is not None else None
 
 
+def _sol_attn_beta(kwargs):
+    """This call's routing threshold: the step's scheduled beta if one is driving it, else the flag.
+
+    The schedule wins over the caller's dict rather than the other way round, because the dict is
+    built once per run from --solattn_beta and would otherwise pin every step to the same value --
+    the very thing a schedule exists to stop. A caller with no schedule is unaffected.
+    """
+    # Imported here rather than at module scope: runtime_state reaches back into this module for
+    # the backend enum, so a top-level import would close the cycle.
+    from xfuser.core.distributed.runtime_state import get_scheduled_solattn_beta
+
+    scheduled = get_scheduled_solattn_beta()
+    if scheduled is not None:
+        # Handed on as the 0-d tensor it is. float() here would read it on the host inside the
+        # compiled forward, which both breaks the graph and pins this step's beta into the graph as
+        # a constant, recompiling for every beta the schedule holds. The routing consumes it as a
+        # scalar operand of the threshold either way.
+        return scheduled
+    return float(kwargs.get("solattn_beta", 0.5))
+
+
 def _aiter_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs, recipe):
     """Run Sol-Attn on one of the AITER MHA v4 mode-2 rows.
 
@@ -1718,7 +1739,7 @@ def _aiter_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
         key,
         value,
         is_causal=is_causal,
-        beta=float(kwargs.get("solattn_beta", 0.5)),
+        beta=_sol_attn_beta(kwargs),
         ring_world_size=get_ring_parallel_world_size(),
         dump_path=sol_attn_dump_path(),
         return_head_cost=cost_sink is not None,

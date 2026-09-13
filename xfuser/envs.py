@@ -48,9 +48,15 @@ environment_variables: Dict[str, Callable[[], Any]] = {
                 "XFUSER_AITER_FP8_STATIC_SCALE_WITH_DESCALE", None
             ),
     "AITER_SAGE_V2_BLOCK_R": lambda: os.environ.get("XFUSER_AITER_SAGE_V2_BLOCK_R", "128"),
-    # Write the first Sol-Attn call's q/k/v to this path, for replaying kernel benchmarks on real
-    # operands instead of synthetic tensors. Debug-only, hence env rather than a CLI flag
+    # Write Sol-Attn calls' q/k/v to this path, for replaying kernel benchmarks on real operands
+    # instead of synthetic tensors. Debug-only, hence env rather than a CLI flag
     "SOL_ATTN_DUMP": lambda: os.environ.get("XFUSER_SOL_ATTN_DUMP", None),
+    # Which Sol-Attn calls SOL_ATTN_DUMP saves, as a comma-separated list of 0-based call indices
+    # counted over the whole process. Defaults to the first call alone, which is the least
+    # representative one there is -- layer 0 of the first denoising step, where the latent is still
+    # noise -- so anything reasoning about routing density wants a few indices spanning both the
+    # layer and the step axis. Call index is step * num_layers + layer.
+    "SOL_ATTN_DUMP_CALLS": lambda: os.environ.get("XFUSER_SOL_ATTN_DUMP_CALLS", "0"),
     "XDIT_FBCACHE_THRESH": lambda: os.environ.get("XDIT_FBCACHE_THRESH", None),
     # opt-in breakdown of where a memory-efficient fill spends its time. Off by default because an
     # honest breakdown has to synchronise at each phase boundary, and that serialises a fill which
