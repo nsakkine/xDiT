@@ -188,6 +188,42 @@ def test_a_beta_schedule_alone_advances_the_counter():
     assert runtime.scheduled_solattn_beta == pytest.approx(0.0)
 
 
+def test_a_warmup_does_not_shift_the_schedule_the_measured_run_walks():
+    """Each pipeline invocation starts at the first beta, whatever the invocation before it spent.
+
+    The counter only advances, wrapping on the schedule length, and a compile warmup runs its own
+    forwards -- usually with a shortened step count. So the measured run used to start partway
+    along the ramp with its last steps wrapped back onto the beginning: silent, and in the worst
+    direction, since it hands every step a beta meant for a later one while the early steps are
+    the ones whose error propagates through the whole run. Wan 2.2 warmed up a full cycle and
+    landed back on zero by arithmetic, which is why this went unnoticed there.
+    """
+    schedule = SolAttnBetaSchedule.from_spec("-0.5:1.0", 8)
+    runtime = _bare_runtime(
+        solattn_beta_schedule=schedule,
+        solattn_beta_schedule_total_steps=torch.tensor(8, dtype=torch.int),
+        step_counter=torch.tensor(0, dtype=torch.int),
+    )
+
+    for _ in range(3):  # a three-step warmup, as MiniMax-H3 runs before the real thing
+        runtime.increment_step_counter()
+    assert float(runtime.scheduled_solattn_beta) != pytest.approx(schedule.get_beta(0))
+
+    runtime.reset_step_counter()
+    runtime.increment_step_counter()
+
+    assert float(runtime.scheduled_solattn_beta) == pytest.approx(schedule.get_beta(0))
+
+
+def test_resetting_the_counter_without_a_schedule_is_harmless():
+    """Every model calls this on every invocation, and most runs schedule nothing at all."""
+    runtime = _bare_runtime()
+
+    runtime.reset_step_counter()
+
+    assert runtime.step_counter is None
+
+
 def test_schedules_that_disagree_about_the_step_count_are_refused():
     """Two schedules on one counter have to be the same length or one of them is being misread.
     Caught here at setup, not per step: the per-step path runs inside the compiled forward, where

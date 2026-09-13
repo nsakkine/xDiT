@@ -984,6 +984,11 @@ class xFuserModel(abc.ABC):
     def prepare_run(self, input_args: dict) -> None:
         """Prepare model state before a pipeline invocation."""
         self._vae_manager.prepare_run(self._decoding_vaes(), input_args)
+        # Each invocation starts the per-step schedules at their first step. Compile warmups and
+        # warmup calls spend forwards of their own, often with a shortened step count, and the
+        # counter only advances -- so without this a measured run picks up wherever the warmup
+        # stopped and every step reads a beta meant for a later one.
+        get_runtime_state().reset_step_counter()
 
     def _run_timed_pipe(self, input_args: dict) -> Tuple[DiffusionOutput, float]:
         """ Run the pipeline and time its latency from the synchronized across all ranks beginning

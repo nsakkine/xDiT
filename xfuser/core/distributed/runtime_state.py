@@ -637,17 +637,36 @@ class DiTRuntimeState(RuntimeState):
         if active_total_steps is None:
             return
 
-        current_step = self.step_counter
-        if self.attention_schedule is not None:
-            self.attention_backend = self.attention_schedule.get_backend(current_step)
-        if self.gemm_schedule is not None:
-            self.use_high_precision_gemm = self.gemm_schedule.is_high_precision(current_step)
-        if self.solattn_beta_schedule is not None:
-            self.scheduled_solattn_beta = self.solattn_beta_schedule.get_beta_tensor(current_step)
+        self._apply_schedules_at(self.step_counter)
 
         # Wrapped by remainder, not by comparing the counter against the total and assigning 0:
         # that comparison is between two tensors and the branch on it reads the result on the host.
         self.step_counter = (self.step_counter + 1) % active_total_steps
+
+    def _apply_schedules_at(self, step) -> None:
+        """Point every active schedule at `step`."""
+        if self.attention_schedule is not None:
+            self.attention_backend = self.attention_schedule.get_backend(step)
+        if self.gemm_schedule is not None:
+            self.use_high_precision_gemm = self.gemm_schedule.is_high_precision(step)
+        if self.solattn_beta_schedule is not None:
+            self.scheduled_solattn_beta = self.solattn_beta_schedule.get_beta_tensor(step)
+
+    def reset_step_counter(self) -> None:
+        """Send the per-step schedules back to their first step, at a pipeline-run boundary.
+
+        The counter only ever advances, wrapping on the schedule length, so any forward spent
+        outside the run being measured leaves it mid-schedule. A compile warmup of three steps
+        starts the real run on the fourth beta and wraps its last three steps back onto the
+        schedule's beginning -- silently, and in the direction that hurts most, since it pushes
+        every step's beta later in the ramp while the steps whose error propagates furthest are
+        the early ones. Wan 2.2 hid this by warming up a full cycle, which lands back on zero by
+        arithmetic; MiniMax-H3 warms up three steps and does not.
+        """
+        if self.step_counter is None:
+            return
+        self.step_counter = torch.zeros_like(self.step_counter)
+        self._apply_schedules_at(self.step_counter)
 
     def set_attention_schedule(
         self,
