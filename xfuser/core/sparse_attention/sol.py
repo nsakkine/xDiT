@@ -434,7 +434,8 @@ _maybe_dump._calls = 0
 def sol_attn_bhsd(query, key, value, is_causal=False, beta=1.0, softmax_scale=None,
                   routing=None, ring_world_size=1, dump_path=None,
                   return_head_cost=False, recipe="fp8", key_seqlen=None,
-                  exact_tokens=None):
+                  exact_tokens=None, sequence_permutation=None,
+                  sequence_inverse_permutation=None):
     """Sol-Attn over BHSD tensors, returning (BHSD bf16 output, per-head cost or None).
 
     query/key/value are (batch, nheads, seqlen, head_dim) bf16 tensors. They are permuted into the
@@ -462,6 +463,11 @@ def sol_attn_bhsd(query, key, value, is_causal=False, beta=1.0, softmax_scale=No
     modality holding a small share of the sequence is judged against a distribution the majority
     wrote, and its own queries lose the blocks they needed. Flagging the minority costs about one
     exact block per block it occupies, which is few by the same token.
+
+    sequence_permutation optionally reorders the shared Q/K/V sequence before routing, and
+    sequence_inverse_permutation restores the query rows on return. This is used by MiniMax-H3 to
+    make spatially adjacent video tokens share blocks while leaving its external packed-row
+    contract unchanged.
     """
     if _AITER is None:
         raise SolAttnUnsupported(
@@ -469,9 +475,34 @@ def sol_attn_bhsd(query, key, value, is_causal=False, beta=1.0, softmax_scale=No
             "please update AITER")
     recipe = _resolve_recipe(recipe)
 
+    if sequence_permutation is not None:
+        if query.shape[2] != key.shape[2] or key.shape[2] != value.shape[2]:
+            raise SolAttnUnsupported(
+                "Sol-Attn sequence reordering requires equal Q/K/V sequence lengths."
+            )
+        if sequence_permutation.ndim != 1 or sequence_permutation.numel() != query.shape[2]:
+            raise ValueError(
+                "Sol-Attn sequence permutation must be one-dimensional and match "
+                f"the sequence length ({query.shape[2]}), got "
+                f"{list(sequence_permutation.shape)}."
+            )
+        if sequence_inverse_permutation is None:
+            sequence_inverse_permutation = torch.argsort(sequence_permutation)
+        query = query.index_select(2, sequence_permutation)
+        key = key.index_select(2, sequence_permutation)
+        value = value.index_select(2, sequence_permutation)
+        if exact_tokens is not None:
+            exact_tokens = exact_tokens.index_select(0, sequence_permutation)
+
     query = query.permute(0, 2, 1, 3).contiguous()
     key = key.permute(0, 2, 1, 3).contiguous()
     value = value.permute(0, 2, 1, 3).contiguous()
+
+    def restore_output(out):
+        out = out.permute(0, 2, 1, 3)
+        if sequence_inverse_permutation is not None:
+            out = out.index_select(2, sequence_inverse_permutation)
+        return out
 
     check_sol_attn_supported(query, key, value, is_causal, ring_world_size=ring_world_size)
     _maybe_dump(dump_path, query, key, value)
@@ -497,7 +528,7 @@ def sol_attn_bhsd(query, key, value, is_causal=False, beta=1.0, softmax_scale=No
         qk, v_fmt = _format(recipe.qk_format), _format(recipe.v_format)
         out = _AITER.sol_attn(query, key, value, qk, qk, v_fmt, beta=beta,
                               softmax_scale=softmax_scale)
-        return out.permute(0, 2, 1, 3), None
+        return restore_output(out), None
 
     # Quantize exactly as the raw entrypoint would. On the fp8 row that means quantize_fp8_rotated
     # for Q/K: rotating both by the same orthonormal matrix leaves Q @ K.T alone while spreading the
@@ -528,7 +559,7 @@ def sol_attn_bhsd(query, key, value, is_causal=False, beta=1.0, softmax_scale=No
         mean_k_scale=routing["mean_k_scale"],
         mean_v_scale=routing["mean_v_scale"],
     )
-    return out.permute(0, 2, 1, 3), _head_cost_from_routing(routing)
+    return restore_output(out), _head_cost_from_routing(routing)
 
 
 def sol_attn_dump_path():

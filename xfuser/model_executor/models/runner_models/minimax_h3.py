@@ -484,6 +484,19 @@ class xFuserMiniMaxH3Model(xFuserModel):
             "width": input_args["width"],
             "num_frames": input_args["num_frames"],
             "num_inference_steps": input_args["num_inference_steps"],
+            "attention_kwargs": {
+                "spargeattn_reorder_sequence": (
+                    self.config.spargeattn_reorder_sequence
+                ),
+                "minimax_h3_video_hw": (
+                    input_args["height"]
+                    // self.pipe.vae_spatial_compression_ratio
+                    // self.pipe.patch_size[1],
+                    input_args["width"]
+                    // self.pipe.vae_spatial_compression_ratio
+                    // self.pipe.patch_size[2],
+                ),
+            },
             "generator": torch.Generator(device="cuda").manual_seed(
                 input_args["seed"]
             ),

@@ -953,6 +953,33 @@ def test_minimax_h3_names_its_small_modalities_to_sol_attn(monkeypatch):
         assert int(exact.sum()) == text + audio
 
 
+def test_minimax_h3_publishes_video_gilbert_permutation_to_sol_attn(monkeypatch):
+    from xfuser.core.distributed.attention_backend import (
+        SOL_SEQUENCE_INVERSE_PERMUTATION_KEY,
+        SOL_SEQUENCE_PERMUTATION_KEY,
+        AttentionBackendType,
+    )
+
+    seen = _run_tiny_forward_capturing_attention(
+        monkeypatch,
+        AttentionBackendType.AITER_FP8_SOL,
+        attention_kwargs={
+            "spargeattn_reorder_sequence": True,
+            "minimax_h3_video_hw": (4, 4),
+        },
+    )
+    main_calls = [kwargs for _, kwargs in seen if kwargs is not None]
+    assert main_calls
+    for kwargs in main_calls:
+        forward = kwargs[SOL_SEQUENCE_PERMUTATION_KEY]
+        inverse = kwargs[SOL_SEQUENCE_INVERSE_PERMUTATION_KEY]
+        identity = torch.arange(64)
+        torch.testing.assert_close(forward.index_select(0, inverse), identity)
+        # Text/audio retain their packed positions; only the 48 video rows move.
+        torch.testing.assert_close(forward[:16], identity[:16])
+        assert not torch.equal(forward[16:], identity[16:])
+
+
 def test_minimax_h3_honours_the_configured_solattn_beta(monkeypatch):
     """--solattn_beta has to reach the attention call, and for this model nothing else carries it.
 

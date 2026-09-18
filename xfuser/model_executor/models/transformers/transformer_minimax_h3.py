@@ -22,8 +22,11 @@ from xfuser.core.distributed import (
 from xfuser.core.distributed.attention_backend import (
     AITER_MHA_V4_SOL_BACKEND_SET,
     SOL_EXACT_TOKENS_KEY,
+    SOL_SEQUENCE_INVERSE_PERMUTATION_KEY,
+    SOL_SEQUENCE_PERMUTATION_KEY,
     AttentionBackendType,
 )
+from xfuser.core.sparse_attention.sparge import get_gilbert_perm
 from xfuser.model_executor.layers.usp import USP, attention
 
 
@@ -56,6 +59,37 @@ def _configured_solattn_beta():
     fixed for the life of a run.
     """
     return get_runtime_state().runtime_config.solattn_beta
+
+
+def _gilbert_sequence_permutations(
+    video_indices: torch.Tensor,
+    padded_length: int,
+    video_hw: tuple[int, int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Embed a video-only Gilbert traversal in the full packed-row permutation."""
+    height, width = (int(video_hw[0]), int(video_hw[1]))
+    rows_per_frame = height * width
+    if height <= 0 or width <= 0 or video_indices.numel() % rows_per_frame:
+        raise ValueError(
+            "MiniMax-H3 Gilbert reordering needs a positive video token grid whose "
+            f"area divides the number of video rows; got hw={video_hw} and "
+            f"{video_indices.numel()} video rows."
+        )
+
+    frames = video_indices.numel() // rows_per_frame
+    video_forward, video_inverse = get_gilbert_perm(
+        (frames, height, width), video_indices.device
+    )
+    identity = torch.arange(
+        padded_length, dtype=torch.long, device=video_indices.device
+    )
+    forward = identity.index_copy(
+        0, video_indices, video_indices.index_select(0, video_forward)
+    )
+    inverse = identity.index_copy(
+        0, video_indices, video_indices.index_select(0, video_inverse)
+    )
+    return forward, inverse
 
 
 def _dense_backend_for(backend):
@@ -156,6 +190,7 @@ class xFuserMiniMaxH3AttnProcessor(MiniMaxH3AttnProcessor):
 class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
     def __init__(self, *args, attention_backend=None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self._attention_backend = attention_backend
         self._usp_attention_kwargs: dict[str, Any] = {}
         # Keys the caller's attention_kwargs contributed on the previous forward, so they can be
         # cleared before the next one merges its own.
@@ -343,6 +378,26 @@ class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
         self._caller_attention_keys = tuple(attention_kwargs or ())
         if attention_kwargs:
             self._usp_attention_kwargs.update(attention_kwargs)
+
+        self._usp_attention_kwargs.pop(SOL_SEQUENCE_PERMUTATION_KEY, None)
+        self._usp_attention_kwargs.pop(SOL_SEQUENCE_INVERSE_PERMUTATION_KEY, None)
+        if (
+            _effective_backend(self._attention_backend) in AITER_MHA_V4_SOL_BACKEND_SET
+            and self._usp_attention_kwargs.get("spargeattn_reorder_sequence", False)
+        ):
+            video_hw = self._usp_attention_kwargs.get("minimax_h3_video_hw")
+            if video_hw is None:
+                raise ValueError(
+                    "MiniMax-H3 Gilbert reordering with Sol-Attn requires "
+                    "`attention_kwargs['minimax_h3_video_hw']`."
+                )
+            sequence_forward, sequence_inverse = _gilbert_sequence_permutations(
+                video_indices, padded_length, video_hw
+            )
+            self._usp_attention_kwargs[SOL_SEQUENCE_PERMUTATION_KEY] = sequence_forward
+            self._usp_attention_kwargs[
+                SOL_SEQUENCE_INVERSE_PERMUTATION_KEY
+            ] = sequence_inverse
 
         if pad_amount:
             indices_k = torch.arange(

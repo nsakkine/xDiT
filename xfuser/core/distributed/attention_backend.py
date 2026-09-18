@@ -711,6 +711,10 @@ AITER_MHA_V4_SOL_BACKEND_SET = frozenset(AITER_MHA_V4_SOL_BACKENDS)
 # sol_attn_bhsd's exact_tokens argument for what it is for. It lives here rather than beside that
 # argument so a model can set it without importing sol.py, whose import is deliberately lazy.
 SOL_EXACT_TOKENS_KEY = "_sol_exact_tokens"
+# Optional full-sequence permutations applied immediately before Sol-Attn routing and reversed on
+# its output. Models publish both so every layer reuses cached tensors without sorting on-device.
+SOL_SEQUENCE_PERMUTATION_KEY = "_sol_sequence_permutation"
+SOL_SEQUENCE_INVERSE_PERMUTATION_KEY = "_sol_sequence_inverse_permutation"
 # Which recipe each backend asks for, so setup can check the device has that row. The MX two are
 # gfx950-only; gfx942 builds the per-tensor pair.
 AITER_MHA_V4_SOL_RECIPE = {
@@ -1748,6 +1752,10 @@ def _aiter_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
         # Set by a model that packs several modalities into one sequence, naming the tokens whose
         # blocks routing must not be allowed to drop. See sol_attn_bhsd.
         exact_tokens=kwargs.get(SOL_EXACT_TOKENS_KEY),
+        sequence_permutation=kwargs.get(SOL_SEQUENCE_PERMUTATION_KEY),
+        sequence_inverse_permutation=kwargs.get(
+            SOL_SEQUENCE_INVERSE_PERMUTATION_KEY
+        ),
     )
     if cost_sink is not None:
         cost_sink.copy_(head_cost)

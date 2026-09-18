@@ -1110,7 +1110,8 @@ class xFuserArgs:
             action=argparse.BooleanOptionalAction,
             default=True,
             help="Reorder image tokens via the gilbert space-filling curve "
-                 "before Sparge attention. Use --no-spargeattn_reorder_sequence to disable."
+                 "before Sparge attention, and video tokens before Sol-Attn for "
+                 "MiniMax-H3. Use --no-spargeattn_reorder_sequence to disable."
         )
         parser.add_argument(
             "--use_spargeattn_static_block_mask",
