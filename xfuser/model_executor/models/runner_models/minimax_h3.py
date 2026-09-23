@@ -41,6 +41,8 @@ _SUPPORTED_ATTN_BACKENDS = frozenset({
     # the per-head cost Sol-Attn publishes. The alignment pad is dropped from K/V through the
     # varlen metadata rather than attended; see _sol_attn_key_seqlen. Which of these rows a device
     # actually has is checked against the manifest in runtime_state, not here.
+    AttentionBackendType.AITER_BF16_SOL,
+    AttentionBackendType.AITER_BF16FP8_SOL,
     AttentionBackendType.AITER_FP8_SOL,
     AttentionBackendType.AITER_I8FP8_SOL,
     AttentionBackendType.AITER_MXFP8_SOL,

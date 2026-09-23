@@ -648,6 +648,8 @@ class AttentionBackendType(Enum):
     AITER_F6F4_SPARGE = "AITER F6F4 Sparge"
     AITER_MXFP4_SPARGE = "AITER MXFP4 Sparge"
     AITER_F4F4_SPARGE = "AITER F4F4 Sparge"
+    AITER_BF16_SOL = "AITER BF16 Sol"
+    AITER_BF16FP8_SOL = "AITER BF16/FP8 Sol"
     AITER_I8FP8_SOL = "AITER I8FP8 Sol"
     AITER_FP8_SOL = "AITER FP8 Sol"
     AITER_MXFP8_SOL = "AITER MXFP8 Sol"
@@ -699,8 +701,10 @@ AITER_MHA_V4_ONLY_BACKENDS = tuple(
 AITER_MHA_V4_ONLY_BACKEND_SET = frozenset(AITER_MHA_V4_ONLY_BACKENDS)
 AITER_MHA_V4_SPARGE_BACKEND_SET = frozenset(AITER_MHA_V4_SPARGE_BACKENDS)
 # The mode-2 (Sol-Attn) rows. A subset of the recipes above: Sol-Attn needs a manifest row of its
-# own per recipe, and only these four are built.
+# own per recipe, and only these six are built.
 AITER_MHA_V4_SOL_BACKENDS = (
+    AttentionBackendType.AITER_BF16_SOL,
+    AttentionBackendType.AITER_BF16FP8_SOL,
     AttentionBackendType.AITER_I8FP8_SOL,
     AttentionBackendType.AITER_FP8_SOL,
     AttentionBackendType.AITER_MXFP8_SOL,
@@ -715,9 +719,11 @@ SOL_EXACT_TOKENS_KEY = "_sol_exact_tokens"
 # its output. Models publish both so every layer reuses cached tensors without sorting on-device.
 SOL_SEQUENCE_PERMUTATION_KEY = "_sol_sequence_permutation"
 SOL_SEQUENCE_INVERSE_PERMUTATION_KEY = "_sol_sequence_inverse_permutation"
-# Which recipe each backend asks for, so setup can check the device has that row. The MX two are
-# gfx950-only; gfx942 builds the per-tensor pair.
+# Which recipe each backend asks for, so setup can check the device has that row. The BF16 and MX
+# rows are gfx950-only; gfx942 builds the per-tensor pair.
 AITER_MHA_V4_SOL_RECIPE = {
+    AttentionBackendType.AITER_BF16_SOL: "bf16",
+    AttentionBackendType.AITER_BF16FP8_SOL: "bf16fp8",
     AttentionBackendType.AITER_I8FP8_SOL: "i8fp8",
     AttentionBackendType.AITER_FP8_SOL: "fp8",
     AttentionBackendType.AITER_MXFP8_SOL: "mxfp8",
@@ -1730,8 +1736,8 @@ def _aiter_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
     and the selection bitmap together from one mask so they cannot disagree. That is also why there
     is no setup_sparge/restore_sparge_output pair here.
 
-    The four rows differ only in how Q/K/V are quantized; the routing, the pooled correction and
-    the head cost are identical, so they all come through here with recipe naming the row.
+    The rows differ only in how Q/K/V are quantized; the routing, the pooled correction and the
+    head cost are identical, so they all come through here with recipe naming the row.
     """
     _validate_aiter_low_precision_dropout(dropout_p)
     from xfuser.core.sparse_attention.sol import sol_attn_bhsd, sol_attn_dump_path
@@ -1760,6 +1766,32 @@ def _aiter_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
     if cost_sink is not None:
         cost_sink.copy_(head_cost)
     return output, None
+
+
+@register_attention_function(AttentionBackendType.AITER_BF16_SOL)
+def _aiter_bf16_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Sol-Attn on the unquantized BF16 row.
+
+    The one row whose only departure from dense attention is the sparsity, so what it saves is
+    bandwidth and MFMA issue on the blocks routing dropped rather than anything from a narrower
+    operand. It is also the row to reach for when a model is losing quality to quantization and
+    the question is whether the selection or the format is responsible.
+    """
+    return _aiter_sol_attn_call(
+        query, key, value, dropout_p, is_causal, attention_kwargs, "bf16"
+    )
+
+
+@register_attention_function(AttentionBackendType.AITER_BF16FP8_SOL)
+def _aiter_bf16fp8_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Sol-Attn on the BF16 Q/K and per-tensor FP8 V row.
+
+    Exact scores with a narrow V, which is the operand the correction pass streams once per KV
+    block, so this is where the pooled branch gets cheap without touching the selection.
+    """
+    return _aiter_sol_attn_call(
+        query, key, value, dropout_p, is_causal, attention_kwargs, "bf16fp8"
+    )
 
 
 @register_attention_function(AttentionBackendType.AITER_FP8_SOL)

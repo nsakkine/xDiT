@@ -379,7 +379,7 @@ class RuntimeState(metaclass=ABCMeta):
         elif attention_backend in AITER_MHA_V4_SOL_BACKEND_SET:
             from xfuser.core.sparse_attention.sol import check_sol_attn_recipe
             # Fail here rather than on the first attention call: which recipes exist depends on the
-            # device (gfx942 builds the per-tensor pair, gfx950 all four), and the per-call check
+            # device (gfx942 builds the per-tensor pair, gfx950 all of them), and the per-call check
             # cannot be reached early enough to give a useful message during setup.
             # SolAttnUnsupported is a RuntimeError, matching the other branches.
             check_sol_attn_recipe(AITER_MHA_V4_SOL_RECIPE[attention_backend])

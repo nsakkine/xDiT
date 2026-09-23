@@ -62,6 +62,22 @@ def _require_sol_recipe(recipe):
         pytest.skip(str(error))
 
 
+def _recipes_on_this_device():
+    """The Sol-Attn recipe ids this arch builds rows for, in declaration order."""
+    from xfuser.core.sparse_attention import sol
+
+    allowed = sol._ARCH_RECIPES.get(sol._device_arch())
+    return [r for r in sol.SOL_ATTN_RECIPES if allowed is None or r in allowed]
+
+
+def _serves(recipe, tile):
+    """Whether this GPU has a Sol-Attn kernel at `tile` for `recipe`'s operands."""
+    from xfuser.core.sparse_attention import sol
+
+    operands = sol._recipe_operands(sol._RECIPES[recipe])
+    return sol._kv_tile_for_q_tile(tile[0], operands, sol._AITER.sol_attn_mode) == tile[1]
+
+
 def test_sol_attn_drops_a_caller_alignment_pad():
     """key_seqlen must reproduce attention over the real tokens, whatever the pad holds.
 
@@ -226,7 +242,7 @@ def _kv_block(key):
     return -(-key.shape[2] // tile)
 
 
-def _operands(seqlen=1024, heads=2, head_dim=128, seed=1234, sharpness=2.0):
+def _operands(seqlen=1024, heads=2, head_dim=128, seed=1234, sharpness=2.0, cluster=128):
     """BHSD bf16 operands with real block structure, which is the layout the backends take.
 
     Independent Gaussian noise is the wrong input for judging any block-sparse kernel: attention
@@ -237,22 +253,30 @@ def _operands(seqlen=1024, heads=2, head_dim=128, seed=1234, sharpness=2.0):
 
     sharpness sets cluster separation relative to the noise, and 2.0 is deliberate. Push it higher
     and the per-tensor fp8 scale is set by the cluster centers, which coarsens everything else --
-    measured, the DENSE fp8 sibling falls to 0.37 cosine against fp32 at sharpness 4 while Sol-Attn
-    holds 0.92, so a dense comparison up there would be measuring the reference falling apart.
+    measured at 2048 tokens, fp8 falls from 0.98 cosine against fp32 at sharpness 2 to 0.82 at 8,
+    and MXFP4 from 0.82 to 0.12. So a test that reads an absolute cosine wants the default, and one
+    that raises sharpness has to compare each row against its own dense sibling instead, which
+    moves with it.
+
+    cluster is how wide one group of related tokens is, and it defaults to the default kernel's KV
+    tile so that the structure lands on tile boundaries. Lowering it below a tile is what separates
+    the geometries: selection is per tile, so a cluster narrower than one drags in its neighbours.
     """
     g = torch.Generator(device="cuda").manual_seed(seed)
-    # Round the cluster counts up so a seqlen that is not a whole number of blocks still gets a
-    # center for its short last block; _spread trims the overhang. Exact for an aligned seqlen.
-    num_kv_blocks = -(-seqlen // 128)
-    centers = torch.randn(num_kv_blocks, head_dim, generator=g, device="cuda") * sharpness
+    # Round the cluster counts up so a seqlen that is not a whole number of clusters still gets a
+    # center for its short last one; _spread trims the overhang. Exact for an aligned seqlen.
+    num_clusters = -(-seqlen // cluster)
+    centers = torch.randn(num_clusters, head_dim, generator=g, device="cuda") * sharpness
 
     def _spread(rows):
         x = rows[:seqlen] + torch.randn(seqlen, head_dim, generator=g, device="cuda")
         return x.unsqueeze(0).unsqueeze(0).expand(1, heads, seqlen, head_dim).contiguous()
 
-    key = _spread(centers.repeat_interleave(128, 0))
-    targets = torch.arange(-(-seqlen // 256), device="cuda") % num_kv_blocks
-    query = _spread(centers[targets].repeat_interleave(256, 0))
+    key = _spread(centers.repeat_interleave(cluster, 0))
+    # Queries change target half as often as the keys change cluster, so that a run of queries has
+    # one block to find rather than every query wanting its own.
+    targets = torch.arange(-(-seqlen // (2 * cluster)), device="cuda") % num_clusters
+    query = _spread(centers[targets].repeat_interleave(2 * cluster, 0))
     value = torch.randn(1, heads, seqlen, head_dim, generator=g, device="cuda")
     return query.bfloat16(), key.bfloat16(), value.bfloat16()
 
@@ -484,42 +508,88 @@ def test_sol_attn_takes_a_seqlen_that_is_not_a_whole_number_of_kv_blocks(seqlen)
     assert cosine > 0.95, f"cosine to fp32 over the real tokens {cosine} at seqlen {seqlen}"
 
 
-def test_sol_attn_is_no_less_accurate_than_dense_fp8(monkeypatch):
-    """Across cluster separations, including where the dense fp8 sibling itself breaks down.
+# Per-format distance a row is allowed from its dense sibling, measured at the geometry below.
+# BF16's is four orders tighter than the rest because nothing rounds on that row: with no
+# quantization the pooled correction reproduces the dense result outright, so anything it loses is
+# float accumulation order and not the algorithm. The quantized rows are bounded by how far their
+# pooled means round away from the blocks they stand in for, which is why MXFP4 -- eight magnitude
+# levels, and the only row that also quantizes V into them -- gets an order more room.
+_DENSE_SIBLING_TOLERANCE = {
+    "bf16": 1e-6,
+    "bf16fp8": 2e-3,
+    "fp8": 2e-3,
+    "i8fp8": 2e-3,
+    "mxfp8": 2e-3,
+    "mxfp4": 2e-2,
+}
 
-    This is the claim that survives outside the well-conditioned regime the test above needs. Once
-    the per-tensor fp8 scale is set by widely separated clusters, dense fp8 loses the rest of the
-    distribution, while Sol-Attn computes only the blocks its routing picked and recovers the others
-    from pooled K/V -- measured at sharpness 4, dense fp8 holds 0.37 cosine to fp32 and Sol-Attn
-    0.92. So the correction is not merely cheaper than attending densely, it is also better
-    conditioned, and that should not silently regress.
+
+@pytest.mark.parametrize(
+    ("recipe", "dense_backend"),
+    [("bf16", "AITER_BF16"), ("bf16fp8", "AITER_BF16FP8"),
+     ("fp8", "AITER_FP8"), ("i8fp8", "AITER_I8FP8"),
+     ("mxfp8", "AITER_MXFP8"), ("mxfp4", "AITER_MXFP4")],
+)
+def test_every_sol_row_holds_its_dense_sibling_across_cluster_separations(
+    recipe, dense_backend, monkeypatch
+):
+    """Each row against its own dense sibling as the clusters pull apart, not at one separation.
+
+    The single-separation test above is the wiring check; this is the conditioning one. Cluster
+    separation is what sets the per-tensor scales, so raising it coarsens everything outside the
+    cluster centers and drives each format toward the regime where its pooled means stop
+    representing the blocks they stand in for. A row that is wired correctly and still degrades
+    only there would pass above and fail here.
+
+    BF16 is the row that makes this readable. It has no quantization to blame, and it reproduces
+    its dense sibling to within a bf16 ulp at every separation, which says the selection and the
+    correction are together exact on these operands -- so the distance every other row shows is
+    its format rounding and nothing else. That is also why this asserts a two-sided band against
+    fp32 rather than that Sol-Attn beats dense: measured, fp8 and i8fp8 come out slightly ahead of
+    their dense siblings here and bf16fp8, mxfp8 and mxfp4 slightly behind, so a one-sided claim
+    would be asserting a coincidence.
+
+    Run at 2048 tokens rather than the 1024 the rest of the file uses. That is 16 KV blocks, which
+    is _MIN_USEFUL_KV_BLOCKS: below it sol.py itself warns that a mean-plus-sigma threshold over
+    the blocks says little, and a comparison there grades the threshold's luck rather than the
+    kernel.
     """
     _require_sol_attn()
+    _require_sol_recipe(recipe)
 
     from xfuser.core.distributed import attention_backend as ab
     from xfuser.core.distributed.attention_backend import (
         ATTENTION_FUNCTION_REGISTRY,
         AttentionBackendType,
     )
+    from xfuser.core.sparse_attention.sol import sol_attn_bhsd
 
     monkeypatch.setattr(ab, "get_ulysses_parallel_world_size", lambda: 1)
     monkeypatch.setattr(ab, "get_ring_parallel_world_size", lambda: 1)
 
+    tolerance = _DENSE_SIBLING_TOLERANCE[recipe]
     for sharpness in (2.0, 4.0, 8.0):
-        query, key, value = _operands(sharpness=sharpness)
+        query, key, value = _operands(seqlen=2048, sharpness=sharpness)
         reference = _fp32_attention(query, key, value)
         with torch.no_grad():
-            sol, _ = ATTENTION_FUNCTION_REGISTRY[AttentionBackendType.AITER_FP8_SOL](
-                query, key, value, dropout_p=0.0, is_causal=False,
-                attention_kwargs={"solattn_beta": 0.5},
-            )
-            dense, _ = ATTENTION_FUNCTION_REGISTRY[AttentionBackendType.AITER_FP8](
-                query, key, value, dropout_p=0.0, is_causal=False
-            )
+            sol, _ = sol_attn_bhsd(query, key, value, beta=0.5, recipe=recipe)
+            dense, _ = ATTENTION_FUNCTION_REGISTRY[
+                AttentionBackendType[dense_backend]
+            ](query, key, value, dropout_p=0.0, is_causal=False)
+
+        assert sol.shape == dense.shape and sol.dtype == torch.bfloat16
+        assert torch.isfinite(sol).all()
+
+        sibling = _cosine(sol, dense)
+        assert 1.0 - sibling < tolerance, (
+            f"at sharpness {sharpness} the {recipe} Sol-Attn row tracks its dense sibling at "
+            f"{sibling:.8f}"
+        )
+
         sol_cosine, dense_cosine = _cosine(sol, reference), _cosine(dense, reference)
-        assert sol_cosine > dense_cosine - 1e-3, (
-            f"at sharpness {sharpness} Sol-Attn tracks fp32 at {sol_cosine:.5f} against dense fp8's "
-            f"{dense_cosine:.5f}"
+        assert abs(sol_cosine - dense_cosine) < tolerance, (
+            f"at sharpness {sharpness} the {recipe} Sol-Attn row tracks fp32 at {sol_cosine:.6f} "
+            f"against its dense sibling's {dense_cosine:.6f}"
         )
 
 
@@ -568,7 +638,8 @@ def test_sol_attn_publishes_a_head_cost_without_changing_the_output(monkeypatch)
 
 @pytest.mark.parametrize(
     ("recipe", "dense_backend"),
-    [("fp8", "AITER_FP8"), ("i8fp8", "AITER_I8FP8"),
+    [("bf16", "AITER_BF16"), ("bf16fp8", "AITER_BF16FP8"),
+     ("fp8", "AITER_FP8"), ("i8fp8", "AITER_I8FP8"),
      ("mxfp8", "AITER_MXFP8"), ("mxfp4", "AITER_MXFP4")],
 )
 def test_every_sol_recipe_tracks_its_own_dense_sibling(recipe, dense_backend):
@@ -614,7 +685,7 @@ def test_every_sol_recipe_tracks_its_own_dense_sibling(recipe, dense_backend):
     assert _cosine(sol, reference) > _cosine(dense, reference) - 0.01
 
 
-@pytest.mark.parametrize("recipe", ["fp8", "i8fp8", "mxfp8", "mxfp4"])
+@pytest.mark.parametrize("recipe", ["bf16", "bf16fp8", "fp8", "i8fp8", "mxfp8", "mxfp4"])
 def test_every_sol_recipe_publishes_a_head_cost(recipe):
     """The balancer consumes this for every row, not just the one with a raw entry point."""
     _require_sol_attn()
@@ -635,7 +706,7 @@ def test_every_sol_recipe_publishes_a_head_cost(recipe):
     assert torch.isfinite(out).all()
 
 
-@pytest.mark.parametrize("recipe", ["fp8", "i8fp8", "mxfp8", "mxfp4"])
+@pytest.mark.parametrize("recipe", ["bf16", "bf16fp8", "fp8", "i8fp8", "mxfp8", "mxfp4"])
 @pytest.mark.parametrize("seqlen", [1024, 1008])
 @pytest.mark.parametrize("head_cost", [False, True])
 def test_sol_attn_holds_one_graph(recipe, seqlen, head_cost):
@@ -793,3 +864,160 @@ def test_a_scheduled_beta_routes_exactly_as_the_same_number_would(monkeypatch):
         "the scheduled beta selected a different number of blocks than the float: "
         f"{cost_from_flag.tolist()} vs {cost_from_schedule.tolist()}")
     assert torch.equal(from_flag, from_schedule), "same threshold, so the output must be identical"
+
+
+def _override_tile(monkeypatch, tile):
+    """Point the module at one geometry, as XFUSER_SOL_ATTN_BLOCK_TILE would have at import.
+
+    Setting the environment variable in-process would do nothing: it is parsed once at import into
+    _BLOCK_TILE_OVERRIDE, deliberately, so that a traced call never reads os.environ. Patching the
+    parsed constant is therefore what exercises the same path a real override takes.
+    """
+    from xfuser.core.sparse_attention import sol
+
+    monkeypatch.setattr(sol, "_BLOCK_TILE_OVERRIDE", tile)
+
+
+@pytest.mark.parametrize("spec,expected", [("64x64", (64, 64)), ("256X128", (256, 128))])
+def test_the_block_tile_env_var_parses_to_a_tile(monkeypatch, spec, expected):
+    """Both cases, because the value is lowercased before splitting on the x."""
+    from xfuser.core.sparse_attention import sol
+
+    monkeypatch.setenv("XFUSER_SOL_ATTN_BLOCK_TILE", spec)
+    assert sol._read_block_tile_override() == expected
+
+
+def test_a_malformed_block_tile_env_var_says_what_it_wanted(monkeypatch):
+    """A typo here would otherwise land as an unpacking error with no mention of the variable."""
+    from xfuser.core.sparse_attention import sol
+
+    monkeypatch.setenv("XFUSER_SOL_ATTN_BLOCK_TILE", "64,64")
+    with pytest.raises(ValueError, match="must be QxKV"):
+        sol._read_block_tile_override()
+
+
+def test_an_unset_block_tile_takes_the_kernel_default(monkeypatch):
+    """Unset is the shipped configuration, and it must not pin a geometry of its own."""
+    _require_sol_attn()
+
+    from aiter.ops.mha_v4 import mha_v4_block_tile
+    from xfuser.core.sparse_attention import sol
+
+    _override_tile(monkeypatch, None)
+    assert sol.sol_attn_block_tile() == mha_v4_block_tile()
+
+
+def test_a_block_tile_with_no_kernel_is_rejected_by_name(monkeypatch):
+    """Named at the variable that set it, not as a missing manifest row several frames down."""
+    _require_sol_attn()
+
+    from xfuser.core.sparse_attention.sol import SolAttnUnsupported, check_sol_attn_supported
+
+    _override_tile(monkeypatch, (128, 64))
+    query, key, value = _operands(seqlen=256)
+    with pytest.raises(SolAttnUnsupported, match="XFUSER_SOL_ATTN_BLOCK_TILE"):
+        check_sol_attn_supported(query, key, value, is_causal=False)
+
+
+def test_the_64x64_override_routes_and_dispatches_at_64(monkeypatch):
+    """End to end at the finer geometry: it has to route at 64 and hold accuracy.
+
+    Accuracy alone would pass with the override ignored and the default kernel running, so the
+    block count carries the proof. It is reported in selected tiles, and the count here exceeds the
+    total number of tiles the default geometry has for this sequence -- a number it cannot reach,
+    whatever it selects -- so routing, pooling and dispatch all moved together.
+
+    What is deliberately NOT asserted is that 64x64 is more accurate. On clustered operands the
+    pooled correction already recovers most of what coarse selection drops, so both geometries land
+    at the same cosine and the finer one keeps more tokens getting there; the case for it is models
+    whose routing is genuinely finer than a 128-token block, which is a different input than this.
+    """
+    _require_sol_attn()
+
+    from xfuser.core.distributed import attention_backend as ab
+    from xfuser.core.distributed.attention_backend import (
+        ATTENTION_FUNCTION_REGISTRY,
+        AttentionBackendType,
+    )
+    from xfuser.core.sparse_attention import sol
+    from xfuser.core.sparse_attention.head_balance import COST_SINK_KEY
+
+    if (64, 64) not in sol._AITER.block_tiles():
+        pytest.skip("this build has no 64x64 Sol-Attn row.")
+
+    monkeypatch.setattr(ab, "get_ulysses_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(ab, "get_ring_parallel_world_size", lambda: 1)
+
+    heads, seqlen = 2, 2048
+    # Clustered at 64, which only the finer geometry can resolve; see _operands.
+    query, key, value = _operands(seqlen=seqlen, heads=heads, cluster=64)
+    call = ATTENTION_FUNCTION_REGISTRY[AttentionBackendType.AITER_FP8_SOL]
+
+    def run(tile):
+        _override_tile(monkeypatch, tile)
+        assert sol.sol_attn_block_tile() == (tile or sol._AITER.block_tile())
+        sink = torch.zeros(heads, device="cuda", dtype=torch.float32)
+        with torch.no_grad():
+            out, _ = call(query, key, value, dropout_p=0.0, is_causal=False,
+                          attention_kwargs={"solattn_beta": 0.25, COST_SINK_KEY: sink})
+        return out, sink.sum().item()
+
+    default, _ = run(None)
+    fine, fine_blocks = run((64, 64))
+
+    q_tile, kv_tile = sol._AITER.block_tile()
+    every_default_tile = heads * (seqlen // q_tile) * (seqlen // kv_tile)
+    assert fine_blocks > every_default_tile, (
+        f"64x64 reported {fine_blocks:.0f} selected blocks, which {q_tile}x{kv_tile} could have "
+        f"reached by selecting all {every_default_tile} of its own, so the count is no evidence "
+        "the override reached routing")
+
+    reference = _fp32_attention(query, key, value)
+    cosine, baseline = _cosine(fine, reference), _cosine(default, reference)
+    assert cosine > 0.9, f"64x64 Sol-Attn fell to {cosine:.4f} against fp32 dense"
+    assert cosine > baseline - 0.02, (
+        f"64x64 lost ground to {q_tile}x{kv_tile}: {cosine:.4f} vs {baseline:.4f}")
+
+
+def test_a_block_tile_only_one_recipe_serves_is_rejected_at_setup(monkeypatch):
+    """gfx950's 64x64 rows are FP8 only, and the three MX/INT8 recipes have to say so by name.
+
+    At setup rather than at the first attention call, which is the point: this is the check that
+    stands between a mistyped launch and a run that loads a model for minutes before dying. The
+    dispatch would catch it too, but only after the load and without naming the variable.
+    """
+    _require_sol_attn()
+
+    from xfuser.core.sparse_attention import sol
+    from xfuser.core.sparse_attention.sol import SolAttnUnsupported, check_sol_attn_recipe
+
+    if (64, 64) not in sol._AITER.block_tiles():
+        pytest.skip("this build has no 64x64 Sol-Attn row.")
+
+    _override_tile(monkeypatch, (64, 64))
+    recipes = _recipes_on_this_device()
+    served = [recipe for recipe in recipes if _serves(recipe, (64, 64))]
+    assert served == ["fp8"], f"expected the FP8 row alone to serve 64x64, got {served}"
+
+    check_sol_attn_recipe("fp8")
+    for recipe in (r for r in recipes if r not in served):
+        with pytest.raises(SolAttnUnsupported, match=f"XFUSER_SOL_ATTN_BLOCK_TILE.*{recipe}"):
+            check_sol_attn_recipe(recipe)
+
+
+def test_every_recipe_serves_the_default_block_tile(monkeypatch):
+    """The unset default has to work everywhere, which is what makes it the safe default.
+
+    Without this the geometry filtering above could narrow to nothing for some recipe and only the
+    64x64 tests would notice, since an override is what they set.
+    """
+    _require_sol_attn()
+
+    from xfuser.core.sparse_attention import sol
+
+    _override_tile(monkeypatch, None)
+    tile = sol.sol_attn_block_tile()
+    for recipe in _recipes_on_this_device():
+        assert _serves(recipe, tile), (
+            f"the '{recipe}' recipe has no {tile[0]}x{tile[1]} Sol-Attn row, so the default "
+            "geometry is not the one every recipe serves")
