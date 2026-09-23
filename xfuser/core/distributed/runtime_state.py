@@ -467,6 +467,7 @@ class DiTRuntimeState(RuntimeState):
     pp_patches_token_num: Optional[List[int]]
     max_condition_sequence_length: int
     split_text_embed_in_sp: bool
+    text_embed_sp_pad: int
 
     def __init__(self, pipeline: DiffusionPipeline, config: EngineConfig):
         self.attention_schedule: Optional[AttentionSchedule] = None
@@ -523,6 +524,13 @@ class DiTRuntimeState(RuntimeState):
                 backbone_in_channel=pipeline.transformer.config.in_channels,
                 backbone_inner_dim=pipeline.transformer.config.n_heads
                 * pipeline.transformer.config.axes_dims[-1]
+            )
+        elif pipeline.__class__.__name__.startswith(("Lumina2", "xFuserLumina2")):
+            self._set_model_parameters(
+                vae_scale_factor=pipeline.vae_scale_factor,
+                backbone_patch_size=pipeline.transformer.config.patch_size,
+                backbone_in_channel=pipeline.transformer.config.in_channels,
+                backbone_inner_dim=pipeline.transformer.config.hidden_size,
             )
         else:
             vae_scale_factor = getattr(pipeline, "vae_scale_factor", 0)
@@ -744,6 +752,7 @@ class DiTRuntimeState(RuntimeState):
         )
         self.max_condition_sequence_length = max_condition_sequence_length
         self.split_text_embed_in_sp = split_text_embed_in_sp
+        self.text_embed_sp_pad = 0
         if self.runtime_config.warmup_steps > self.input_config.num_inference_steps:
             self.runtime_config.warmup_steps = self.input_config.num_inference_steps
         if seed is not None and seed != self.input_config.seed:

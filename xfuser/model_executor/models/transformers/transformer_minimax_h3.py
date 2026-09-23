@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
@@ -27,7 +28,12 @@ from xfuser.core.distributed.attention_backend import (
     AttentionBackendType,
 )
 from xfuser.core.sparse_attention.sparge import get_gilbert_perm
-from xfuser.model_executor.layers.usp import USP, attention
+from xfuser.core.vsa_h3_attention import build_h3_vsa_metadata
+from xfuser.model_executor.layers.usp import (
+    ULYSSES_EXTRA_INPUTS_KEY,
+    USP,
+    attention,
+)
 
 
 MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT = 64
@@ -116,6 +122,7 @@ class xFuserMiniMaxH3AttnProcessor(MiniMaxH3AttnProcessor):
         attention_kwargs: dict[str, Any] | None = None,
         backend=None,
         substitute_dense_for_sol: bool = False,
+        use_fasth3_vsa: bool = False,
     ) -> None:
         super().__init__()
         self.use_ulysses_parallel_attention = use_ulysses_parallel_attention
@@ -124,6 +131,20 @@ class xFuserMiniMaxH3AttnProcessor(MiniMaxH3AttnProcessor):
         # Set for the token refiner, whose sequence is too short to route over. Resolved per call
         # rather than here because backend is usually None; see _effective_backend.
         self.substitute_dense_for_sol = substitute_dense_for_sol
+        self.use_fasth3_vsa = use_fasth3_vsa
+
+    @property
+    def use_vsa_h3(self) -> bool:
+        """Whether this call runs FastH3 VSA.
+
+        Resolved per call for the reason _effective_backend gives: FLEX_VSA_H3 usually arrives
+        through the runtime state rather than the constructor, so deciding once at construction
+        reads None and declines the gate on a run that asked for it.
+        """
+        return (
+            self.use_fasth3_vsa
+            and _effective_backend(self.backend) == AttentionBackendType.FLEX_VSA_H3
+        )
 
     def __call__(
         self,
@@ -156,6 +177,19 @@ class xFuserMiniMaxH3AttnProcessor(MiniMaxH3AttnProcessor):
             query = _apply_rotary_emb(query, *rotary_emb)
             key = _apply_rotary_emb(key, *rotary_emb)
 
+        use_vsa_h3 = self.use_vsa_h3
+        if use_vsa_h3:
+            if self.attention_kwargs is None:
+                raise RuntimeError("FastH3 VSA metadata was not configured.")
+            if self.attention_kwargs.get("vsa_h3_metadata") is None:
+                raise RuntimeError("FastH3 VSA metadata was not prepared.")
+            self.attention_kwargs["vsa_h3_gate"] = attn.to_gate_compress(
+                hidden_states
+            ).unflatten(-1, (attn.heads, -1)).transpose(1, 2)
+            # The gate is per-head like QKV, so it has to follow them through
+            # the Ulysses exchange before FLEX_VSA_H3 consumes it.
+            self.attention_kwargs[ULYSSES_EXTRA_INPUTS_KEY] = ("vsa_h3_gate",)
+
         use_ulysses = (
             self.use_ulysses_parallel_attention
             and get_ulysses_parallel_world_size() > 1
@@ -180,6 +214,9 @@ class xFuserMiniMaxH3AttnProcessor(MiniMaxH3AttnProcessor):
             value.transpose(1, 2),
             **attention_args,
         ).transpose(1, 2)
+        if use_vsa_h3 and self.attention_kwargs is not None:
+            self.attention_kwargs["vsa_h3_gate"] = None
+            self.attention_kwargs[ULYSSES_EXTRA_INPUTS_KEY] = None
 
         hidden_states = hidden_states.flatten(2, 3).type_as(query)
         hidden_states = attn.to_out[0](hidden_states)
@@ -188,14 +225,81 @@ class xFuserMiniMaxH3AttnProcessor(MiniMaxH3AttnProcessor):
 
 
 class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
-    def __init__(self, *args, attention_backend=None, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self._attention_backend = attention_backend
-        self._usp_attention_kwargs: dict[str, Any] = {}
+    def __init__(
+        self,
+        num_attention_heads: int = 56,
+        attention_head_dim: int = 128,
+        hidden_size: int = 5376,
+        num_layers: int = 50,
+        num_refiner_layers: int = 2,
+        ffn_dim: int = 14336,
+        in_channels: int = 24,
+        audio_in_channels: int = 32,
+        patch_size: tuple[int, int, int] = (1, 2, 2),
+        text_dim: int = 5120,
+        freq_dim: int = 256,
+        time_embed_hidden_dim: int = 5376,
+        time_embed_dim: int = 2688,
+        rope_freq_dim: int = 16,
+        rope_theta: float = 10000.0,
+        norm_eps: float = 1e-5,
+        qk_norm_eps: float = 1e-5,
+        final_norm_eps: float = 1e-5,
+        attention_backend=None,
+        enable_fasth3_vsa: bool = False,
+    ) -> None:
+        super().__init__(
+            num_attention_heads=num_attention_heads,
+            attention_head_dim=attention_head_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            num_refiner_layers=num_refiner_layers,
+            ffn_dim=ffn_dim,
+            in_channels=in_channels,
+            audio_in_channels=audio_in_channels,
+            patch_size=patch_size,
+            text_dim=text_dim,
+            freq_dim=freq_dim,
+            time_embed_hidden_dim=time_embed_hidden_dim,
+            time_embed_dim=time_embed_dim,
+            rope_freq_dim=rope_freq_dim,
+            rope_theta=rope_theta,
+            norm_eps=norm_eps,
+            qk_norm_eps=qk_norm_eps,
+            final_norm_eps=final_norm_eps,
+        )
+        # Keys are always present, carrying None when unused. torch.compile
+        # guards on this dict's key set, so adding or removing entries between
+        # forwards forces a recompile.
+        self._usp_attention_kwargs: dict[str, Any] = {
+            "indices_k": None,
+            "cu_seqlens_k": None,
+            "max_seqlen_k": None,
+            "vsa_h3_metadata": None,
+            "vsa_h3_gate": None,
+            ULYSSES_EXTRA_INPUTS_KEY: None,
+        }
         # Keys the caller's attention_kwargs contributed on the previous forward, so they can be
         # cleared before the next one merges its own.
         self._caller_attention_keys: tuple[str, ...] = ()
+        self._attention_backend = attention_backend
+        self.enable_fasth3_vsa = enable_fasth3_vsa
 
+        if enable_fasth3_vsa:
+            for block in self.transformer_blocks:
+                attn = block.attn
+                # FastH3 VSA checkpoints carry one learned compression gate
+                # per transformer block. Defining the module here makes those
+                # checkpoint keys loadable; the VSA-H3 processor will consume
+                # its output once that backend is enabled.
+                attn.to_gate_compress = torch.nn.Linear(
+                    attn.to_q.in_features,
+                    attn.to_q.out_features,
+                    bias=False,
+                )
+
+        # The processors are handed the constructor's backend unresolved, None included, so each
+        # call asks the runtime state afresh; see _effective_backend.
         for block in self.token_refiner.refiner_blocks:
             block.attn.set_processor(
                 xFuserMiniMaxH3AttnProcessor(
@@ -211,11 +315,26 @@ class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
                     use_ulysses_parallel_attention=True,
                     attention_kwargs=self._usp_attention_kwargs,
                     backend=attention_backend,
+                    use_fasth3_vsa=enable_fasth3_vsa,
                 )
             )
 
         self.register_forward_pre_hook(
             lambda module, args: get_runtime_state().increment_step_counter()
+        )
+
+    @property
+    def use_vsa_h3(self) -> bool:
+        """Whether this forward prepares FastH3 VSA metadata.
+
+        The gate modules above are built from enable_fasth3_vsa alone, because a checkpoint has to
+        load whatever backend runs; whether they are used is a per-call question for the reason
+        _effective_backend gives.
+        """
+        return (
+            self.enable_fasth3_vsa
+            and _effective_backend(self._attention_backend)
+            == AttentionBackendType.FLEX_VSA_H3
         )
 
     @staticmethod
@@ -296,6 +415,49 @@ class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
                 f"tensors matching `position_ids`, got {list(token_tags.shape)} "
                 f"and {list(timestep_indices.shape)} for seq_len={sequence_length}."
             )
+
+        if self.use_vsa_h3:
+            text_count = text_indices.numel()
+            audio_count = audio_indices.numel()
+            expected_text = torch.arange(text_count, device=text_indices.device)
+            expected_audio = torch.arange(
+                text_count,
+                text_count + audio_count,
+                device=audio_indices.device,
+            )
+            expected_video = torch.arange(
+                text_count + audio_count,
+                sequence_length,
+                device=video_indices.device,
+            )
+            if not (
+                torch.equal(text_indices, expected_text)
+                and torch.equal(audio_indices, expected_audio)
+                and torch.equal(video_indices, expected_video)
+            ):
+                raise ValueError(
+                    "FastH3 Preview v1 VSA requires the T2VA packed order "
+                    "[text | audio | generated video]."
+                )
+            video_positions = position_ids.index_select(0, video_indices)
+            video_shape = tuple(
+                int(torch.unique(video_positions[:, axis]).numel())
+                for axis in range(3)
+            )
+            if math.prod(video_shape) != video_indices.numel():
+                raise ValueError(
+                    "Could not recover FastH3's generated-video grid from "
+                    f"position_ids: shape={video_shape}, rows={video_indices.numel()}."
+                )
+            self._usp_attention_kwargs["vsa_h3_metadata"] = (
+                build_h3_vsa_metadata(
+                    (text_count, audio_count),
+                    video_shape,
+                    position_ids.device,
+                )
+            )
+        else:
+            self._usp_attention_kwargs["vsa_h3_metadata"] = None
 
         video_embeds = self.proj_in(hidden_states.to(self.proj_in.weight.dtype))
         audio_embeds = self.audio_proj_in(
@@ -405,21 +567,24 @@ class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
                 dtype=torch.long,
                 device=packed_hidden_states.device,
             )
-            self._usp_attention_kwargs.update(
-                {
-                    "indices_k": indices_k,
-                    "cu_seqlens_k": torch.tensor(
-                        [0, sequence_length],
-                        dtype=torch.int32,
-                        device=packed_hidden_states.device,
-                    ),
-                    "max_seqlen_k": sequence_length,
-                }
+            cu_seqlens_k = torch.tensor(
+                [0, sequence_length],
+                dtype=torch.int32,
+                device=packed_hidden_states.device,
             )
+            max_seqlen_k = sequence_length
         else:
-            self._usp_attention_kwargs.pop("indices_k", None)
-            self._usp_attention_kwargs.pop("cu_seqlens_k", None)
-            self._usp_attention_kwargs.pop("max_seqlen_k", None)
+            indices_k = None
+            cu_seqlens_k = None
+            max_seqlen_k = None
+
+        self._usp_attention_kwargs.update(
+            {
+                "indices_k": indices_k,
+                "cu_seqlens_k": cu_seqlens_k,
+                "max_seqlen_k": max_seqlen_k,
+            }
+        )
 
         # Audio and text are a fraction of a percent and a few percent of this sequence; video is
         # the rest. Sol-Attn thresholds each KV block against statistics taken over every block,
