@@ -48,6 +48,7 @@ def _probe_aiter():
             mha_v4_kv_tile,
             mha_v4_kv_tile_for_q_tile,
             mha_v4_block_tiles,
+            mha_v4_block_tiles_in_any_precision,
             mha_v4_operands,
             MHA_V4_SOL_ATTN_MODE,
             mha_v4_packed,
@@ -77,6 +78,7 @@ def _probe_aiter():
         block_tile=mha_v4_block_tile,
         kv_tile_for_q_tile=mha_v4_kv_tile_for_q_tile,
         block_tiles=mha_v4_block_tiles,
+        block_tiles_any_precision=mha_v4_block_tiles_in_any_precision,
         operands=mha_v4_operands,
         sol_attn_mode=MHA_V4_SOL_ATTN_MODE,
         q_multiplier=mha_v4_q_multiplier,
@@ -137,7 +139,7 @@ def _read_block_tile_override():
 _BLOCK_TILE_OVERRIDE = _read_block_tile_override()
 
 
-def sol_attn_block_tile():
+def sol_attn_block_tile(recipe=None):
     """The (q_tile, kv_tile) this process routes, pools and dispatches Sol-Attn at.
 
     One source for all three. They are not independently choosable: the LUT and the selection
@@ -145,12 +147,19 @@ def sol_attn_block_tile():
     folds log2(kv_tile) into its softmax bias as a build-time constant. A mismatch between any two
     is silently wrong rather than an error, which is why every site below reads it from here.
 
+    `recipe` is what picks the default when the override is unset, and it is not optional on
+    gfx950: the rows there no longer agree on the KV tile at a 256-row query tile, since BF16 and
+    BF16/FP8 route on 64 tokens and the rest on 128. aiter refuses to guess, which is what we want
+    -- pooling at one tile and dispatching at another is silently wrong, per above.
+
     Deliberately not cached: the override is already a constant and the aiter fallback is cached and
     torch_compile_guard'd on its side, so this body is a tuple return that Dynamo folds away.
     """
     if _BLOCK_TILE_OVERRIDE is not None:
         return _BLOCK_TILE_OVERRIDE
-    return _default_block_tile()
+    return _default_block_tile(
+        None if recipe is None else _recipe_operands(recipe), _AITER.sol_attn_mode
+    )
 
 
 class _Recipe(NamedTuple):
@@ -276,21 +285,33 @@ def _check_block_tile_override(recipe=None):
     Checked against `recipe`'s operands when one is given, because a geometry need not exist in
     every precision: gfx950's 64x64 rows are FP8 and BF16 only, so the override is valid for those
     two recipes and for none of the others. Without a recipe it only asks whether any precision
-    serves the tile, which is all a caller reaching sol_attn_bhsd() directly has settled by then.
+    serves the tile, which is all a caller reaching sol_attn_bhsd() directly has settled by then,
+    and which is a question for the union of the rows rather than for the per-Q-tile query: that
+    one collapses to a single KV tile and refuses where the rows disagree, as gfx950's now do at
+    256 rows. A wrong tile would still be caught, one frame lower, when the recipe is known.
     """
     if _BLOCK_TILE_OVERRIDE is None:
         return
     q_tile, kv_tile = _BLOCK_TILE_OVERRIDE
-    operands = None if recipe is None else _recipe_operands(recipe)
-    if _kv_tile_for_q_tile(q_tile, operands, _AITER.sol_attn_mode) == kv_tile:
-        return
-    served = _AITER.block_tiles(operands, _AITER.sol_attn_mode)
-    detail = "" if recipe is None else f" with the '{recipe.id}' recipe"
+    if recipe is None:
+        served = _AITER.block_tiles_any_precision(_AITER.sol_attn_mode)
+        if (q_tile, kv_tile) in served:
+            return
+        detail = default = ""
+    else:
+        operands = _recipe_operands(recipe)
+        if _kv_tile_for_q_tile(q_tile, operands, _AITER.sol_attn_mode) == kv_tile:
+            return
+        served = _AITER.block_tiles(operands, _AITER.sol_attn_mode)
+        detail = f" with the '{recipe.id}' recipe"
+        default = (
+            " Unset it for the default geometry "
+            f"({'x'.join(str(part) for part in sol_attn_block_tile(recipe))})."
+        )
     raise SolAttnUnsupported(
         f"XFUSER_SOL_ATTN_BLOCK_TILE asks for {q_tile}x{kv_tile}, which this GPU has no Sol-Attn "
         f"kernel for{detail}; it serves "
-        f"{', '.join(f'{qo}x{kv}' for qo, kv in served) or 'none'}. Unset it for the default "
-        f"geometry ({'x'.join(str(part) for part in _default_block_tile())}).")
+        f"{', '.join(f'{qo}x{kv}' for qo, kv in served) or 'none'}.{default}")
 
 
 def _recipe_operands(recipe):
@@ -381,7 +402,7 @@ def _quantize(recipe, query, key, value, softmax_scale):
             (v, v_descale, value if packed else None))
 
 
-def _force_blocks_from_tokens(exact_tokens, key_seqlen, padded_seqlen):
+def _force_blocks_from_tokens(exact_tokens, key_seqlen, padded_seqlen, recipe):
     """Per-KV-block "compute this exactly" flags from a per-token mask.
 
     A block is forced on when it holds any flagged token, because the block is the finest thing
@@ -395,7 +416,7 @@ def _force_blocks_from_tokens(exact_tokens, key_seqlen, padded_seqlen):
     if pad > 0:
         # The tile pad is zero keys, which nothing needs computed exactly.
         exact_tokens = torch.nn.functional.pad(exact_tokens, (0, pad))
-    return exact_tokens.reshape(-1, sol_attn_block_tile()[1]).any(dim=1)
+    return exact_tokens.reshape(-1, sol_attn_block_tile(recipe)[1]).any(dim=1)
 
 
 def sol_attn_routing_for(q, k, v, beta, recipe=_RECIPES["fp8"], force_blocks=None,
@@ -425,7 +446,7 @@ def sol_attn_routing_for(q, k, v, beta, recipe=_RECIPES["fp8"], force_blocks=Non
         # wrong tile is not a rounding difference, it hands the kernel pooled tensors of the wrong
         # height. The pad and the dispatch below read the same source, which is what keeps the three
         # from drifting apart.
-        *sol_attn_block_tile(),
+        *sol_attn_block_tile(recipe),
         num_heads=(q[2] if packed is not None else q[0]).shape[2],
         # A packed operand pools from its source and is quantized again, so it has no stored scale
         # to pool and offering one is an error.
@@ -455,7 +476,7 @@ _MIN_USEFUL_KV_BLOCKS = 16
 _short_kv_warned = set()
 
 
-def _warn_if_kv_too_short(seqlen_k):
+def _warn_if_kv_too_short(seqlen_k, recipe):
     """Say something when a call is too short for Sol-Attn to be worth routing.
 
     This is the failure mode that does not announce itself: nothing raises, the answer is just
@@ -468,7 +489,7 @@ def _warn_if_kv_too_short(seqlen_k):
     """
     if torch.compiler.is_compiling():
         return
-    kv_tile = sol_attn_block_tile()[1]
+    kv_tile = sol_attn_block_tile(recipe)[1]
     blocks = seqlen_k // kv_tile
     if blocks >= _MIN_USEFUL_KV_BLOCKS or blocks in _short_kv_warned:
         return
@@ -487,7 +508,7 @@ def _warn_if_kv_too_short(seqlen_k):
     )
 
 
-def _pad_kv_to_tile(key, value):
+def _pad_kv_to_tile(key, value, recipe):
     """Right-pad BSHD K/V with zero tokens so seqlen_k is a whole number of KV blocks.
 
     The LUT-based mha_v4 rows index KV in whole tiles and are handed no real token count, so aiter
@@ -502,7 +523,7 @@ def _pad_kv_to_tile(key, value):
     is why this is a pad and not a mask. Q is deliberately left alone: nothing constrains seqlen_q,
     and padding it would only add rows to slice back off the output.
     """
-    pad = -key.shape[1] % sol_attn_block_tile()[1]
+    pad = -key.shape[1] % sol_attn_block_tile(recipe)[1]
     if pad == 0:
         return key, value
     # BSHD, so the seqlen axis is the second of four and F.pad counts from the last.
@@ -623,15 +644,15 @@ def sol_attn_bhsd(query, key, value, is_causal=False, beta=1.0, softmax_scale=No
     # kernel's own remainder is padded back, which is at most one block of zero tokens.
     if key_seqlen is not None and key_seqlen < key.shape[1]:
         key, value = key[:, :key_seqlen], value[:, :key_seqlen]
-    key, value = _pad_kv_to_tile(key, value)
-    _warn_if_kv_too_short(key.shape[1])
+    key, value = _pad_kv_to_tile(key, value, recipe)
+    _warn_if_kv_too_short(key.shape[1], recipe)
 
     if softmax_scale is None:
         softmax_scale = query.shape[-1] ** -0.5
 
     force_blocks = (
         None if exact_tokens is None
-        else _force_blocks_from_tokens(exact_tokens, key_seqlen, key.shape[1])
+        else _force_blocks_from_tokens(exact_tokens, key_seqlen, key.shape[1], recipe)
     )
 
     # The raw entrypoint routes internally from beta alone, so it cannot be told about forced
@@ -641,7 +662,7 @@ def sol_attn_bhsd(query, key, value, is_causal=False, beta=1.0, softmax_scale=No
         qk, v_fmt = _format(recipe.qk_format), _format(recipe.v_format)
         out = _AITER.sol_attn(query, key, value, qk, qk, v_fmt, beta=beta,
                               softmax_scale=softmax_scale,
-                              block_tile=sol_attn_block_tile())
+                              block_tile=sol_attn_block_tile(recipe))
         return restore_output(out), None
 
     # Quantize exactly as the raw entrypoint would. On the fp8 row that means quantize_fp8_rotated
@@ -674,7 +695,7 @@ def sol_attn_bhsd(query, key, value, is_causal=False, beta=1.0, softmax_scale=No
         mean_v_scale=routing["mean_v_scale"],
         # The row to dispatch, not a preference: routing above already pooled and packed for this
         # geometry, so the kernel has to be the one that reads it that way.
-        block_tile=sol_attn_block_tile(),
+        block_tile=sol_attn_block_tile(recipe),
     )
     return restore_output(out), _head_cost_from_routing(routing)
 

@@ -54,8 +54,27 @@ def _probe_aiter_mha_v4_capabilities(mha_v4_fn) -> _AiterMhaV4Capabilities:
     kv_tile = 64 if is_gfx942 else 128
     if enabled:
         try:
-            from aiter.ops.mha_v4 import mha_v4_kv_tile as _aiter_mha_v4_kv_tile
-            kv_tile = int(_aiter_mha_v4_kv_tile())
+            # Asked for the per-tensor FP8 row rather than for the arch, because gfx950's rows no
+            # longer agree on the KV tile at a 256-row query tile: BF16 and BF16/FP8 route on 64
+            # tokens and every other recipe on 128, so an operand-blind query raises. FP8 stands
+            # for all of AITER_MHA_V4_SPARGE_BACKENDS, which is where this field is consumed and
+            # which contains none of the BF16 recipes -- they reach mha_v4 through the Sol-Attn and
+            # VSA-H3 paths, both of which carry their own geometry.
+            from aiter.ops.mha_v4 import (
+                AttentionScaleMode,
+                MHA_V4_SPARSE_MODE,
+                mha_v4_kv_tile as _aiter_mha_v4_kv_tile,
+                mha_v4_operands,
+                native_fp8_format,
+            )
+            fp8 = native_fp8_format()
+            per_tensor = AttentionScaleMode.F32_PER_TENSOR
+            kv_tile = int(
+                _aiter_mha_v4_kv_tile(
+                    mha_v4_operands(fp8, fp8, fp8, per_tensor, per_tensor, per_tensor),
+                    MHA_V4_SPARSE_MODE,
+                )
+            )
         except ImportError:
             pass
     return _AiterMhaV4Capabilities(
@@ -791,7 +810,11 @@ AITER_MHA_V4_GFX942_SPARGE_BACKEND_SET = frozenset(AITER_MHA_V4_GFX942_SPARGE_BA
 
 
 def _mha_v4_sparge_tile():
-    """Return Sparge tile sizes matching the active MHA v4 sparse KV geometry."""
+    """Return Sparge tile sizes matching the active MHA v4 sparse KV geometry.
+
+    One geometry for every Sparge backend, which holds because none of them is a BF16 recipe --
+    those are the two that route on a 64-token block. See the capability probe.
+    """
     return {"BLOCK_M": 256, "BLOCK_N": _AITER_MHA_V4.kv_tile}
 
 

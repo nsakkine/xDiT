@@ -58,16 +58,17 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # layer and the step axis. Call index is step * num_layers + layer.
     "SOL_ATTN_DUMP_CALLS": lambda: os.environ.get("XFUSER_SOL_ATTN_DUMP_CALLS", "0"),
     # Sol-Attn routing/dispatch tile as "QxKV", e.g. "64x64". Unset takes the ASM row the aiter
-    # manifest calls default: 256x128 on gfx950, 256x64 on gfx942.
+    # manifest calls default for the selected recipe: 256x64 on gfx950 for the BF16 and BF16/FP8
+    # rows, 256x128 there for the rest, 256x64 on gfx942.
     #
-    # The only alternative gfx950 ships is 64x64, and only for the FP8 recipe, so it takes
-    # --attention_backend aiter_fp8_sol; every other row exists at 256x128 alone and rejects the
-    # override at setup. It quadruples routing resolution -- a
-    # block is a quarter the KV width and a quarter the query rows, so a query tile's threshold is
-    # computed over 4x more, 4x smaller blocks. That costs throughput per token (the same KV is
-    # re-read by 4x as many query tiles), so it only wins where 128-token blocks are too coarse to
-    # localise what a query actually attends to, which is the case this exists for: MiniMax-H3
-    # video, where a 128-token block spans rows of a frame. Env rather than a CLI flag because it
+    # gfx950 also ships 64x64, for the FP8 and BF16 recipes, so it takes --attention_backend
+    # aiter_fp8_sol or aiter_bf16_sol; the other rows exist at their default alone and reject the
+    # override at setup. What 64x64 buys over a recipe's default is whatever that default does not
+    # already have: against FP8's 256x128 it quarters both the KV width and the query rows, so a
+    # query tile's threshold is computed over 4x more, 4x smaller blocks; against BF16's 256x64 the
+    # KV width is already 64 and only the query tile narrows, which sharpens the threshold without
+    # changing what a block is. Either way it costs throughput per token, since the same KV is
+    # re-read by 4x as many query tiles. Env rather than a CLI flag because it
     # selects a kernel rather than a model behaviour, and the choice has to be measured per model.
     "SOL_ATTN_BLOCK_TILE": lambda: os.environ.get("XFUSER_SOL_ATTN_BLOCK_TILE", None),
     "XDIT_FBCACHE_THRESH": lambda: os.environ.get("XDIT_FBCACHE_THRESH", None),

@@ -78,6 +78,20 @@ def _serves(recipe, tile):
     return sol._kv_tile_for_q_tile(tile[0], operands, sol._AITER.sol_attn_mode) == tile[1]
 
 
+def _default_tile(recipe):
+    """The (q_tile, kv_tile) `recipe`'s kernel defaults to, whatever the override currently says.
+
+    Asked per recipe because the arch has no one answer to give: on gfx950 the BF16 rows route on
+    a 64-token block and every other recipe on 128. Asked of aiter rather than through
+    sol_attn_block_tile because that one honours the override, which the tests below set and
+    unset -- reading the default through it would return whatever was last forced.
+    """
+    from xfuser.core.sparse_attention import sol
+
+    operands = sol._recipe_operands(sol._RECIPES[recipe])
+    return sol._default_block_tile(operands, sol._AITER.sol_attn_mode)
+
+
 def test_sol_attn_drops_a_caller_alignment_pad():
     """key_seqlen must reproduce attention over the real tokens, whatever the pad holds.
 
@@ -125,15 +139,15 @@ def test_forced_blocks_are_added_to_what_routing_picked():
 
     from xfuser.core.sparse_attention.sol import (
         _force_blocks_from_tokens,
-        _kv_tile,
         _quantize,
         _RECIPES,
+        sol_attn_block_tile,
         sol_attn_routing_for,
     )
 
-    tile = _kv_tile()
-    query, key, value = _operands(seqlen=8 * tile, heads=2)
     recipe = _RECIPES["fp8"]
+    tile = sol_attn_block_tile(recipe)[1]
+    query, key, value = _operands(seqlen=8 * tile, heads=2)
     q, k, v = _quantize(
         recipe,
         *(x.permute(0, 2, 1, 3).contiguous() for x in (query, key, value)),
@@ -143,7 +157,7 @@ def test_forced_blocks_are_added_to_what_routing_picked():
     # A band the size of one block, as a minority modality would be.
     exact_tokens = torch.zeros(8 * tile, dtype=torch.bool, device="cuda")
     exact_tokens[3 * tile : 4 * tile] = True
-    forced = _force_blocks_from_tokens(exact_tokens, None, 8 * tile)
+    forced = _force_blocks_from_tokens(exact_tokens, None, 8 * tile, recipe)
     assert forced.tolist() == [False, False, False, True, False, False, False, False]
 
     routed = sol_attn_routing_for(q, k, v, 0.5, recipe)["block_attn_mask"]
@@ -158,19 +172,24 @@ def test_forced_blocks_are_added_to_what_routing_picked():
 
 def test_forced_blocks_follow_the_same_trim_and_pad_as_kv():
     """The token mask has to stay in step with K/V or it names the wrong blocks."""
-    # _kv_tile() reads the manifest for the device, so this needs one even though the check below
-    # is pure tensor bookkeeping.
+    # sol_attn_block_tile() reads the manifest for the device, so this needs one even though the
+    # check below is pure tensor bookkeeping.
     _require_sol_attn()
 
-    from xfuser.core.sparse_attention.sol import _force_blocks_from_tokens, _kv_tile
+    from xfuser.core.sparse_attention.sol import (
+        _force_blocks_from_tokens,
+        _RECIPES,
+        sol_attn_block_tile,
+    )
 
     import torch
 
-    tile = _kv_tile()
+    recipe = _RECIPES["fp8"]
+    tile = sol_attn_block_tile(recipe)[1]
     # Two real blocks plus a partial third, trimmed from a caller pad, then padded back to tile.
     tokens = torch.zeros(3 * tile, dtype=torch.bool)
     tokens[2 * tile : 2 * tile + 5] = True
-    forced = _force_blocks_from_tokens(tokens, 2 * tile + 5, 3 * tile)
+    forced = _force_blocks_from_tokens(tokens, 2 * tile + 5, 3 * tile, recipe)
     assert forced.tolist() == [False, False, True]
 
 
@@ -234,12 +253,9 @@ def test_sol_attn_refuses_multi_sequence_varlen():
         )
 
 
-def _kv_block(key):
-    """Number of pooled KV blocks in a BHSD key, at the tile this device's manifest row uses."""
-    from xfuser.core.sparse_attention.sol import _kv_tile
-
-    tile = _kv_tile()
-    return -(-key.shape[2] // tile)
+def _kv_block(key, recipe="fp8"):
+    """Number of pooled KV blocks in a BHSD key, at the tile this recipe's manifest row uses."""
+    return -(-key.shape[2] // _default_tile(recipe)[1])
 
 
 def _operands(seqlen=1024, heads=2, head_dim=128, seed=1234, sharpness=2.0, cluster=128):
@@ -631,7 +647,7 @@ def test_sol_attn_publishes_a_head_cost_without_changing_the_output(monkeypatch)
         "the packed path taken for head cost must reproduce the raw path exactly"
     )
     assert (cost_sink > 0).all(), "every head should select at least one block"
-    num_kv_blocks = _kv_block(key)
+    num_kv_blocks = _kv_block(key, "fp8")
     num_q_tiles = (query.shape[2] + 255) // 256
     assert (cost_sink <= num_q_tiles * num_kv_blocks).all()
 
@@ -897,14 +913,23 @@ def test_a_malformed_block_tile_env_var_says_what_it_wanted(monkeypatch):
 
 
 def test_an_unset_block_tile_takes_the_kernel_default(monkeypatch):
-    """Unset is the shipped configuration, and it must not pin a geometry of its own."""
+    """Unset is the shipped configuration, and it must not pin a geometry of its own.
+
+    Checked once per recipe, because the kernel default is now per recipe: gfx950's BF16 rows
+    route on a 64-token block and the rest on 128. Deferring to aiter per recipe is the whole
+    property -- a geometry pinned here would be right for at most one of them.
+    """
     _require_sol_attn()
 
     from aiter.ops.mha_v4 import mha_v4_block_tile
     from xfuser.core.sparse_attention import sol
 
     _override_tile(monkeypatch, None)
-    assert sol.sol_attn_block_tile() == mha_v4_block_tile()
+    for recipe in _recipes_on_this_device():
+        operands = sol._recipe_operands(sol._RECIPES[recipe])
+        assert sol.sol_attn_block_tile(sol._RECIPES[recipe]) == mha_v4_block_tile(
+            operands, sol._AITER.sol_attn_mode
+        ), f"the '{recipe}' recipe does not take aiter's default for its own row"
 
 
 def test_a_block_tile_with_no_kernel_is_rejected_by_name(monkeypatch):
@@ -923,9 +948,15 @@ def test_the_64x64_override_routes_and_dispatches_at_64(monkeypatch):
     """End to end at the finer geometry: it has to route at 64 and hold accuracy.
 
     Accuracy alone would pass with the override ignored and the default kernel running, so the
-    block count carries the proof. It is reported in selected tiles, and the count here exceeds the
-    total number of tiles the default geometry has for this sequence -- a number it cannot reach,
-    whatever it selects -- so routing, pooling and dispatch all moved together.
+    block count carries the proof. It is reported in (query tile x KV block) pairs, so naming the
+    same content on the finer grid costs strictly more of them; ignoring the override would return
+    the default run's number exactly. Routing, pooling and dispatch therefore all moved together.
+
+    The output is deliberately not part of that proof, because for a recipe whose default already
+    routes at 64 keys it is bit-identical to the default run: refining only the query tile leaves
+    every row accumulating over the same KV tiles in the same order, so the two kernels agree to
+    the last bit. That is a fact about the arithmetic, not evidence the override did nothing --
+    the block counts, which come out four times larger, are what separate the two.
 
     What is deliberately NOT asserted is that 64x64 is more accurate. On clustered operands the
     pooled correction already recovers most of what coarse selection drops, so both geometries land
@@ -946,7 +977,9 @@ def test_the_64x64_override_routes_and_dispatches_at_64(monkeypatch):
     from xfuser.core.sparse_attention import sol
     from xfuser.core.sparse_attention.head_balance import COST_SINK_KEY
 
-    if (64, 64) not in sol._AITER.block_tiles():
+    # Per recipe, since a blind enumeration would raise rather than answer: it lists one KV tile
+    # per Q tile, and at 256 rows this arch serves two depending on the recipe.
+    if not any(_serves(recipe, (64, 64)) for recipe in _recipes_on_this_device()):
         pytest.skip("this build has no 64x64 Sol-Attn row.")
 
     monkeypatch.setattr(ab, "get_ulysses_parallel_world_size", lambda: 1)
@@ -956,8 +989,6 @@ def test_the_64x64_override_routes_and_dispatches_at_64(monkeypatch):
     # Clustered at 64, which only the finer geometry can resolve; see _operands.
     query, key, value = _operands(seqlen=seqlen, heads=heads, cluster=64)
     reference = _fp32_attention(query, key, value)
-    q_tile, kv_tile = sol._AITER.block_tile()
-    every_default_tile = heads * (seqlen // q_tile) * (seqlen // kv_tile)
 
     on_device = _recipes_on_this_device()
     serving = [(backend, recipe) for backend, recipe in AITER_MHA_V4_SOL_RECIPE.items()
@@ -966,23 +997,28 @@ def test_the_64x64_override_routes_and_dispatches_at_64(monkeypatch):
 
     for backend, recipe in serving:
         call = ATTENTION_FUNCTION_REGISTRY[backend]
+        # Per recipe, since that is how fine the defaults are now: BF16 defaults to a 64-key
+        # block here and the rest to 128.
+        default_tile = _default_tile(recipe)
+        q_tile, kv_tile = default_tile
 
         def run(tile):
             _override_tile(monkeypatch, tile)
-            assert sol.sol_attn_block_tile() == (tile or sol._AITER.block_tile())
+            assert sol.sol_attn_block_tile(sol._RECIPES[recipe]) == (tile or default_tile)
             sink = torch.zeros(heads, device="cuda", dtype=torch.float32)
             with torch.no_grad():
                 out, _ = call(query, key, value, dropout_p=0.0, is_causal=False,
                               attention_kwargs={"solattn_beta": 0.25, COST_SINK_KEY: sink})
             return out, sink.sum().item()
 
-        default, _ = run(None)
+        default, default_blocks = run(None)
         fine, fine_blocks = run((64, 64))
 
-        assert fine_blocks > every_default_tile, (
-            f"{recipe}: 64x64 reported {fine_blocks:.0f} selected blocks, which "
-            f"{q_tile}x{kv_tile} could have reached by selecting all {every_default_tile} of its "
-            "own, so the count is no evidence the override reached routing")
+        assert fine_blocks > default_blocks, (
+            f"{recipe}: 64x64 reported {fine_blocks:.0f} selected blocks and "
+            f"{q_tile}x{kv_tile} reported {default_blocks:.0f}; the finer grid has to cost more "
+            "pairs for the same content, so an equal or smaller count means the override never "
+            "reached routing")
 
         cosine, baseline = _cosine(fine, reference), _cosine(default, reference)
         assert cosine > 0.9, f"{recipe}: 64x64 Sol-Attn fell to {cosine:.4f} against fp32 dense"
@@ -1006,7 +1042,9 @@ def test_a_block_tile_not_every_recipe_serves_is_rejected_at_setup(monkeypatch):
     from xfuser.core.sparse_attention import sol
     from xfuser.core.sparse_attention.sol import SolAttnUnsupported, check_sol_attn_recipe
 
-    if (64, 64) not in sol._AITER.block_tiles():
+    # Per recipe, since a blind enumeration would raise rather than answer: it lists one KV tile
+    # per Q tile, and at 256 rows this arch serves two depending on the recipe.
+    if not any(_serves(recipe, (64, 64)) for recipe in _recipes_on_this_device()):
         pytest.skip("this build has no 64x64 Sol-Attn row.")
 
     _override_tile(monkeypatch, (64, 64))
@@ -1034,8 +1072,8 @@ def test_every_recipe_serves_the_default_block_tile(monkeypatch):
     from xfuser.core.sparse_attention import sol
 
     _override_tile(monkeypatch, None)
-    tile = sol.sol_attn_block_tile()
     for recipe in _recipes_on_this_device():
+        tile = _default_tile(recipe)
         assert _serves(recipe, tile), (
-            f"the '{recipe}' recipe has no {tile[0]}x{tile[1]} Sol-Attn row, so the default "
-            "geometry is not the one every recipe serves")
+            f"the '{recipe}' recipe has no {tile[0]}x{tile[1]} Sol-Attn row, so its default "
+            "geometry is not one it serves")
