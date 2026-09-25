@@ -274,9 +274,9 @@ def _check_block_tile_override(recipe=None):
     """Raise unless XFUSER_SOL_ATTN_BLOCK_TILE names a geometry this device has a kernel for.
 
     Checked against `recipe`'s operands when one is given, because a geometry need not exist in
-    every precision: gfx950's 64x64 rows are FP8 only, so the override is valid for the fp8 recipe
-    and for none of the others. Without a recipe it only asks whether any precision serves the
-    tile, which is all a caller reaching sol_attn_bhsd() directly has settled by then.
+    every precision: gfx950's 64x64 rows are FP8 and BF16 only, so the override is valid for those
+    two recipes and for none of the others. Without a recipe it only asks whether any precision
+    serves the tile, which is all a caller reaching sol_attn_bhsd() directly has settled by then.
     """
     if _BLOCK_TILE_OVERRIDE is None:
         return

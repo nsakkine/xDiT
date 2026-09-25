@@ -280,6 +280,62 @@ def _flex_block_mask(block_map: torch.Tensor, block_size: int) -> BlockMask:
     )
 
 
+def h3_vsa_tiles_are_full(metadata: MiniMaxH3VSAMetadata) -> bool:
+    """Whether every tile holds a whole tile's worth of real tokens.
+
+    False whenever a prefix segment is not a multiple of the tile or the video grid does not
+    divide by the tile shape, which leaves zero-padded key slots inside otherwise-real tiles.
+    A kernel that can only mask whole tiles cannot express that padding: a zeroed key scores 0
+    rather than -inf, so it takes softmax mass while contributing nothing to the numerator.
+    """
+    return bool(
+        torch.all(metadata.variable_block_sizes == metadata.tile_elements).item()
+    )
+
+
+def h3_vsa_selection(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    metadata: MiniMaxH3VSAMetadata,
+    sparsity: float = FASTH3_VSA_SPARSITY,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The tile selection and the dense pooled branch, shared by every VSA-H3 kernel.
+
+    Both are kernel-independent: the selection is a boolean tile map that any block-sparse
+    implementation can consume, and the compressed branch is the pooled attention the
+    checkpoint's learned gate mixes into whatever the sparse kernel returns.
+    """
+    expected = (
+        query.ndim == 4
+        and query.shape == key.shape == value.shape
+        and query.shape[2] == metadata.padded_seq_length
+    )
+    if not expected:
+        raise ValueError(
+            "VSA-H3 attention expects equally shaped padded BHSD tensors; "
+            f"got q={tuple(query.shape)}, k={tuple(key.shape)}, "
+            f"v={tuple(value.shape)}."
+        )
+
+    pooled_query = pool_h3_vsa_tiles(query, metadata)
+    pooled_key = pool_h3_vsa_tiles(key, metadata)
+    pooled_value = pool_h3_vsa_tiles(value, metadata)
+    scores = torch.matmul(
+        pooled_query,
+        pooled_key.transpose(-2, -1),
+    ) * (query.shape[-1] ** -0.5)
+    block_map = build_h3_vsa_block_mask(
+        scores,
+        metadata.num_prefix_tiles,
+        metadata.num_video_tiles,
+        sparsity,
+    )
+    compressed = torch.matmul(torch.softmax(scores, dim=-1), pooled_value)
+    compressed = compressed.repeat_interleave(metadata.tile_elements, dim=2)
+    return block_map, compressed
+
+
 def pool_h3_vsa_tiles(
     tensor: torch.Tensor,
     metadata: MiniMaxH3VSAMetadata,
@@ -314,31 +370,7 @@ def flex_h3_vsa_attention(
     value is the dense pooled branch expanded back to token rows; callers
     apply the checkpoint's learned gate before adding it to the sparse output.
     """
-    expected = (
-        query.ndim == 4
-        and query.shape == key.shape == value.shape
-        and query.shape[2] == metadata.padded_seq_length
-    )
-    if not expected:
-        raise ValueError(
-            "VSA-H3 attention expects equally shaped padded BHSD tensors; "
-            f"got q={tuple(query.shape)}, k={tuple(key.shape)}, "
-            f"v={tuple(value.shape)}."
-        )
-
-    pooled_query = pool_h3_vsa_tiles(query, metadata)
-    pooled_key = pool_h3_vsa_tiles(key, metadata)
-    pooled_value = pool_h3_vsa_tiles(value, metadata)
-    scores = torch.matmul(
-        pooled_query,
-        pooled_key.transpose(-2, -1),
-    ) * (query.shape[-1] ** -0.5)
-    block_map = build_h3_vsa_block_mask(
-        scores,
-        metadata.num_prefix_tiles,
-        metadata.num_video_tiles,
-        sparsity,
-    )
+    block_map, compressed = h3_vsa_selection(query, key, value, metadata, sparsity)
     flex_block_mask = _flex_block_mask(block_map, metadata.tile_elements)
     variable_block_sizes = metadata.variable_block_sizes
     tile_elements = metadata.tile_elements
@@ -361,6 +393,4 @@ def flex_h3_vsa_attention(
             "ROWS_GUARANTEED_SAFE": True,
         },
     )
-    compressed = torch.matmul(torch.softmax(scores, dim=-1), pooled_value)
-    compressed = compressed.repeat_interleave(tile_elements, dim=2)
     return sparse_output, compressed

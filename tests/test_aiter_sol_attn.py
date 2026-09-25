@@ -931,13 +931,17 @@ def test_the_64x64_override_routes_and_dispatches_at_64(monkeypatch):
     pooled correction already recovers most of what coarse selection drops, so both geometries land
     at the same cosine and the finer one keeps more tokens getting there; the case for it is models
     whose routing is genuinely finer than a 128-token block, which is a different input than this.
+
+    Every backend whose recipe has a 64x64 row is exercised, read off the manifest rather than
+    named, so a precision that gains one is covered the day it lands instead of leaving the
+    geometry proven in FP8 alone.
     """
     _require_sol_attn()
 
     from xfuser.core.distributed import attention_backend as ab
     from xfuser.core.distributed.attention_backend import (
+        AITER_MHA_V4_SOL_RECIPE,
         ATTENTION_FUNCTION_REGISTRY,
-        AttentionBackendType,
     )
     from xfuser.core.sparse_attention import sol
     from xfuser.core.sparse_attention.head_balance import COST_SINK_KEY
@@ -951,36 +955,47 @@ def test_the_64x64_override_routes_and_dispatches_at_64(monkeypatch):
     heads, seqlen = 2, 2048
     # Clustered at 64, which only the finer geometry can resolve; see _operands.
     query, key, value = _operands(seqlen=seqlen, heads=heads, cluster=64)
-    call = ATTENTION_FUNCTION_REGISTRY[AttentionBackendType.AITER_FP8_SOL]
-
-    def run(tile):
-        _override_tile(monkeypatch, tile)
-        assert sol.sol_attn_block_tile() == (tile or sol._AITER.block_tile())
-        sink = torch.zeros(heads, device="cuda", dtype=torch.float32)
-        with torch.no_grad():
-            out, _ = call(query, key, value, dropout_p=0.0, is_causal=False,
-                          attention_kwargs={"solattn_beta": 0.25, COST_SINK_KEY: sink})
-        return out, sink.sum().item()
-
-    default, _ = run(None)
-    fine, fine_blocks = run((64, 64))
-
+    reference = _fp32_attention(query, key, value)
     q_tile, kv_tile = sol._AITER.block_tile()
     every_default_tile = heads * (seqlen // q_tile) * (seqlen // kv_tile)
-    assert fine_blocks > every_default_tile, (
-        f"64x64 reported {fine_blocks:.0f} selected blocks, which {q_tile}x{kv_tile} could have "
-        f"reached by selecting all {every_default_tile} of its own, so the count is no evidence "
-        "the override reached routing")
 
-    reference = _fp32_attention(query, key, value)
-    cosine, baseline = _cosine(fine, reference), _cosine(default, reference)
-    assert cosine > 0.9, f"64x64 Sol-Attn fell to {cosine:.4f} against fp32 dense"
-    assert cosine > baseline - 0.02, (
-        f"64x64 lost ground to {q_tile}x{kv_tile}: {cosine:.4f} vs {baseline:.4f}")
+    on_device = _recipes_on_this_device()
+    serving = [(backend, recipe) for backend, recipe in AITER_MHA_V4_SOL_RECIPE.items()
+               if recipe in on_device and _serves(recipe, (64, 64))]
+    assert serving, "this build has a 64x64 Sol-Attn row but no backend reaches it"
+
+    for backend, recipe in serving:
+        call = ATTENTION_FUNCTION_REGISTRY[backend]
+
+        def run(tile):
+            _override_tile(monkeypatch, tile)
+            assert sol.sol_attn_block_tile() == (tile or sol._AITER.block_tile())
+            sink = torch.zeros(heads, device="cuda", dtype=torch.float32)
+            with torch.no_grad():
+                out, _ = call(query, key, value, dropout_p=0.0, is_causal=False,
+                              attention_kwargs={"solattn_beta": 0.25, COST_SINK_KEY: sink})
+            return out, sink.sum().item()
+
+        default, _ = run(None)
+        fine, fine_blocks = run((64, 64))
+
+        assert fine_blocks > every_default_tile, (
+            f"{recipe}: 64x64 reported {fine_blocks:.0f} selected blocks, which "
+            f"{q_tile}x{kv_tile} could have reached by selecting all {every_default_tile} of its "
+            "own, so the count is no evidence the override reached routing")
+
+        cosine, baseline = _cosine(fine, reference), _cosine(default, reference)
+        assert cosine > 0.9, f"{recipe}: 64x64 Sol-Attn fell to {cosine:.4f} against fp32 dense"
+        assert cosine > baseline - 0.02, (
+            f"{recipe}: 64x64 lost ground to {q_tile}x{kv_tile}: {cosine:.4f} vs {baseline:.4f}")
 
 
-def test_a_block_tile_only_one_recipe_serves_is_rejected_at_setup(monkeypatch):
-    """gfx950's 64x64 rows are FP8 only, and the three MX/INT8 recipes have to say so by name.
+def test_a_block_tile_not_every_recipe_serves_is_rejected_at_setup(monkeypatch):
+    """gfx950's 64x64 rows are FP8 and BF16, and the MX/INT8 recipes have to say so by name.
+
+    Which recipes serve 64x64 is read off the manifest rather than named here, so adding a row
+    extends the test instead of breaking it. What is asserted is the partition: the tile has to be
+    served by some recipe and not by all of them, or neither half below would be checking anything.
 
     At setup rather than at the first attention call, which is the point: this is the check that
     stands between a mistyped launch and a run that loads a model for minutes before dying. The
@@ -997,10 +1012,13 @@ def test_a_block_tile_only_one_recipe_serves_is_rejected_at_setup(monkeypatch):
     _override_tile(monkeypatch, (64, 64))
     recipes = _recipes_on_this_device()
     served = [recipe for recipe in recipes if _serves(recipe, (64, 64))]
-    assert served == ["fp8"], f"expected the FP8 row alone to serve 64x64, got {served}"
+    unserved = [recipe for recipe in recipes if recipe not in served]
+    assert served, "no recipe serves 64x64, so the acceptance half below checks nothing"
+    assert unserved, "every recipe serves 64x64, so the rejection half below checks nothing"
 
-    check_sol_attn_recipe("fp8")
-    for recipe in (r for r in recipes if r not in served):
+    for recipe in served:
+        check_sol_attn_recipe(recipe)
+    for recipe in unserved:
         with pytest.raises(SolAttnUnsupported, match=f"XFUSER_SOL_ATTN_BLOCK_TILE.*{recipe}"):
             check_sol_attn_recipe(recipe)
 

@@ -698,6 +698,7 @@ class AttentionBackendType(Enum):
     AITER_SPARGE_V2 = "AITER Sparge V2"
     AITER_VSA = "AITER VSA CK"
     FLEX_VSA_H3 = "Flex VSA-H3"
+    AITER_VSA_H3 = "AITER VSA-H3"
     FLEX_BLOCK_SPARGE = "Flex Block Sparge"
     AITER_FLYDSL = "AITER FlyDSL"
     AITER_FLYDSL_FP8 = "AITER FlyDSL FP8"
@@ -735,6 +736,14 @@ AITER_MHA_V4_ONLY_BACKENDS = tuple(
         if backend != AttentionBackendType.AITER_FP8
     ]
 )
+# The VSA-H3 rows. Both run FastH3's 64-token tile selection and its gated pooled branch, and
+# differ only in which kernel walks the selection, so every caller that asks "is this call VSA-H3"
+# rather than "which kernel" tests against this.
+VSA_H3_ATTN_BACKENDS = (
+    AttentionBackendType.FLEX_VSA_H3,
+    AttentionBackendType.AITER_VSA_H3,
+)
+VSA_H3_ATTN_BACKEND_SET = frozenset(VSA_H3_ATTN_BACKENDS)
 AITER_MHA_V4_ONLY_BACKEND_SET = frozenset(AITER_MHA_V4_ONLY_BACKENDS)
 AITER_MHA_V4_SPARGE_BACKEND_SET = frozenset(AITER_MHA_V4_SPARGE_BACKENDS)
 # The mode-2 (Sol-Attn) rows. A subset of the recipes above: Sol-Attn needs a manifest row of its
@@ -1982,8 +1991,72 @@ def _dense_h3_fallback_attn_call(
     )
 
 
-@register_attention_function(AttentionBackendType.FLEX_VSA_H3)
-def _flex_vsa_h3_attn_call(
+# VSA-H3 pools over 64-token tiles, so its selection is only expressible at this geometry.
+_VSA_H3_AITER_TILE = (64, 64)
+
+
+@functools.lru_cache(maxsize=None)
+def _warn_once(message):
+    """Log once per distinct message, for per-call conditions that hold for a whole run."""
+    logger.warning(message)
+
+
+@functools.lru_cache(maxsize=1)
+def _aiter_vsa_h3_row_available() -> bool:
+    """Whether this device has a BF16 64x64 block-sparse MHA v4 row.
+
+    VSA-H3's tile is 64 tokens, so the selection is only expressible at that geometry; gfx950
+    served it in FP8 alone until the BF16 rows landed, and gfx942's finest is 256x64.
+    """
+    if not (_AITER_MHA_V4.enabled and _AITER_MHA_V4.block_mask):
+        return False
+    try:
+        from aiter.ops.mha_v4 import MHA_V4_SPARSE_MODE, mha_v4_block_tiles
+    except ImportError:
+        return False
+    bf16 = _AiterAttentionFormat.BF16
+    unscaled = _AiterAttentionScaleMode.NONE
+    operands = (bf16, bf16, bf16, unscaled, unscaled, unscaled)
+    return _VSA_H3_AITER_TILE in mha_v4_block_tiles(operands, MHA_V4_SPARSE_MODE)
+
+
+def _aiter_h3_vsa_attention(query, key, value, metadata, sparsity=None):
+    """VSA-H3's sparse branch through AITER's 64x64 block-sparse MHA v4 row.
+
+    Signature-compatible with flex_h3_vsa_attention, and takes the selection from the same
+    shared helper: only the kernel that walks it differs. Pure sparse rather than Sol-Attn
+    because FastH3 carries its own pooled branch and mixes it with a learned gate outside the
+    softmax, where Sol-Attn folds an approximation of the skipped blocks inside it.
+
+    The caller is responsible for the padding gate. This row masks whole tiles only, so a tile
+    holding fewer than 64 real tokens would let its zeroed slots score 0 instead of -inf.
+    """
+    from xfuser.core.vsa_h3_attention import FASTH3_VSA_SPARSITY, h3_vsa_selection
+
+    block_map, compressed = h3_vsa_selection(
+        query,
+        key,
+        value,
+        metadata,
+        FASTH3_VSA_SPARSITY if sparsity is None else sparsity,
+    )
+    bf16 = _AiterAttentionFormat.BF16
+    sparse_output = _aiter_mha_v4(
+        query.transpose(1, 2).contiguous(),
+        key.transpose(1, 2).contiguous(),
+        value.transpose(1, 2).contiguous(),
+        bf16,
+        bf16,
+        bf16,
+        block_mask=block_map,
+        block_tile=_VSA_H3_AITER_TILE,
+    )
+    return sparse_output.transpose(1, 2), compressed
+
+
+def _vsa_h3_attn_call(
+    runner,
+    label,
     query,
     key,
     value,
@@ -1991,7 +2064,7 @@ def _flex_vsa_h3_attn_call(
     is_causal,
     attention_kwargs=None,
 ):
-    """FastH3 64-token VSA-H3 through FlexAttention.
+    """FastH3 64-token VSA-H3, over whichever kernel ``runner`` dispatches.
 
     USP gathers sequence before this runs. The compression gate rides the
     same Ulysses exchange in ``attention_kwargs['vsa_h3_gate']``. Calls
@@ -2007,12 +2080,11 @@ def _flex_vsa_h3_attn_call(
             query, key, value, dropout_p, is_causal, attention_kwargs
         )
     if is_causal:
-        raise ValueError("FLEX_VSA_H3 does not support causal attention")
+        raise ValueError(f"{label} does not support causal attention")
     if dropout_p not in (None, 0.0):
-        raise ValueError("FLEX_VSA_H3 does not support attention dropout")
+        raise ValueError(f"{label} does not support attention dropout")
 
     from xfuser.core.vsa_h3_attention import (
-        flex_h3_vsa_attention,
         tile_h3_vsa_tensor,
         untile_h3_vsa_tensor,
     )
@@ -2034,7 +2106,7 @@ def _flex_vsa_h3_attn_call(
     tiled_key = tile_bhsd(key)
     tiled_value = tile_bhsd(value)
     tiled_gate = tile_bhsd(gate)
-    sparse_output, compressed_output = flex_h3_vsa_attention(
+    sparse_output, compressed_output = runner(
         tiled_query,
         tiled_key,
         tiled_value,
@@ -2057,6 +2129,75 @@ def _flex_vsa_h3_attn_call(
         padded_output[:, :, :sequence_length] = packed_output
         packed_output = padded_output
     return packed_output, None
+
+
+@register_attention_function(AttentionBackendType.FLEX_VSA_H3)
+def _flex_vsa_h3_attn_call(
+    query, key, value, dropout_p, is_causal, attention_kwargs=None
+):
+    """FastH3 64-token VSA-H3 through FlexAttention."""
+    from xfuser.core.vsa_h3_attention import flex_h3_vsa_attention
+
+    return _vsa_h3_attn_call(
+        flex_h3_vsa_attention,
+        "FLEX_VSA_H3",
+        query,
+        key,
+        value,
+        dropout_p,
+        is_causal,
+        attention_kwargs,
+    )
+
+
+@register_attention_function(AttentionBackendType.AITER_VSA_H3)
+@torch.compiler.disable
+def _aiter_vsa_h3_attn_call(
+    query, key, value, dropout_p, is_causal, attention_kwargs=None
+):
+    """FastH3 64-token VSA-H3 through AITER's BF16 64x64 block-sparse row.
+
+    Falls back to the FlexAttention runner whenever this device has no such row, and whenever
+    the tiling leaves padded key slots: AITER's block mask is per tile and cannot drive the
+    stragglers to -inf, so their zeroed keys would score 0 and take softmax mass. That is not a
+    rare shape -- an arbitrary text or audio prefix length, or a video grid that does not divide
+    by the 4x4x4 tile, is enough -- so the fallback carries the common case for now.
+    """
+    from xfuser.core.vsa_h3_attention import h3_vsa_tiles_are_full
+
+    metadata = (attention_kwargs or {}).get("vsa_h3_metadata")
+    runner = _aiter_h3_vsa_attention
+    if metadata is not None:
+        reason = None
+        if not _aiter_vsa_h3_row_available():
+            reason = "this device has no BF16 64x64 block-sparse MHA v4 row"
+        elif not h3_vsa_tiles_are_full(metadata):
+            if environment_variables["VSA_H3_ALLOW_PADDED"]() == "1":
+                _warn_once(
+                    "XFUSER_VSA_H3_ALLOW_PADDED is set, so AITER_VSA_H3 is running a tiling "
+                    "with padded key slots. Those keys score 0 rather than -inf and take "
+                    "softmax mass, which costs output quality."
+                )
+            else:
+                reason = (
+                    "the VSA-H3 tiling leaves padded key slots, which a per-tile block mask "
+                    "cannot mask out"
+                )
+        if reason is not None:
+            _warn_once(f"AITER_VSA_H3 is running FlexAttention because {reason}.")
+            from xfuser.core.vsa_h3_attention import flex_h3_vsa_attention
+
+            runner = flex_h3_vsa_attention
+    return _vsa_h3_attn_call(
+        runner,
+        "AITER_VSA_H3",
+        query,
+        key,
+        value,
+        dropout_p,
+        is_causal,
+        attention_kwargs,
+    )
 
 
 @register_attention_function(AttentionBackendType.AITER_VSA)

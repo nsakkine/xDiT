@@ -6,6 +6,8 @@ from xfuser.core.vsa_h3_attention import (
     build_h3_vsa_block_mask,
     build_h3_vsa_metadata,
     compute_h3_vsa_topk,
+    h3_vsa_selection,
+    h3_vsa_tiles_are_full,
     tile_h3_vsa_tensor,
     untile_h3_vsa_tensor,
 )
@@ -115,3 +117,64 @@ def test_h3_vsa_rejects_non_64_token_geometry():
             device=torch.device("cpu"),
             tile_shape=(2, 2, 2),
         )
+
+
+@pytest.mark.parametrize(
+    ("prefix_segments", "video_shape", "full"),
+    [
+        # whole-tile prefixes and a grid that divides by 4x4x4 leave no padded slot
+        ((128, 64), (8, 16, 16), True),
+        # a prefix that is not a multiple of the tile leaves a short remainder tile
+        ((130, 64), (8, 16, 16), False),
+        # so does a video axis that does not divide by its tile extent
+        ((128, 64), (8, 16, 18), False),
+    ],
+)
+def test_h3_vsa_tiles_are_full_tracks_every_source_of_padding(
+    prefix_segments, video_shape, full
+):
+    """The predicate the AITER backend gates on. A kernel that masks whole tiles only cannot
+    drive a padded key to -inf, so it needs to know whether any tile is short."""
+    metadata = build_h3_vsa_metadata(
+        prefix_segments=prefix_segments,
+        video_shape=video_shape,
+        device=torch.device("cpu"),
+    )
+    assert h3_vsa_tiles_are_full(metadata) is full
+    assert full == bool(
+        (metadata.variable_block_sizes == FASTH3_VSA_TILE_ELEMENTS).all()
+    )
+
+
+def test_h3_vsa_selection_is_kernel_independent():
+    """Both VSA-H3 backends take their selection and pooled branch from this one helper, so it
+    has to answer in tile units and in token units respectively, whoever calls it."""
+    metadata = build_h3_vsa_metadata(
+        prefix_segments=(64, 64),
+        video_shape=(4, 4, 4),
+        device=torch.device("cpu"),
+    )
+    heads, head_dim = 2, 8
+    torch.manual_seed(0)
+    operands = [
+        torch.randn(1, heads, metadata.padded_seq_length, head_dim) for _ in range(3)
+    ]
+
+    block_map, compressed = h3_vsa_selection(*operands, metadata)
+
+    assert block_map.shape == (1, heads, metadata.num_tiles, metadata.num_tiles)
+    assert block_map.dtype == torch.bool
+    # the prefix is exempt from the top-k, so every query tile keeps all of it
+    assert block_map[..., : metadata.num_prefix_tiles].all()
+    assert compressed.shape == (1, heads, metadata.padded_seq_length, head_dim)
+
+
+def test_h3_vsa_selection_rejects_unpadded_operands():
+    metadata = build_h3_vsa_metadata(
+        prefix_segments=(65, 3),
+        video_shape=(2, 3, 5),
+        device=torch.device("cpu"),
+    )
+    packed = [torch.randn(1, 2, metadata.total_seq_length, 8) for _ in range(3)]
+    with pytest.raises(ValueError, match="padded BHSD"):
+        h3_vsa_selection(*packed, metadata)

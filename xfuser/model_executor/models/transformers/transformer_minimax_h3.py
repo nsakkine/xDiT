@@ -26,6 +26,7 @@ from xfuser.core.distributed.attention_backend import (
     SOL_SEQUENCE_INVERSE_PERMUTATION_KEY,
     SOL_SEQUENCE_PERMUTATION_KEY,
     AttentionBackendType,
+    VSA_H3_ATTN_BACKEND_SET,
 )
 from xfuser.core.sparse_attention.sparge import get_gilbert_perm
 from xfuser.core.vsa_h3_attention import build_h3_vsa_metadata
@@ -137,13 +138,13 @@ class xFuserMiniMaxH3AttnProcessor(MiniMaxH3AttnProcessor):
     def use_vsa_h3(self) -> bool:
         """Whether this call runs FastH3 VSA.
 
-        Resolved per call for the reason _effective_backend gives: FLEX_VSA_H3 usually arrives
-        through the runtime state rather than the constructor, so deciding once at construction
-        reads None and declines the gate on a run that asked for it.
+        Resolved per call for the reason _effective_backend gives: a VSA-H3 backend usually
+        arrives through the runtime state rather than the constructor, so deciding once at
+        construction reads None and declines the gate on a run that asked for it.
         """
         return (
             self.use_fasth3_vsa
-            and _effective_backend(self.backend) == AttentionBackendType.FLEX_VSA_H3
+            and _effective_backend(self.backend) in VSA_H3_ATTN_BACKEND_SET
         )
 
     def __call__(
@@ -187,7 +188,7 @@ class xFuserMiniMaxH3AttnProcessor(MiniMaxH3AttnProcessor):
                 hidden_states
             ).unflatten(-1, (attn.heads, -1)).transpose(1, 2)
             # The gate is per-head like QKV, so it has to follow them through
-            # the Ulysses exchange before FLEX_VSA_H3 consumes it.
+            # the Ulysses exchange before the VSA-H3 backend consumes it.
             self.attention_kwargs[ULYSSES_EXTRA_INPUTS_KEY] = ("vsa_h3_gate",)
 
         use_ulysses = (
@@ -333,8 +334,7 @@ class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
         """
         return (
             self.enable_fasth3_vsa
-            and _effective_backend(self._attention_backend)
-            == AttentionBackendType.FLEX_VSA_H3
+            and _effective_backend(self._attention_backend) in VSA_H3_ATTN_BACKEND_SET
         )
 
     @staticmethod

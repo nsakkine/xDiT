@@ -7,7 +7,10 @@ from types import MethodType, SimpleNamespace
 import numpy as np
 import torch
 
-from xfuser.core.distributed.attention_backend import AttentionBackendType
+from xfuser.core.distributed.attention_backend import (
+    AttentionBackendType,
+    VSA_H3_ATTN_BACKEND_SET,
+)
 from xfuser.core.distributed import (
     get_runtime_state,
     get_vae_parallel_group,
@@ -49,7 +52,7 @@ _SUPPORTED_ATTN_BACKENDS = frozenset({
     AttentionBackendType.AITER_MXFP8_SOL,
     AttentionBackendType.AITER_MXFP4_SOL,
 })
-_FASTH3_ATTN_BACKENDS = frozenset({AttentionBackendType.FLEX_VSA_H3})
+_FASTH3_ATTN_BACKENDS = VSA_H3_ATTN_BACKEND_SET
 _SUPPORTED_ULYSSES_DEGREES = frozenset({1, 2, 4, 8})
 _SUPPORTED_TASKS = frozenset({"t2va", "i2va", "l2va", "fl2va", "ref2va"})
 FASTH3_V1_DATAFREE_MODEL_ID = (
@@ -740,13 +743,15 @@ class xFuserFastH3Model(xFuserMiniMaxH3Model):
         backend = _parse_attention_backend(
             config.attention_backend, "attention backend"
         )
-        if backend == AttentionBackendType.FLEX_VSA_H3:
+        if backend in VSA_H3_ATTN_BACKEND_SET:
             if config.use_hybrid_attn_schedule:
                 raise ValueError(
-                    "FLEX_VSA_H3 uses VSA-H3 for every transformer step and "
+                    f"{backend.name} uses VSA-H3 for every transformer step and "
                     "does not support xDiT's hybrid attention schedule."
                 )
-            if config.use_torch_compile:
+            # Only the Flex row is excluded from whole-transformer compile. AITER_VSA_H3 is
+            # marked torch.compiler.disable like every other AITER backend here.
+            if backend == AttentionBackendType.FLEX_VSA_H3 and config.use_torch_compile:
                 raise ValueError(
                     "FLEX_VSA_H3 does not support wrapping the full transformer "
                     "with --use_torch_compile yet. Its FlexAttention kernel is "

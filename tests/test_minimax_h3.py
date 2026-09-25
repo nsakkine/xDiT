@@ -230,7 +230,10 @@ def test_minimax_h3_runner_registration():
 
 
 def test_fasth3_defaults_match_inference_contract():
-    from xfuser.core.distributed.attention_backend import AttentionBackendType
+    from xfuser.core.distributed.attention_backend import (
+        AttentionBackendType,
+        VSA_H3_ATTN_BACKEND_SET,
+    )
     from xfuser.model_executor.models.runner_models.minimax_h3 import (
         FASTH3_V1_DATAFREE_MODEL_ID,
         xFuserFastH3Model,
@@ -246,10 +249,12 @@ def test_fasth3_defaults_match_inference_contract():
     assert xFuserFastH3Model.default_input_values.num_inference_steps == 5
     assert xFuserFastH3Model._warmup_num_inference_steps == 5
     assert xFuserFastH3Model._enable_fasth3_vsa
+    # Every VSA-H3 backend, not the Flex one alone: they differ only in which kernel walks
+    # FastH3's tile selection, so a checkpoint that runs one runs all of them.
     assert xFuserFastH3Model._supported_attn_backends == (
-        xFuserMiniMaxH3Model._supported_attn_backends
-        | {AttentionBackendType.FLEX_VSA_H3}
+        xFuserMiniMaxH3Model._supported_attn_backends | VSA_H3_ATTN_BACKEND_SET
     )
+    assert AttentionBackendType.FLEX_VSA_H3 in VSA_H3_ATTN_BACKEND_SET
 
 
 def test_fasth3_wrapper_defines_checkpoint_compression_gates(monkeypatch):
