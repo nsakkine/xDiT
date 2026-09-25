@@ -34,6 +34,7 @@ from xfuser.core.distributed.attention_backend import (
     AITER_MHA_V4_SOL_RECIPE,
     AITER_MHA_V4_SPARGE_BACKENDS,
     AITER_MHA_V4_SPARGE_BACKEND_SET,
+    VSA_H3_AITER_RECIPE_BY_BACKEND,
     AttentionBackendType,
 )
 from xfuser.core.distributed.attention_schedule import (
@@ -376,6 +377,18 @@ class RuntimeState(metaclass=ABCMeta):
                 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
             except ImportError:
                 raise RuntimeError("AITER Sparse Sage attention is not available, please update AITER") from None
+        elif attention_backend in VSA_H3_AITER_RECIPE_BY_BACKEND:
+            # Only the build is checked here, not the device. Whether this GPU has the 64x64
+            # sorted-sparse row for the recipe is a per-device answer that the attention call
+            # warns about and falls back to FlexAttention for, as the Triton row does; a build
+            # with no mha_v4_packed at all cannot run any of them and is worth failing on.
+            try:
+                from aiter.ops.mha_v4 import mha_v4_packed
+            except ImportError:
+                raise RuntimeError(
+                    f"{attention_backend.value} attention is not available, "
+                    "please update AITER"
+                ) from None
         elif attention_backend in AITER_MHA_V4_SOL_BACKEND_SET:
             from xfuser.core.sparse_attention.sol import check_sol_attn_recipe
             # Fail here rather than on the first attention call: which recipes exist depends on the

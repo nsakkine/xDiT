@@ -699,6 +699,8 @@ class AttentionBackendType(Enum):
     AITER_VSA = "AITER VSA CK"
     FLEX_VSA_H3 = "Flex VSA-H3"
     TRITON_VSA_H3 = "Triton VSA-H3"
+    AITER_BF16_VSA_H3 = "AITER BF16 VSA-H3"
+    AITER_FP8_VSA_H3 = "AITER FP8 VSA-H3"
     FLEX_BLOCK_SPARGE = "Flex Block Sparge"
     AITER_FLYDSL = "AITER FlyDSL"
     AITER_FLYDSL_FP8 = "AITER FlyDSL FP8"
@@ -715,12 +717,20 @@ AITER_LOW_PRECISION_BACKENDS = (
     AttentionBackendType.AITER_MXFP4,
     AttentionBackendType.AITER_F4F4,
 )
-# Both run FastH3's VSA-H3 selection and differ only in the kernel that
-# consumes it, so anything keyed on "is this VSA-H3?" takes the pair.
+# All four run FastH3's VSA-H3 selection and differ only in the kernel that
+# consumes it, so anything keyed on "is this VSA-H3?" takes the set.
 VSA_H3_BACKENDS = frozenset({
     AttentionBackendType.FLEX_VSA_H3,
     AttentionBackendType.TRITON_VSA_H3,
+    AttentionBackendType.AITER_BF16_VSA_H3,
+    AttentionBackendType.AITER_FP8_VSA_H3,
 })
+# The AITER rows, and which mha_v4 recipe each dispatches. The 64x64 sorted-sparse geometry
+# VSA-H3's tile needs exists in these two precisions and no others.
+VSA_H3_AITER_RECIPE_BY_BACKEND = {
+    AttentionBackendType.AITER_BF16_VSA_H3: "bf16",
+    AttentionBackendType.AITER_FP8_VSA_H3: "fp8",
+}
 AITER_MHA_V4_SPARGE_BACKENDS = (
     AttentionBackendType.AITER_I8FP8_SPARGE,
     AttentionBackendType.AITER_FP8_SPARGE,
@@ -2041,6 +2051,26 @@ def _warn_vsa_h3_triton_missing(device):
     )
 
 
+_warned_vsa_h3_aiter_row_missing = set()
+
+
+def _warn_vsa_h3_aiter_row_missing(recipe):
+    """Warn once per recipe that this device has no 64x64 sorted-sparse row for it.
+
+    Per recipe rather than once overall because the answer is per recipe: a device can serve one
+    of the two and not the other, and a run that switched rows after seeing this deserves to be
+    told whether the second one is missing too.
+    """
+    if recipe in _warned_vsa_h3_aiter_row_missing:
+        return
+    _warned_vsa_h3_aiter_row_missing.add(recipe)
+    logger.warning(
+        "VSA-H3 has no AITER %s 64x64 block-sparse MHA v4 row on this device, falling back to "
+        "the FlexAttention path. That geometry is gfx950 only; gfx942's finest is 256x64.",
+        recipe,
+    )
+
+
 def _vsa_h3_attn_call(
     query,
     key,
@@ -2048,9 +2078,10 @@ def _vsa_h3_attn_call(
     dropout_p,
     is_causal,
     attention_kwargs,
-    use_triton,
+    kernel,
+    recipe=None,
 ):
-    """FastH3 64-token VSA-H3, on either kernel.
+    """FastH3 64-token VSA-H3, on any of its kernels.
 
     USP gathers sequence before this runs. The compression gate rides the
     same Ulysses exchange in ``attention_kwargs['vsa_h3_gate']``. Calls
@@ -2058,8 +2089,9 @@ def _vsa_h3_attn_call(
     back to dense attention the same way AITER_VSA falls back without
     Wan ``thw``.
 
-    Both kernels select the same key tiles and differ only in how they read
-    them, so everything around the call is shared.
+    Every kernel selects the same key tiles and differs only in how it reads
+    them, so everything around the call is shared. ``kernel`` is "flex",
+    "triton" or "aiter", and ``recipe`` names the mha_v4 row for the last.
     """
     attention_kwargs = attention_kwargs or {}
     metadata = attention_kwargs.get("vsa_h3_metadata")
@@ -2078,9 +2110,15 @@ def _vsa_h3_attn_call(
         h3_vsa_triton_is_usable,
     )
 
-    if use_triton and not h3_vsa_triton_is_usable(query.device):
+    if kernel == "triton" and not h3_vsa_triton_is_usable(query.device):
         _warn_vsa_h3_triton_missing(query.device)
-        use_triton = False
+        kernel = "flex"
+    if kernel == "aiter":
+        from xfuser.core.vsa_h3_aiter import vsa_h3_aiter_row_available
+
+        if not vsa_h3_aiter_row_available(recipe):
+            _warn_vsa_h3_aiter_row_missing(recipe)
+            kernel = "flex"
 
     sequence_length = metadata.total_seq_length
     gathered_length = query.shape[2]
@@ -2089,12 +2127,19 @@ def _vsa_h3_attn_call(
     value = value[:, :, :sequence_length]
     gate = gate[:, :, :sequence_length]
 
-    # Nothing is permuted here. The padded tile buffers the FlexAttention
-    # kernel needs are built inside h3_vsa_attention, which keeps the gate and
+    # Nothing is permuted here. The padded tile buffers the FlexAttention and
+    # AITER kernels need are built inside the callee, which keeps the gate and
     # the compression branch out of tile order entirely.
-    packed_output = h3_vsa_attention(
-        query, key, value, gate, metadata, use_triton=use_triton
-    )
+    if kernel == "aiter":
+        from xfuser.core.vsa_h3_aiter import aiter_h3_vsa_attention
+
+        packed_output = aiter_h3_vsa_attention(
+            query, key, value, gate, metadata, recipe=recipe
+        )
+    else:
+        packed_output = h3_vsa_attention(
+            query, key, value, gate, metadata, use_triton=kernel == "triton"
+        )
     if gathered_length > sequence_length:
         padded_output = packed_output.new_zeros(
             packed_output.shape[0],
@@ -2124,7 +2169,7 @@ def _flex_vsa_h3_attn_call(
         dropout_p,
         is_causal,
         attention_kwargs,
-        use_triton=False,
+        kernel="flex",
     )
 
 
@@ -2145,7 +2190,59 @@ def _triton_vsa_h3_attn_call(
         dropout_p,
         is_causal,
         attention_kwargs,
-        use_triton=True,
+        kernel="triton",
+    )
+
+
+@register_attention_function(AttentionBackendType.AITER_BF16_VSA_H3)
+@torch.compiler.disable
+def _aiter_bf16_vsa_h3_attn_call(
+    query,
+    key,
+    value,
+    dropout_p,
+    is_causal,
+    attention_kwargs=None,
+):
+    """VSA-H3 through AITER's BF16 64x64 sorted-sparse MHA v4 row."""
+    return _vsa_h3_attn_call(
+        query,
+        key,
+        value,
+        dropout_p,
+        is_causal,
+        attention_kwargs,
+        kernel="aiter",
+        recipe="bf16",
+    )
+
+
+@register_attention_function(AttentionBackendType.AITER_FP8_VSA_H3)
+@torch.compiler.disable
+def _aiter_fp8_vsa_h3_attn_call(
+    query,
+    key,
+    value,
+    dropout_p,
+    is_causal,
+    attention_kwargs=None,
+):
+    """VSA-H3 through AITER's per-tensor FP8 64x64 sorted-sparse MHA v4 row.
+
+    Shorter sequences only. This row stages its LUT in LDS, which caps the key length at its
+    1919 entries -- 122,816 tokens -- and FastH3's default 768x1344x124 render is 2024 tiles,
+    so it lands just past that and the launcher refuses it by name. The BF16 row walks the LUT
+    from memory instead and has no such ceiling.
+    """
+    return _vsa_h3_attn_call(
+        query,
+        key,
+        value,
+        dropout_p,
+        is_causal,
+        attention_kwargs,
+        kernel="aiter",
+        recipe="fp8",
     )
 
 
