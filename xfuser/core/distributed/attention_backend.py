@@ -698,7 +698,7 @@ class AttentionBackendType(Enum):
     AITER_SPARGE_V2 = "AITER Sparge V2"
     AITER_VSA = "AITER VSA CK"
     FLEX_VSA_H3 = "Flex VSA-H3"
-    AITER_VSA_H3 = "AITER VSA-H3"
+    TRITON_VSA_H3 = "Triton VSA-H3"
     FLEX_BLOCK_SPARGE = "Flex Block Sparge"
     AITER_FLYDSL = "AITER FlyDSL"
     AITER_FLYDSL_FP8 = "AITER FlyDSL FP8"
@@ -715,6 +715,12 @@ AITER_LOW_PRECISION_BACKENDS = (
     AttentionBackendType.AITER_MXFP4,
     AttentionBackendType.AITER_F4F4,
 )
+# Both run FastH3's VSA-H3 selection and differ only in the kernel that
+# consumes it, so anything keyed on "is this VSA-H3?" takes the pair.
+VSA_H3_BACKENDS = frozenset({
+    AttentionBackendType.FLEX_VSA_H3,
+    AttentionBackendType.TRITON_VSA_H3,
+})
 AITER_MHA_V4_SPARGE_BACKENDS = (
     AttentionBackendType.AITER_I8FP8_SPARGE,
     AttentionBackendType.AITER_FP8_SPARGE,
@@ -736,14 +742,6 @@ AITER_MHA_V4_ONLY_BACKENDS = tuple(
         if backend != AttentionBackendType.AITER_FP8
     ]
 )
-# The VSA-H3 rows. Both run FastH3's 64-token tile selection and its gated pooled branch, and
-# differ only in which kernel walks the selection, so every caller that asks "is this call VSA-H3"
-# rather than "which kernel" tests against this.
-VSA_H3_ATTN_BACKENDS = (
-    AttentionBackendType.FLEX_VSA_H3,
-    AttentionBackendType.AITER_VSA_H3,
-)
-VSA_H3_ATTN_BACKEND_SET = frozenset(VSA_H3_ATTN_BACKENDS)
 AITER_MHA_V4_ONLY_BACKEND_SET = frozenset(AITER_MHA_V4_ONLY_BACKENDS)
 AITER_MHA_V4_SPARGE_BACKEND_SET = frozenset(AITER_MHA_V4_SPARGE_BACKENDS)
 # The mode-2 (Sol-Attn) rows. A subset of the recipes above: Sol-Attn needs a manifest row of its
@@ -1227,9 +1225,41 @@ def _validate_aiter_mha_v4_request(dropout_p, is_causal, attention_kwargs=None):
     _validate_aiter_low_precision_dropout(dropout_p)
     if is_causal:
         raise NotImplementedError("MHA v4 does not support causal masking")
-    # MHA v4 has no key-padding mask, so honouring these would need packed K/V.
-    if (attention_kwargs or {}).get("indices_k") is not None:
+
+
+def _trim_mha_v4_trailing_pad(key, value, attention_kwargs):
+    """Slice a declared trailing K/V pad so dense MHA v4 can serve a padded request.
+
+    MHA v4 has no key-padding mask. When the pad is a uniform trailing block the
+    mask is unnecessary: keeping every query row and shortening K/V is the same
+    computation, which is what ``valid_kv_len`` declares (see
+    ``usp._trim_trailing_kv_padding``). Only the producer knows the pad is
+    trailing -- ``cu_seqlens_k`` having one segment does not imply it, and a mask
+    with interior gaps would be silently mis-served -- so a request that packs
+    keys without declaring ``valid_kv_len`` is still refused.
+
+    Q is deliberately left alone. It is never packed, its pad rows are discarded
+    downstream, and trimming it by a key-side length would be wrong for cross
+    attention, where the two sequences differ.
+    """
+    kwargs = attention_kwargs or {}
+    if kwargs.get("indices_k") is None:
+        return key, value
+
+    valid_kv_len = kwargs.get("valid_kv_len")
+    if valid_kv_len is None:
         raise NotImplementedError("MHA v4 does not support varlen packed keys")
+    if not 0 < valid_kv_len <= key.shape[2]:
+        raise ValueError(
+            f"valid_kv_len must be in [1, {key.shape[2]}], got {valid_kv_len}."
+        )
+    max_seqlen_k = kwargs.get("max_seqlen_k")
+    if max_seqlen_k is not None and max_seqlen_k != valid_kv_len:
+        raise ValueError(
+            "A trailing K/V pad has as many valid keys as its longest segment, "
+            f"got valid_kv_len={valid_kv_len} and max_seqlen_k={max_seqlen_k}."
+        )
+    return key[:, :, :valid_kv_len], value[:, :, :valid_kv_len]
 
 
 def _use_aiter_mha_v4_fp8(query, is_causal):
@@ -1359,6 +1389,7 @@ def _aiter_mixed_attn_call(
     query, key, value, qk_format, v_format, dropout_p, is_causal, attention_kwargs=None
 ):
     _validate_aiter_mha_v4_request(dropout_p, is_causal, attention_kwargs)
+    key, value = _trim_mha_v4_trailing_pad(key, value, attention_kwargs)
     query = torch.permute(query, [0, 2, 1, 3]).contiguous()
     key = torch.permute(key, [0, 2, 1, 3]).contiguous()
     value = torch.permute(value, [0, 2, 1, 3]).contiguous()
@@ -1424,6 +1455,7 @@ def _aiter_i8fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kw
 def _aiter_mxfp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
     """Run the AITER MXFP8 Q/K and per-tensor FP8 V recipe."""
     _validate_aiter_mha_v4_request(dropout_p, is_causal, attention_kwargs)
+    key, value = _trim_mha_v4_trailing_pad(key, value, attention_kwargs)
     query = torch.permute(query, [0, 2, 1, 3]).contiguous()
     key = torch.permute(key, [0, 2, 1, 3]).contiguous()
     value = torch.permute(value, [0, 2, 1, 3]).contiguous()
@@ -1568,6 +1600,9 @@ def _validate_aiter_mha_v4_sparge_request(
     if query.shape[1] != key.shape[1] or query.shape[1] != value.shape[1]:
         raise NotImplementedError("MHA v4 Sparge currently supports MHA only")
     if (attention_kwargs or {}).get("indices_k") is not None:
+        # The dense rows serve a trailing pad by slicing K/V, but the sorted-sparse
+        # launch needs the key length padded to its KV tile, which is the very
+        # alignment such a slice removes.
         raise NotImplementedError("MHA v4 Sparge does not support varlen packed keys")
 
 
@@ -1991,86 +2026,40 @@ def _dense_h3_fallback_attn_call(
     )
 
 
-# VSA-H3 pools over 64-token tiles, so its selection is only expressible at this geometry.
-_VSA_H3_AITER_TILE = (64, 64)
+_warned_vsa_h3_triton_missing = False
 
 
-@functools.lru_cache(maxsize=None)
-def _warn_once(message):
-    """Log once per distinct message, for per-call conditions that hold for a whole run."""
-    logger.warning(message)
-
-
-@functools.lru_cache(maxsize=1)
-def _aiter_vsa_h3_row_available() -> bool:
-    """Whether this device has a BF16 64x64 block-sparse MHA v4 row.
-
-    VSA-H3's tile is 64 tokens, so the selection is only expressible at that geometry; gfx950
-    served it in FP8 alone until the BF16 rows landed, and gfx942's finest is 256x64.
-    """
-    if not (_AITER_MHA_V4.enabled and _AITER_MHA_V4.block_mask):
-        return False
-    try:
-        from aiter.ops.mha_v4 import MHA_V4_SPARSE_MODE, mha_v4_block_tiles
-    except ImportError:
-        return False
-    bf16 = _AiterAttentionFormat.BF16
-    unscaled = _AiterAttentionScaleMode.NONE
-    operands = (bf16, bf16, bf16, unscaled, unscaled, unscaled)
-    return _VSA_H3_AITER_TILE in mha_v4_block_tiles(operands, MHA_V4_SPARSE_MODE)
-
-
-def _aiter_h3_vsa_attention(query, key, value, metadata, sparsity=None):
-    """VSA-H3's sparse branch through AITER's 64x64 block-sparse MHA v4 row.
-
-    Signature-compatible with flex_h3_vsa_attention, and takes the selection from the same
-    shared helper: only the kernel that walks it differs. Pure sparse rather than Sol-Attn
-    because FastH3 carries its own pooled branch and mixes it with a learned gate outside the
-    softmax, where Sol-Attn folds an approximation of the skipped blocks inside it.
-
-    The caller is responsible for the padding gate. This row masks whole tiles only, so a tile
-    holding fewer than 64 real tokens would let its zeroed slots score 0 instead of -inf.
-    """
-    from xfuser.core.vsa_h3_attention import FASTH3_VSA_SPARSITY, h3_vsa_selection
-
-    block_map, compressed = h3_vsa_selection(
-        query,
-        key,
-        value,
-        metadata,
-        FASTH3_VSA_SPARSITY if sparsity is None else sparsity,
+def _warn_vsa_h3_triton_missing(device):
+    global _warned_vsa_h3_triton_missing
+    if _warned_vsa_h3_triton_missing:
+        return
+    _warned_vsa_h3_triton_missing = True
+    logger.warning(
+        "TRITON_VSA_H3 cannot run its kernel on %s, falling back to the "
+        "FlexAttention path. Select FLEX_VSA_H3 to ask for it directly.",
+        device,
     )
-    bf16 = _AiterAttentionFormat.BF16
-    sparse_output = _aiter_mha_v4(
-        query.transpose(1, 2).contiguous(),
-        key.transpose(1, 2).contiguous(),
-        value.transpose(1, 2).contiguous(),
-        bf16,
-        bf16,
-        bf16,
-        block_mask=block_map,
-        block_tile=_VSA_H3_AITER_TILE,
-    )
-    return sparse_output.transpose(1, 2), compressed
 
 
 def _vsa_h3_attn_call(
-    runner,
-    label,
     query,
     key,
     value,
     dropout_p,
     is_causal,
-    attention_kwargs=None,
+    attention_kwargs,
+    use_triton,
 ):
-    """FastH3 64-token VSA-H3, over whichever kernel ``runner`` dispatches.
+    """FastH3 64-token VSA-H3, on either kernel.
 
     USP gathers sequence before this runs. The compression gate rides the
     same Ulysses exchange in ``attention_kwargs['vsa_h3_gate']``. Calls
     without that metadata, including the MiniMax-H3 token refiner, fall
     back to dense attention the same way AITER_VSA falls back without
     Wan ``thw``.
+
+    Both kernels select the same key tiles and differ only in how they read
+    them, so everything around the call is shared.
     """
     attention_kwargs = attention_kwargs or {}
     metadata = attention_kwargs.get("vsa_h3_metadata")
@@ -2080,14 +2069,18 @@ def _vsa_h3_attn_call(
             query, key, value, dropout_p, is_causal, attention_kwargs
         )
     if is_causal:
-        raise ValueError(f"{label} does not support causal attention")
+        raise ValueError("VSA-H3 does not support causal attention")
     if dropout_p not in (None, 0.0):
-        raise ValueError(f"{label} does not support attention dropout")
+        raise ValueError("VSA-H3 does not support attention dropout")
 
     from xfuser.core.vsa_h3_attention import (
-        tile_h3_vsa_tensor,
-        untile_h3_vsa_tensor,
+        h3_vsa_attention,
+        h3_vsa_triton_is_usable,
     )
+
+    if use_triton and not h3_vsa_triton_is_usable(query.device):
+        _warn_vsa_h3_triton_missing(query.device)
+        use_triton = False
 
     sequence_length = metadata.total_seq_length
     gathered_length = query.shape[2]
@@ -2096,29 +2089,12 @@ def _vsa_h3_attn_call(
     value = value[:, :, :sequence_length]
     gate = gate[:, :, :sequence_length]
 
-    def tile_bhsd(tensor):
-        return tile_h3_vsa_tensor(
-            tensor.transpose(1, 2),
-            metadata,
-        ).transpose(1, 2).contiguous()
-
-    tiled_query = tile_bhsd(query)
-    tiled_key = tile_bhsd(key)
-    tiled_value = tile_bhsd(value)
-    tiled_gate = tile_bhsd(gate)
-    sparse_output, compressed_output = runner(
-        tiled_query,
-        tiled_key,
-        tiled_value,
-        metadata,
+    # Nothing is permuted here. The padded tile buffers the FlexAttention
+    # kernel needs are built inside h3_vsa_attention, which keeps the gate and
+    # the compression branch out of tile order entirely.
+    packed_output = h3_vsa_attention(
+        query, key, value, gate, metadata, use_triton=use_triton
     )
-    tiled_output = sparse_output + (
-        compressed_output.to(sparse_output.dtype) * tiled_gate
-    )
-    packed_output = untile_h3_vsa_tensor(
-        tiled_output.transpose(1, 2),
-        metadata,
-    ).transpose(1, 2)
     if gathered_length > sequence_length:
         padded_output = packed_output.new_zeros(
             packed_output.shape[0],
@@ -2133,70 +2109,43 @@ def _vsa_h3_attn_call(
 
 @register_attention_function(AttentionBackendType.FLEX_VSA_H3)
 def _flex_vsa_h3_attn_call(
-    query, key, value, dropout_p, is_causal, attention_kwargs=None
+    query,
+    key,
+    value,
+    dropout_p,
+    is_causal,
+    attention_kwargs=None,
 ):
-    """FastH3 64-token VSA-H3 through FlexAttention."""
-    from xfuser.core.vsa_h3_attention import flex_h3_vsa_attention
-
+    """VSA-H3 through FlexAttention: portable, and the selection reference."""
     return _vsa_h3_attn_call(
-        flex_h3_vsa_attention,
-        "FLEX_VSA_H3",
         query,
         key,
         value,
         dropout_p,
         is_causal,
         attention_kwargs,
+        use_triton=False,
     )
 
 
-@register_attention_function(AttentionBackendType.AITER_VSA_H3)
-@torch.compiler.disable
-def _aiter_vsa_h3_attn_call(
-    query, key, value, dropout_p, is_causal, attention_kwargs=None
+@register_attention_function(AttentionBackendType.TRITON_VSA_H3)
+def _triton_vsa_h3_attn_call(
+    query,
+    key,
+    value,
+    dropout_p,
+    is_causal,
+    attention_kwargs=None,
 ):
-    """FastH3 64-token VSA-H3 through AITER's BF16 64x64 block-sparse row.
-
-    Falls back to the FlexAttention runner whenever this device has no such row, and whenever
-    the tiling leaves padded key slots: AITER's block mask is per tile and cannot drive the
-    stragglers to -inf, so their zeroed keys would score 0 and take softmax mass. That is not a
-    rare shape -- an arbitrary text or audio prefix length, or a video grid that does not divide
-    by the 4x4x4 tile, is enough -- so the fallback carries the common case for now.
-    """
-    from xfuser.core.vsa_h3_attention import h3_vsa_tiles_are_full
-
-    metadata = (attention_kwargs or {}).get("vsa_h3_metadata")
-    runner = _aiter_h3_vsa_attention
-    if metadata is not None:
-        reason = None
-        if not _aiter_vsa_h3_row_available():
-            reason = "this device has no BF16 64x64 block-sparse MHA v4 row"
-        elif not h3_vsa_tiles_are_full(metadata):
-            if environment_variables["VSA_H3_ALLOW_PADDED"]() == "1":
-                _warn_once(
-                    "XFUSER_VSA_H3_ALLOW_PADDED is set, so AITER_VSA_H3 is running a tiling "
-                    "with padded key slots. Those keys score 0 rather than -inf and take "
-                    "softmax mass, which costs output quality."
-                )
-            else:
-                reason = (
-                    "the VSA-H3 tiling leaves padded key slots, which a per-tile block mask "
-                    "cannot mask out"
-                )
-        if reason is not None:
-            _warn_once(f"AITER_VSA_H3 is running FlexAttention because {reason}.")
-            from xfuser.core.vsa_h3_attention import flex_h3_vsa_attention
-
-            runner = flex_h3_vsa_attention
+    """VSA-H3 through the hand-written kernel, Flex where it cannot run."""
     return _vsa_h3_attn_call(
-        runner,
-        "AITER_VSA_H3",
         query,
         key,
         value,
         dropout_p,
         is_causal,
         attention_kwargs,
+        use_triton=True,
     )
 
 

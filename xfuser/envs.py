@@ -70,12 +70,6 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # video, where a 128-token block spans rows of a frame. Env rather than a CLI flag because it
     # selects a kernel rather than a model behaviour, and the choice has to be measured per model.
     "SOL_ATTN_BLOCK_TILE": lambda: os.environ.get("XFUSER_SOL_ATTN_BLOCK_TILE", None),
-    # Let AITER_VSA_H3 run a tiling that leaves padded key slots, which it otherwise declines by
-    # falling back to FlexAttention. The AITER row masks whole tiles only, so a padded key scores
-    # 0 rather than -inf and takes softmax mass it should not: measured 2.8e-02 relative L2 on a
-    # default render against 2.7e-03 for the same kernel on aligned geometry. Off by default
-    # because that is a real quality loss, and on for measuring what the loss actually looks like.
-    "VSA_H3_ALLOW_PADDED": lambda: os.environ.get("XFUSER_VSA_H3_ALLOW_PADDED", "0"),
     "XDIT_FBCACHE_THRESH": lambda: os.environ.get("XDIT_FBCACHE_THRESH", None),
     # opt-in breakdown of where a memory-efficient fill spends its time. Off by default because an
     # honest breakdown has to synchronise at each phase boundary, and that serialises a fill which
