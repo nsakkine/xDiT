@@ -9,6 +9,8 @@ import torch.nn.functional as F
 
 
 _MHA_V4_SPARGE_BACKENDS = (
+    "AITER_BF16_SPARGE",
+    "AITER_BF16FP8_SPARGE",
     "AITER_I8FP8_SPARGE",
     "AITER_FP8_SPARGE",
     "AITER_MXFP8_SPARGE",
@@ -77,7 +79,7 @@ def test_mha_v4_sparge_backends_are_registered():
         AttentionBackendType,
     )
 
-    assert len(AITER_MHA_V4_SPARGE_BACKENDS) == 8
+    assert len(AITER_MHA_V4_SPARGE_BACKENDS) == 10
     for name in _MHA_V4_SPARGE_BACKENDS:
         backend = AttentionBackendType[name]
         assert backend in ATTENTION_FUNCTION_REGISTRY
@@ -170,6 +172,44 @@ def test_fp8_sparge_uses_gfx942_kv_tile(monkeypatch):
     assert output.shape == query.shape
     assert captured["config"] == {"BLOCK_M": 256, "BLOCK_N": 64}
     assert tuple(captured["block_mask"].shape) == (1, 2, 2, 8)
+
+
+@pytest.mark.parametrize(
+    "backend_name, expected_kv_tile",
+    [("AITER_BF16_SPARGE", 64), ("AITER_BF16FP8_SPARGE", 64), ("AITER_FP8_SPARGE", 128)],
+)
+def test_sparge_cuts_its_mask_at_its_own_recipes_kv_tile(
+    monkeypatch, backend_name, expected_kv_tile
+):
+    """gfx950 routes BF16 Q/K on 64-key blocks and the rest on 128, so one tile cannot serve all.
+
+    A mask cut at the other recipe's tile has the wrong number of KV columns and mha_v4 refuses it.
+    """
+    from xfuser.core.distributed import attention_backend as ab
+    from xfuser.core.distributed.attention_backend import AttentionBackendType
+
+    captured = {}
+
+    def fake_build(query, key, value, is_causal, attention_kwargs, config, pad_block_divisible=False):
+        captured["config"] = dict(config)
+        mask = torch.ones((query.shape[0], query.shape[1], 2, 4), dtype=torch.bool)
+        return query, key, value, SimpleNamespace(), mask, query.shape[1]
+
+    _patch_mha_v4_caps(
+        monkeypatch, ab, enabled=True, block_mask=True, kv_tile=128, bf16_kv_tile=64
+    )
+    monkeypatch.setattr(ab, "_build_sparge_block_mask", fake_build)
+    monkeypatch.setattr(ab, "restore_sparge_output", lambda output, state: output)
+    monkeypatch.setattr(
+        ab, "_aiter_mha_v4", lambda query, *args, **kwargs: torch.zeros_like(query)
+    )
+
+    query = torch.zeros((1, 2, 512, 128), dtype=torch.bfloat16)
+    ab.ATTENTION_FUNCTION_REGISTRY[AttentionBackendType[backend_name]](
+        query, query, query, dropout_p=0.0, is_causal=False
+    )
+
+    assert captured["config"] == {"BLOCK_M": 256, "BLOCK_N": expected_kv_tile}
 
 
 def test_mxfp8_sparge_rejected_on_gfx942(monkeypatch):

@@ -337,6 +337,15 @@ def aiter_h3_vsa_attention(
         lut_count=lut_count,
         block_tile=VSA_H3_AITER_TILE,
     )
+    # Prefix (text/audio) query rows attend to every key, as FastVideo trains FastH3; only video
+    # rows are sparse. Over the packed sequence they need no padding mask, so they are one plain
+    # attention call, written into their tile slots so the epilogue mixes them like any other row.
+    rows = metadata.num_prefix_tokens
+    if rows:
+        dense_prefix = F.scaled_dot_product_attention(query[:, :, :rows], key, value)
+        sparse_output.index_copy_(
+            1, metadata.packed_to_tiled_index[:rows], dense_prefix.transpose(1, 2)
+        )
 
     # Model dtype for the compression branch, matching flex_h3_vsa_attention: that keeps the
     # [tiles, tiles] probability matrix inside a flash kernel instead of materialising it.
