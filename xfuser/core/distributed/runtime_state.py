@@ -389,6 +389,11 @@ class RuntimeState(metaclass=ABCMeta):
                     f"{attention_backend.value} attention is not available, "
                     "please update AITER"
                 ) from None
+            # Primed here, outside any compiled region, so the attention call's lookup is a
+            # constant under the transformer's compile rather than a trace of the manifest read.
+            from xfuser.core.vsa_h3_aiter import vsa_h3_aiter_row_available
+
+            vsa_h3_aiter_row_available(VSA_H3_AITER_RECIPE_BY_BACKEND[attention_backend])
         elif attention_backend in AITER_MHA_V4_SOL_BACKEND_SET:
             from xfuser.core.sparse_attention.sol import check_sol_attn_recipe
             # Fail here rather than on the first attention call: which recipes exist depends on the

@@ -1746,17 +1746,29 @@ def test_minimax_h3_forward_increments_hybrid_step_counter(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="VSA-H3 needs a GPU")
-@pytest.mark.parametrize("vsa_backend", ["FLEX_VSA_H3", "TRITON_VSA_H3"])
+@pytest.mark.parametrize(
+    "vsa_backend",
+    ["FLEX_VSA_H3", "TRITON_VSA_H3", "AITER_BF16_VSA_H3", "AITER_FP8_VSA_H3"],
+)
 def test_fasth3_vsa_transformer_compiles_fullgraph(monkeypatch, vsa_backend):
-    """Both VSA-H3 kernels must trace without graph breaks under fullgraph."""
+    """Every VSA-H3 kernel must trace without graph breaks under fullgraph."""
     import torch._dynamo
 
-    from xfuser.core import vsa_h3_triton
+    from xfuser.core import vsa_h3_aiter, vsa_h3_triton
 
     if vsa_backend == "TRITON_VSA_H3" and not vsa_h3_triton.is_available():
         pytest.skip("Triton is unavailable")
 
-    from xfuser.core.distributed.attention_backend import AttentionBackendType
+    from xfuser.core.distributed.attention_backend import (
+        VSA_H3_AITER_RECIPE_BY_BACKEND,
+        AttentionBackendType,
+    )
+
+    aiter_recipe = VSA_H3_AITER_RECIPE_BY_BACKEND.get(AttentionBackendType[vsa_backend])
+    if aiter_recipe is not None and not vsa_h3_aiter.vsa_h3_aiter_row_available(
+        aiter_recipe
+    ):
+        pytest.skip(f"No AITER {aiter_recipe} 64x64 sorted-sparse row on this device")
     from xfuser.core.vsa_h3_attention import build_h3_vsa_metadata
     from xfuser.model_executor.models.transformers import transformer_minimax_h3
     from xfuser.model_executor.models.transformers.transformer_minimax_h3 import (
@@ -1774,11 +1786,13 @@ def test_fasth3_vsa_transformer_compiles_fullgraph(monkeypatch, vsa_backend):
     device = torch.device("cuda")
     # The token refiner falls back to the dense AITER kernel, which has no
     # head_dim=16 variant, so this case needs a wider head than _tiny_config.
+    # The AITER VSA-H3 rows are hd128 only.
+    head_dim = 64 if aiter_recipe is None else 128
     config = dict(
         _tiny_config(),
-        attention_head_dim=64,
-        hidden_size=128,
-        time_embed_hidden_dim=128,
+        attention_head_dim=head_dim,
+        hidden_size=2 * head_dim,
+        time_embed_hidden_dim=2 * head_dim,
     )
     wrapper = (
         xFuserMiniMaxH3Transformer3DWrapper(
@@ -1802,7 +1816,21 @@ def test_fasth3_vsa_transformer_compiles_fullgraph(monkeypatch, vsa_backend):
     with torch.no_grad():
         eager = wrapper(**inputs)
 
-    # The runner primes the geometry outside the compiled region; do the same.
+    # The runner primes the geometry outside the compiled region; do the same, from cold, so the
+    # padded-tiling warning below can only have come from this compiled run.
+    wrapper._vsa_h3_metadata_key = None
+    vsa_h3_aiter._WARNED.clear()
+    from xfuser.core.distributed import attention_backend
+
+    # Recorded at the call rather than through caplog: xfuser's loggers do not propagate, and
+    # whether a record reaches the root handler depends on what else has configured logging.
+    messages = []
+    for module_logger in (vsa_h3_aiter.logger, attention_backend.logger):
+        monkeypatch.setattr(
+            module_logger,
+            "warning",
+            lambda message, *args, **kwargs: messages.append(message % args),
+        )
     wrapper.prepare_vsa_h3_metadata(
         inputs["position_ids"],
         inputs["video_indices"],
@@ -1820,8 +1848,14 @@ def test_fasth3_vsa_transformer_compiles_fullgraph(monkeypatch, vsa_backend):
         # stable and the geometry cache stays warm.
         compiled(**inputs)
     assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == graphs
-    # The untraceable geometry recovery must stay out of the graph entirely.
+    # The priming call above is the only build; the untraceable geometry recovery must stay out
+    # of the graph entirely.
     assert build_h3_vsa_metadata.cache_info().misses == misses
+    assert not [message for message in messages if "falling back" in message]
+    # _tiny_inputs' 16-token prefix is a partial tile, so the AITER rows must say so exactly once
+    # even though the attention call's own copy is dropped under compile.
+    padded = [message for message in messages if "padded key slots" in message]
+    assert len(padded) == (0 if aiter_recipe is None else 1)
 
     # A smoke check that the graph computes the model, not an equivalence test:
     # Inductor fuses reductions across the whole transformer in a different

@@ -10,7 +10,6 @@ import torch
 
 from xfuser.core.distributed.attention_backend import (
     AITER_MHA_V4_ONLY_BACKEND_SET,
-    VSA_H3_AITER_RECIPE_BY_BACKEND,
     VSA_H3_BACKENDS,
     AttentionBackendType,
 )
@@ -807,15 +806,6 @@ class xFuserFastH3Model(xFuserMiniMaxH3Model):
                 raise ValueError(
                     "VSA-H3 runs on every transformer step and does not "
                     "support xDiT's hybrid attention schedule."
-                )
-            # Whole-transformer compile here is fullgraph unless the hybrid schedule is on, and
-            # the hybrid schedule is what the branch above just refused. The AITER rows are
-            # torch.compiler.disable like every other AITER backend, which under fullgraph is an
-            # error rather than a graph break, so the two cannot be selected together.
-            if backend in VSA_H3_AITER_RECIPE_BY_BACKEND and config.use_torch_compile:
-                raise ValueError(
-                    f"{backend.name} does not support wrapping the full transformer with "
-                    "--use_torch_compile. Use TRITON_VSA_H3, which compiles, or drop the flag."
                 )
         super()._validate_config(config)
 

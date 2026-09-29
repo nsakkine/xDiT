@@ -25,6 +25,7 @@ from xfuser.core.distributed.attention_backend import (
     SOL_EXACT_TOKENS_KEY,
     SOL_SEQUENCE_INVERSE_PERMUTATION_KEY,
     SOL_SEQUENCE_PERMUTATION_KEY,
+    VSA_H3_AITER_RECIPE_BY_BACKEND,
     VSA_H3_BACKENDS,
     AttentionBackendType,
 )
@@ -488,6 +489,26 @@ class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
             (text_count, audio_count), video_shape, position_ids.device
         )
         self._vsa_h3_metadata_key = key
+        self._warn_if_aiter_vsa_h3_padded()
+
+    def _warn_if_aiter_vsa_h3_padded(self) -> None:
+        """Emit the AITER rows' padded-tiling warning here, where it runs eagerly.
+
+        The attention call warns too, but under compile Dynamo drops that logging call rather than
+        breaking the graph, so a compiled run would otherwise never see it.
+        """
+        recipe = VSA_H3_AITER_RECIPE_BY_BACKEND.get(
+            _effective_backend(self._attention_backend)
+        )
+        if recipe is None:
+            return
+        from xfuser.core.vsa_h3_aiter import (
+            vsa_h3_aiter_row_available,
+            warn_if_padded_tiling,
+        )
+
+        if vsa_h3_aiter_row_available(recipe):
+            warn_if_padded_tiling(self._vsa_h3_metadata)
 
     @apply_lora_scale("attention_kwargs")
     def forward(

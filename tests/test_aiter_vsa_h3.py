@@ -332,7 +332,7 @@ def test_a_padded_tiling_runs_and_says_what_it_costs(recipe, caplog):
     import xfuser.core.vsa_h3_aiter as vsa_h3_aiter
     from xfuser.core.vsa_h3_attention import h3_vsa_attention
 
-    vsa_h3_aiter._warn_once.cache_clear()
+    vsa_h3_aiter._WARNED.clear()
     metadata = _metadata(PADDED_PREFIX, PADDED_VIDEO)
     query, key, value, gate = _operands(metadata)
 
@@ -468,20 +468,13 @@ def test_the_backend_rows_are_registered_and_carry_a_recipe_each():
 
 
 @pytest.mark.parametrize(
-    "backend, compiles",
-    [
-        ("AITER_BF16_VSA_H3", False),
-        ("AITER_FP8_VSA_H3", False),
-        ("TRITON_VSA_H3", True),
-    ],
+    "backend", ["AITER_BF16_VSA_H3", "AITER_FP8_VSA_H3", "TRITON_VSA_H3"]
 )
-def test_torch_compile_is_refused_for_the_aiter_rows_alone(backend, compiles, monkeypatch):
-    """These rows disable Dynamo, and FastH3 compiles the transformer at fullgraph.
+def test_torch_compile_is_accepted_for_every_vsa_h3_row(backend, monkeypatch):
+    """The AITER rows trace under FastH3's fullgraph transformer compile, so none is refused.
 
-    A graph break inside a fullgraph region is an error, not a fallback, so the combination has to
-    be refused at config time with something a caller can act on rather than at the first forward
-    with a Dynamo traceback. The Triton row is here to hold the other side: it does compile, and a
-    refusal written against the whole VSA-H3 set would take it down with the AITER pair.
+    That they actually trace is pinned in tests/test_minimax_h3.py's fullgraph test; this holds
+    the config gate open, so a benchmark grid can keep --use_torch_compile across all its cells.
     """
     from types import SimpleNamespace
 
@@ -495,9 +488,22 @@ def test_torch_compile_is_refused_for_the_aiter_rows_alone(backend, compiles, mo
     monkeypatch.setattr(
         xFuserFastH3Model.__mro__[1], "_validate_config", lambda self, config: None
     )
-    runner = object.__new__(xFuserFastH3Model)
-    if compiles:
-        xFuserFastH3Model._validate_config(runner, config)
-        return
-    with pytest.raises(ValueError, match="use_torch_compile"):
-        xFuserFastH3Model._validate_config(runner, config)
+    xFuserFastH3Model._validate_config(object.__new__(xFuserFastH3Model), config)
+
+
+def test_the_row_query_is_a_dict_hit_once_primed(monkeypatch):
+    """Primed, the per-device row query must not reach aiter's manifest reader again.
+
+    Under the transformer's compile that reader's builtin open() cannot be traced, which is why
+    the answer lives in a plain dict that runtime_state fills at setup.
+    """
+    import xfuser.core.vsa_h3_aiter as vsa_h3_aiter
+
+    monkeypatch.setattr(vsa_h3_aiter, "_ROW_AVAILABLE", {})
+    first = vsa_h3_aiter.vsa_h3_aiter_row_available("bf16")
+
+    def _refuse(recipe_id):
+        raise AssertionError("a primed row query reached aiter")
+
+    monkeypatch.setattr(vsa_h3_aiter, "_query_row_available", _refuse)
+    assert vsa_h3_aiter.vsa_h3_aiter_row_available("bf16") is first
