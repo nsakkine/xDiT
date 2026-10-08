@@ -2,7 +2,10 @@ from typing import Callable, Dict, List, Optional, Type, TypeVar
 
 import torch
 
-from xfuser.core.distributed.attention_backend import AttentionBackendType, env_info
+from xfuser.core.attention.spec import AttentionBackendType
+from xfuser.envs import PACKAGES_CHECKER
+
+env_info = PACKAGES_CHECKER.get_packages_info()
 
 T = TypeVar("T", bound="AttentionSchedule")
 

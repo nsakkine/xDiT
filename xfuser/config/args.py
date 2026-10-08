@@ -41,13 +41,13 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
 
     def _normalize_name(self, name: str) -> str:
         # First, try the standard normalization (all hyphens to underscores)
-        fully_normalized = "--" + name[len("--"):].replace("-", "_")
+        fully_normalized = "--" + name[len("--") :].replace("-", "_")
         if fully_normalized in self._option_string_actions:
             return fully_normalized
 
         # If not found, check if it's a BooleanOptionalAction (starts with --no-)
         if name.startswith("--no-"):
-            no_dash_normalized = "--no-" + name[len("--no-"):].replace("-", "_")
+            no_dash_normalized = "--no-" + name[len("--no-") :].replace("-", "_")
             if no_dash_normalized in self._option_string_actions:
                 return no_dash_normalized
 
@@ -136,10 +136,7 @@ def _normalize_determinism_check_report_ranks(value: str) -> frozenset[int]:
 
     invalid_ranks = sorted(rank for rank in ranks if rank < 0 or rank >= world_size)
     if invalid_ranks:
-        raise ValueError(
-            "determinism_check_report_ranks contains ranks outside "
-            f"0..{world_size - 1}: {invalid_ranks}"
-        )
+        raise ValueError(f"determinism_check_report_ranks contains ranks outside 0..{world_size - 1}: {invalid_ranks}")
     return ranks
 
 
@@ -149,8 +146,7 @@ def _add_gemm_profile_args(parser) -> None:
         type=parse_gemm_quantization,
         default=None,
         help=(
-            "Transformer GEMM precision: none, fp8, fp4, fp6, int8, "
-            "low=fp4,high=fp8, or low=fp4,high=fp6."
+            "Transformer GEMM precision: none, fp8, fp4, fp6, a6w4, int8, or a supported low=fp4,high=<format> pair."
         ),
     )
     parser.add_argument(
@@ -246,6 +242,7 @@ class xFuserArgs:
     use_fp4_gemms: bool = False
     # Internal compatibility bridge derived from gemm_quantization.
     use_fp6_gemms: bool = False
+    use_a6w4_gemms: bool = False
     fp8_precision_override_prefix_patterns: Optional[str] = None
     fp8_precision_override_suffix_patterns: Optional[str] = None
     use_fp8_comms: bool = False
@@ -274,6 +271,7 @@ class xFuserArgs:
     dataset_path: Optional[str] = None
     use_fsdp: bool = False
     fully_shard_degree: int = 1
+    fully_shard_components: Optional[List[str]] = None
     reshard_after_forward: bool = True
     memory_efficient_sharding: bool = False
     memory_efficient_replicated_load: bool = False
@@ -297,9 +295,15 @@ class xFuserArgs:
     spargeattn_cdfthreshold: float = 0.92
     # Block-sparse Ulysses head balancing (not Sparge-specific)
     use_sparseattn_head_balance: bool = False
-    # Sol-Attn
+    # AITER MHA v4 Sol-Attn (the AITER_*_SOL backends)
     solattn_beta: float = 0.5
     solattn_beta_schedule: Optional[str] = None
+    # NVIDIA Sol-Attn (the SOL_ATTN backend)
+    sol_attn_tau: float = 0.2
+    sol_attn_thresh_type: str = "exact"
+    sol_attn_kv_splits: str = "auto"
+    sol_attn_sink_tokens: int = 0
+    sol_attn_sink_start: Optional[int] = None
     # AITER CK-Tile VSA attention
     vsa_block_size: int = 128
     vsa_top_k: int = 1
@@ -315,16 +319,17 @@ class xFuserArgs:
     distilled_transformer_2_path: Optional[str] = None
 
     def __post_init__(self):
-        self.determinism_check_report_ranks = (
-            _normalize_determinism_check_report_ranks(
-                self.determinism_check_report_ranks
-            )
+        self.determinism_check_report_ranks = _normalize_determinism_check_report_ranks(
+            self.determinism_check_report_ranks
         )
         if self.profile_with_stack and not self.profile:
-            logger.warning(
-                "--profile_with_stack has no effect without --profile; "
-                "no profiles will be outputted."
-            )
+            logger.warning("--profile_with_stack has no effect without --profile; no profiles will be outputted.")
+        if self.fully_shard_components is not None:
+            self.fully_shard_components = list(dict.fromkeys(self.fully_shard_components))
+            if not self.fully_shard_components:
+                raise ValueError("--fully_shard_components requires at least one component")
+            if self.fully_shard_degree <= 1:
+                raise ValueError("--fully_shard_components requires --fully_shard_degree greater than 1")
         self._resolve_gemm_quantization()
         if self.cache_method is None:
             if self.use_fbcache:
@@ -383,16 +388,15 @@ class xFuserArgs:
             if getattr(self, name) is not None
         )
 
-        if not explicit_spec and self.use_fp6_gemms:
-            raise ValueError(
-                "MXFP6 must be selected through gemm_quantization."
-            )
+        if not explicit_spec and (self.use_fp6_gemms or self.use_a6w4_gemms):
+            raise ValueError("MXFP6 and mixed-MXFP formats must be selected through gemm_quantization.")
 
         if explicit_spec:
             self._warn_deprecated_gemm_options(legacy_formats, ignored=True)
             self.use_fp8_gemms = False
             self.use_fp4_gemms = False
             self.use_fp6_gemms = False
+            self.use_a6w4_gemms = False
             self.use_int8_gemms = False
             if spec.is_pure("fp8"):
                 self.use_fp8_gemms = True
@@ -400,11 +404,14 @@ class xFuserArgs:
                 self.use_fp4_gemms = True
             elif spec.is_pure("fp6"):
                 self.use_fp6_gemms = True
+            elif spec.is_pure("a6w4"):
+                self.use_a6w4_gemms = True
             elif spec.is_pure("int8"):
                 self.use_int8_gemms = True
             elif spec.is_tiered:
                 self.use_fp4_gemms = True
                 self.use_fp6_gemms = spec.high == "fp6"
+                self.use_a6w4_gemms = spec.high == "a6w4"
         else:
             if self.use_fp4_gemms:
                 spec = GemmQuantizationSpec("fp4", "fp8")
@@ -418,12 +425,10 @@ class xFuserArgs:
         if self.gemm_config is not None:
             advanced = load_gemm_config(self.gemm_config)
             if advanced.settings.get("hybrid_gemm_schedule") is not None and (
-                self.use_hybrid_gemm_schedule
-                or self.num_hybrid_gemm_high_precision_steps is not None
+                self.use_hybrid_gemm_schedule or self.num_hybrid_gemm_high_precision_steps is not None
             ):
                 raise ValueError(
-                    "YAML hybrid_gemm_schedule cannot be combined with the "
-                    "simple hybrid GEMM schedule flags"
+                    "YAML hybrid_gemm_schedule cannot be combined with the simple hybrid GEMM schedule flags"
                 )
             for name, value in advanced.settings.items():
                 setattr(self, name, value)
@@ -466,9 +471,7 @@ class xFuserArgs:
 
         # Runtime arguments
         runtime_group = parser.add_argument_group("Runtime Options")
-        runtime_group.add_argument(
-            "--warmup_steps", type=int, default=1, help="Warmup steps in generation."
-        )
+        runtime_group.add_argument("--warmup_steps", type=int, default=1, help="Warmup steps in generation.")
         # runtime_group.add_argument("--use_cuda_graph", action="store_true")
         runtime_group.add_argument("--use_parallel_vae", action="store_true")
         # runtime_group.add_argument("--use_profiler", action="store_true")
@@ -538,9 +541,7 @@ class xFuserArgs:
             action="store_true",
             help="Use split batch in classifier_free_guidance. cfg_degree will be 2 if set",
         )
-        parallel_group.add_argument(
-            "--data_parallel_degree", type=int, default=1, help="Data parallel degree."
-        )
+        parallel_group.add_argument("--data_parallel_degree", type=int, default=1, help="Data parallel degree.")
         parallel_group.add_argument(
             "--ulysses_degree",
             type=int,
@@ -609,21 +610,11 @@ class xFuserArgs:
 
         # Input arguments
         input_group = parser.add_argument_group("Input Options")
-        input_group.add_argument(
-            "--height", type=int, default=1024, help="The height of image"
-        )
-        input_group.add_argument(
-            "--width", type=int, default=1024, help="The width of image"
-        )
-        input_group.add_argument(
-            "--num_frames", type=int, default=49, help="The frames of video"
-        )
-        input_group.add_argument(
-            "--img_file_path", type=str, default=None, help="Path for the input image."
-        )
-        input_group.add_argument(
-            "--prompt", type=str, nargs="*", default="", help="Prompt for the model."
-        )
+        input_group.add_argument("--height", type=int, default=1024, help="The height of image")
+        input_group.add_argument("--width", type=int, default=1024, help="The width of image")
+        input_group.add_argument("--num_frames", type=int, default=49, help="The frames of video")
+        input_group.add_argument("--img_file_path", type=str, default=None, help="Path for the input image.")
+        input_group.add_argument("--prompt", type=str, nargs="*", default="", help="Prompt for the model.")
         input_group.add_argument("--no_use_resolution_binning", action="store_true")
         input_group.add_argument(
             "--negative_prompt",
@@ -644,9 +635,7 @@ class xFuserArgs:
             default=256,
             help="Max sequencen length of prompt",
         )
-        runtime_group.add_argument(
-            "--seed", type=int, default=42, help="Random seed for operations."
-        )
+        runtime_group.add_argument("--seed", type=int, default=42, help="Random seed for operations.")
         runtime_group.add_argument(
             "--output_type",
             type=str,
@@ -673,7 +662,7 @@ class xFuserArgs:
             "--enable_group_cpu_offload",
             action="store_true",
             help="Async leaf-level group CPU offload (streamed, per-group pinned). Overlaps H2D "
-                 "transfer with compute; upstream diffusers group offloading.",
+            "transfer with compute; upstream diffusers group offloading.",
         )
         runtime_group.add_argument(
             "--enable_tiling",
@@ -684,37 +673,37 @@ class xFuserArgs:
             "--enable_slicing",
             action="store_true",
             help="Decode one batch item at a time to reduce GPU memory use. This has no effect "
-                 "when the batch size is 1.",
+            "when the batch size is 1.",
         )
         runtime_group.add_argument(
             "--vae_tile_size_height",
             type=int,
             default=None,
             help="Exact output-pixel height of each VAE tile. Requires --enable_tiling. "
-                 "Must be used with --vae_tile_size_width.",
+            "Must be used with --vae_tile_size_width.",
         )
         runtime_group.add_argument(
             "--vae_tile_size_width",
             type=int,
             default=None,
             help="Exact output-pixel width of each VAE tile. Requires --enable_tiling. "
-                 "Must be used with --vae_tile_size_height.",
+            "Must be used with --vae_tile_size_height.",
         )
         runtime_group.add_argument(
             "--vae_tile_overlap_height",
             type=int,
             default=None,
             help="Exact VAE tile overlap along the height axis, in output pixels. Requires "
-                 "--enable_tiling. Must be used with --vae_tile_overlap_width. Height and width "
-                 "may differ; use 0 for an inactive strip axis.",
+            "--enable_tiling. Must be used with --vae_tile_overlap_width. Height and width "
+            "may differ; use 0 for an inactive strip axis.",
         )
         runtime_group.add_argument(
             "--vae_tile_overlap_width",
             type=int,
             default=None,
             help="Exact VAE tile overlap along the width axis, in output pixels. Requires "
-                 "--enable_tiling. Must be used with --vae_tile_overlap_height. Height and width "
-                 "may differ; use 0 for an inactive strip axis.",
+            "--enable_tiling. Must be used with --vae_tile_overlap_height. Height and width "
+            "may differ; use 0 for an inactive strip axis.",
         )
         runtime_group.add_argument(
             "--use_fp8_t5_encoder",
@@ -748,8 +737,8 @@ class xFuserArgs:
             type=float,
             default=DEFAULT_FP8_COMMS_SAFETY_FACTOR,
             help="Safety factor for the calibrated FP8 comms scale: scale = amax / "
-                 "(FP8_MAX * safety_factor). LOWER it (e.g. 0.4) to enlarge the scale and "
-                 "leave more headroom before fp8 saturation. Default 0.85.",
+            "(FP8_MAX * safety_factor). LOWER it (e.g. 0.4) to enlarge the scale and "
+            "leave more headroom before fp8 saturation. Default 0.85.",
         )
 
         # DiTFastAttn arguments
@@ -803,7 +792,6 @@ class xFuserArgs:
 
         return parser
 
-
     @staticmethod
     def add_runner_args(parser: FlexibleArgumentParser):
         parser.add_argument(
@@ -812,10 +800,7 @@ class xFuserArgs:
             help="Name or path of the huggingface model to use.",
             required=True,
         )
-        parser.add_argument(
-            "--use_parallel_vae",
-            help="Enable parallel VAE.",
-            action="store_true")
+        parser.add_argument("--use_parallel_vae", help="Enable parallel VAE.", action="store_true")
         parser.add_argument(
             "--use_torch_compile",
             action="store_true",
@@ -838,9 +823,7 @@ class xFuserArgs:
             action="store_true",
             help="Use split batch in classifier_free_guidance. cfg_degree will be 2 if set",
         )
-        parser.add_argument(
-            "--data_parallel_degree", type=int, default=1, help="Data parallel degree."
-        )
+        parser.add_argument("--data_parallel_degree", type=int, default=1, help="Data parallel degree.")
         parser.add_argument(
             "--ulysses_degree",
             type=int,
@@ -871,39 +854,44 @@ class xFuserArgs:
             default=1,
             help="Tensor parallel degree for supported text encoders, reusing the existing model ranks.",
         )
+        parser.add_argument("--fully_shard_degree", type=int, default=1, help="Fully sharding (sharding) degree.")
         parser.add_argument(
-            "--fully_shard_degree",
-            type=int,
-            default=1,
-            help="Fully sharding (sharding) degree."
+            "--fully_shard_components",
+            nargs="+",
+            default=None,
+            help=(
+                "Only FSDP-wrap these pipeline components (for example "
+                "'text_encoder'). By default every component named by the "
+                "model's FSDP strategy is sharded."
+            ),
         )
         parser.add_argument(
             "--no_reshard_after_forward",
             dest="reshard_after_forward",
             action="store_false",
             help="Keep parameters gathered after each block's forward instead of resharding. "
-                 "Trades memory for latency by eliminating repeated all-gathers. "
-                 "Only valid with --fully_shard_degree > 1.",
+            "Trades memory for latency by eliminating repeated all-gathers. "
+            "Only valid with --fully_shard_degree > 1.",
         )
         parser.add_argument(
             "--memory_efficient_sharding",
             action="store_true",
             default=False,
             help="Reduce peak VRAM during load: shard transformer blocks one at a time on GPU "
-                 "during init, so the full unsharded component never materializes on device. "
-                 "Slightly slower to load - use if the model OOMs on GPU during init. Requires "
-                 "--fully_shard_degree > 1.",
+            "during init, so the full unsharded component never materializes on device. "
+            "Slightly slower to load - use if the model OOMs on GPU during init. Requires "
+            "--fully_shard_degree > 1.",
         )
         parser.add_argument(
             "--memory_efficient_replicated_load",
             action="store_true",
             default=False,
             help="Reduce peak host RAM when a model that fits one GPU is replicated across ranks "
-                 "(pure sequence/CFG/data parallelism): rank0 loads the real weights and peers "
-                 "build on meta and receive them over a GPU->GPU broadcast, so host peak is 1x the "
-                 "model instead of Nx. Use if the load is OOM-killed on host as rank count grows. "
-                 "No effect with weight-splitting parallelism (FSDP/PipeFusion/tensor parallel), "
-                 "which loads per-rank weights anyway, or on a single rank.",
+            "(pure sequence/CFG/data parallelism): rank0 loads the real weights and peers "
+            "build on meta and receive them over a GPU->GPU broadcast, so host peak is 1x the "
+            "model instead of Nx. Use if the load is OOM-killed on host as rank count grows. "
+            "No effect with weight-splitting parallelism (FSDP/PipeFusion/tensor parallel), "
+            "which loads per-rank weights anyway, or on a single rank.",
         )
         parser.add_argument(
             "--height",
@@ -927,7 +915,8 @@ class xFuserArgs:
             help="Prompt for the model.",
         )
         parser.add_argument(
-            "--negative_prompt", type=str,
+            "--negative_prompt",
+            type=str,
             nargs="*",
             help="Negative prompt for the model.",
         )
@@ -941,12 +930,7 @@ class xFuserArgs:
             type=int,
             help="Max sequence length of prompt",
         )
-        parser.add_argument(
-            "--seed",
-            type=int,
-            default=42,
-            help="Random seed for operations."
-        )
+        parser.add_argument("--seed", type=int, default=42, help="Random seed for operations.")
         parser.add_argument(
             "--guidance_scale",
             type=float,
@@ -981,8 +965,8 @@ class xFuserArgs:
             "--group_offload_low_cpu_mem",
             action="store_true",
             help="With --enable_group_cpu_offload, pin each tensor as it is offloaded instead of "
-                 "pre-pinning whole components. Keeps host RAM flat on hosts where it is the "
-                 "binding constraint, at some of the streaming speedup.",
+            "pre-pinning whole components. Keeps host RAM flat on hosts where it is the "
+            "binding constraint, at some of the streaming speedup.",
         )
         parser.add_argument(
             "--enable_tiling",
@@ -993,37 +977,37 @@ class xFuserArgs:
             "--enable_slicing",
             action="store_true",
             help="Decode one batch item at a time to reduce GPU memory use. This has no effect "
-                 "when the batch size is 1.",
+            "when the batch size is 1.",
         )
         parser.add_argument(
             "--vae_tile_size_height",
             type=int,
             default=None,
             help="Exact output-pixel height of each VAE tile. Requires --enable_tiling. "
-                 "Must be used with --vae_tile_size_width.",
+            "Must be used with --vae_tile_size_width.",
         )
         parser.add_argument(
             "--vae_tile_size_width",
             type=int,
             default=None,
             help="Exact output-pixel width of each VAE tile. Requires --enable_tiling. "
-                 "Must be used with --vae_tile_size_height.",
+            "Must be used with --vae_tile_size_height.",
         )
         parser.add_argument(
             "--vae_tile_overlap_height",
             type=int,
             default=None,
             help="Exact VAE tile overlap along the height axis, in output pixels. Requires "
-                 "--enable_tiling. Must be used with --vae_tile_overlap_width. Height and width "
-                 "may differ; use 0 for an inactive strip axis.",
+            "--enable_tiling. Must be used with --vae_tile_overlap_width. Height and width "
+            "may differ; use 0 for an inactive strip axis.",
         )
         parser.add_argument(
             "--vae_tile_overlap_width",
             type=int,
             default=None,
             help="Exact VAE tile overlap along the width axis, in output pixels. Requires "
-                 "--enable_tiling. Must be used with --vae_tile_overlap_height. Height and width "
-                 "may differ; use 0 for an inactive strip axis.",
+            "--enable_tiling. Must be used with --vae_tile_overlap_height. Height and width "
+            "may differ; use 0 for an inactive strip axis.",
         )
         _add_gemm_profile_args(parser)
         parser.add_argument(
@@ -1040,9 +1024,9 @@ class xFuserArgs:
             "--use_fp8_text_encoder",
             action="store_true",
             help="Also quantize the text encoder's linear layers to FP8 (selected models only). "
-                 "Requires a GEMM profile containing FP8. Frees several GB "
-                 "for large bf16 text encoders, at whatever output-quality cost FP8 carries for "
-                 "the encoder; off by default because that is a quality trade-off, not a free win.",
+            "Requires a GEMM profile containing FP8. Frees several GB "
+            "for large bf16 text encoders, at whatever output-quality cost FP8 carries for "
+            "the encoder; off by default because that is a quality trade-off, not a free win.",
         )
         parser.add_argument(
             "--use_fp4_gemms",
@@ -1077,15 +1061,10 @@ class xFuserArgs:
             type=float,
             default=DEFAULT_FP8_COMMS_SAFETY_FACTOR,
             help="Safety factor for the calibrated FP8 comms scale: scale = amax / "
-                 "(FP8_MAX * safety_factor). LOWER it (e.g. 0.4) to enlarge the scale and "
-                 "leave more headroom before fp8 saturation. Default 0.85.",
+            "(FP8_MAX * safety_factor). LOWER it (e.g. 0.4) to enlarge the scale and "
+            "leave more headroom before fp8 saturation. Default 0.85.",
         )
-        parser.add_argument(
-            "--num_iterations",
-            type=int,
-            default=1,
-            help="Number of iterations to run the model."
-        )
+        parser.add_argument("--num_iterations", type=int, default=1, help="Number of iterations to run the model.")
         parser.add_argument(
             "--determinism_check",
             type=int,
@@ -1102,7 +1081,7 @@ class xFuserArgs:
             "--profile",
             default=False,
             action="store_true",
-            help="Whether to run Pytorch profiler. See --profile_wait, --profile_warmup and --profile_active for profiler specific warmup."
+            help="Whether to run Pytorch profiler. See --profile_wait, --profile_warmup and --profile_active for profiler specific warmup.",
         )
         parser.add_argument(
             "--profile_wait",
@@ -1157,9 +1136,7 @@ class xFuserArgs:
             help="Whether to resize and crop the input image(s) to the specified width and height.",
         )
         parser.add_argument(
-            "--task",
-            default=None,
-            help="Task to perform. Only applicable if the model supports multiple tasks."
+            "--task", default=None, help="Task to perform. Only applicable if the model supports multiple tasks."
         )
         parser.add_argument(
             "--batch_size",
@@ -1176,7 +1153,7 @@ class xFuserArgs:
             "--use_hybrid_attn_schedule",
             action="store_true",
             default=False,
-            help="Enable hybrid attention schedule for faster inference and improved quality."
+            help="Enable hybrid attention schedule for faster inference and improved quality.",
         )
         parser.add_argument(
             "--hybrid_attn_low_precision_backend",
@@ -1243,47 +1220,79 @@ class xFuserArgs:
             action=argparse.BooleanOptionalAction,
             default=True,
             help="Reorder image tokens via the gilbert space-filling curve "
-                 "before Sparge attention, and video tokens before Sol-Attn for "
-                 "MiniMax-H3. Use --no-spargeattn_reorder_sequence to disable."
+            "before Sparge attention, and video tokens before Sol-Attn for "
+            "MiniMax-H3. Use --no-spargeattn_reorder_sequence to disable.",
         )
         parser.add_argument(
             "--use_spargeattn_static_block_mask",
             action=argparse.BooleanOptionalAction,
             default=True,
             help="OR a static gilbert block-neighbor mask into the dynamic "
-                 "Sparge block mask. Only meaningful when "
-                 "--spargeattn_reorder_sequence is set. Use --no-use_spargeattn_static_block_mask to disable."
+            "Sparge block mask. Only meaningful when "
+            "--spargeattn_reorder_sequence is set. Use --no-use_spargeattn_static_block_mask to disable.",
         )
         parser.add_argument(
             "--use_sparseattn_head_balance",
             action="store_true",
             help="Balance per-rank attention work across Ulysses ranks by "
-                 "permuting heads (block-sparse load balancing). Only has an "
-                 "effect with ulysses_degree>1, equal query and KV head counts, "
-                 "and a block-sparse attention backend that publishes a per-head "
-                 "cost (the Sparge backends or the Sol backends).",
+            "permuting heads (block-sparse load balancing). Only has an "
+            "effect with ulysses_degree>1, equal query and KV head counts, "
+            "and a block-sparse attention backend that publishes a per-head "
+            "cost (the Sparge backends or the AITER Sol backends).",
         )
         parser.add_argument(
             "--solattn_beta",
             type=float,
             default=0.5,
             help="Routing threshold for the AITER Sol backends. A KV block is "
-                 "computed exactly when its pooled proxy score exceeds "
-                 "mean + beta*std over the blocks of that query tile, so larger "
-                 "beta keeps fewer blocks.",
+            "computed exactly when its pooled proxy score exceeds "
+            "mean + beta*std over the blocks of that query tile, so larger "
+            "beta keeps fewer blocks.",
         )
         parser.add_argument(
             "--solattn_beta_schedule",
             type=nullable_str,
             default=None,
             help="Vary --solattn_beta across denoising steps, since steps are not equally "
-                 "approximable. Either 'first:last' for a linear ramp over the run, e.g. "
-                 "'1.0:-0.25' to start aggressive and end exact, or one beta per step as "
-                 "'0.5,0.5,0.25,...' -- per DENOISING STEP, so a 40-step run takes 40 whether or "
-                 "not guidance is on: a guided step's conditional and unconditional forward share "
-                 "the step's beta. Overrides --solattn_beta when set. A spec starting with a "
-                 "negative beta needs the --solattn_beta_schedule=-0.5:0.0 form, or argparse "
-                 "reads the leading minus as another option.",
+            "approximable. Either 'first:last' for a linear ramp over the run, e.g. "
+            "'1.0:-0.25' to start aggressive and end exact, or one beta per step as "
+            "'0.5,0.5,0.25,...' -- per DENOISING STEP, so a 40-step run takes 40 whether or "
+            "not guidance is on: a guided step's conditional and unconditional forward share "
+            "the step's beta. Overrides --solattn_beta when set. A spec starting with a "
+            "negative beta needs the --solattn_beta_schedule=-0.5:0.0 form, or argparse "
+            "reads the leading minus as another option.",
+        )
+        parser.add_argument(
+            "--sol_attn_tau",
+            type=float,
+            default=0.2,
+            help="NVIDIA Sol-Attn (SOL_ATTN backend) routing temperature. Higher values keep fewer KV blocks exact.",
+        )
+        parser.add_argument(
+            "--sol_attn_thresh_type",
+            type=str,
+            default="exact",
+            choices=["diag", "exact"],
+            help="NVIDIA Sol-Attn routing threshold. 'diag' uses the diagonal covariance; 'exact' uses the full covariance.",
+        )
+        parser.add_argument(
+            "--sol_attn_kv_splits",
+            type=str,
+            default="auto",
+            choices=["auto", "1", "2", "4"],
+            help="KV splits for the SM90 Sol-Attn kernel. 'auto' uses 4 on SM90 CuTe when the sequence is at least 65536 tokens.",
+        )
+        parser.add_argument(
+            "--sol_attn_sink_tokens",
+            type=int,
+            default=0,
+            help="NVIDIA Sol-Attn: number of tokens whose KV blocks stay exact for every query. 0 disables the sink.",
+        )
+        parser.add_argument(
+            "--sol_attn_sink_start",
+            type=int,
+            default=None,
+            help="NVIDIA Sol-Attn: first token of the exact KV sink. Omit to place the sink on the token suffix.",
         )
         parser.add_argument(
             "--vsa_block_size",
@@ -1301,8 +1310,7 @@ class xFuserArgs:
             "--vsa_top_k_ratio",
             type=float,
             default=0.0,
-            help="Minimum selected KV-block fraction for AITER VSA. "
-                 "For Jenga drop rate r, set this to 1-r.",
+            help="Minimum selected KV-block fraction for AITER VSA. For Jenga drop rate r, set this to 1-r.",
         )
         parser.add_argument(
             "--vsa_drop_rates",
@@ -1310,8 +1318,8 @@ class xFuserArgs:
             nargs="+",
             default=None,
             help="Enable Jenga's per-step sparse schedule. One value applies "
-                 "to all steps; two values switch after the midpoint. "
-                 "Drop rates <=0.25 use dense AITER attention.",
+            "to all steps; two values switch after the midpoint. "
+            "Drop rates <=0.25 use dense AITER attention.",
         )
         parser.add_argument(
             "--vsa_prob_threshold",
@@ -1377,12 +1385,11 @@ class xFuserArgs:
             default=None,
             help=(
                 "JSON string of advanced config overrides merged on top of preset defaults. "
-                "E.g. '{\"residual_diff_threshold\": 0.5, \"max_warmup_steps\": 6}'. "
+                'E.g. \'{"residual_diff_threshold": 0.5, "max_warmup_steps": 6}\'. '
                 "Keys must match DBCacheConfig fields (cache-dit)."
             ),
         )
         return parser
-
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -1398,15 +1405,29 @@ class xFuserArgs:
         engine_args = cls(**{arg_name: arg_value for arg_name, arg_value in args.items() if arg_name in attrs})
         return engine_args
 
-
     def _validate_gemm_quantization_flags(self) -> None:
         """Validate ownership of mutually exclusive generic GEMM quantizers."""
         spec = self.gemm_quantization_spec
-        if self.use_fp8_text_encoder and "fp8" not in spec.formats:
+        uses_mixed_mxfp = self.use_a6w4_gemms
+        if uses_mixed_mxfp and (
+            self.enable_model_cpu_offload or self.enable_sequential_cpu_offload or self.enable_group_cpu_offload
+        ):
+            raise ValueError("A6W4 GEMMs do not support CPU offload.")
+        if uses_mixed_mxfp and (
+            self.fully_shard_degree > 1 or self.memory_efficient_sharding or self.memory_efficient_replicated_load
+        ):
+            raise ValueError("A6W4 GEMMs currently support eager loading only.")
+        if not spec.is_tiered and (
+            self.fp8_precision_override_prefix_patterns is not None
+            or self.fp8_precision_override_suffix_patterns is not None
+        ):
             raise ValueError(
-                "--use_fp8_text_encoder requires a gemm_quantization profile "
-                "containing FP8."
+                "Precision override patterns require a tiered GEMM quantization profile, "
+                "such as --gemm_quantization low=fp4,high=fp8. "
+                "Use a tiered profile or drop the patterns."
             )
+        if self.use_fp8_text_encoder and "fp8" not in spec.formats:
+            raise ValueError("--use_fp8_text_encoder requires a gemm_quantization profile containing FP8.")
         has_advanced_targets = (
             self.gemm_high_precision_targets != "model"
             or self.gemm_high_precision_module_patterns is not None
@@ -1414,42 +1435,23 @@ class xFuserArgs:
             or self.gemm_high_precision_suffix_patterns is not None
         )
         if has_advanced_targets and not spec.is_tiered:
-            raise ValueError(
-                "Advanced GEMM target settings require a low/high "
-                "--gemm_quantization profile."
-            )
+            raise ValueError("Advanced GEMM target settings require a low/high --gemm_quantization profile.")
         if self.use_hybrid_gemm_schedule and not spec.is_tiered:
+            raise ValueError("Hybrid GEMM scheduling requires a low/high --gemm_quantization profile.")
+        if self.hybrid_gemm_schedule is not None and self.num_hybrid_gemm_high_precision_steps is not None:
             raise ValueError(
-                "Hybrid GEMM scheduling requires a low/high "
-                "--gemm_quantization profile."
-            )
-        if (
-            self.hybrid_gemm_schedule is not None
-            and self.num_hybrid_gemm_high_precision_steps is not None
-        ):
-            raise ValueError(
-                "YAML hybrid_gemm_schedule cannot be combined with "
-                "--num_hybrid_gemm_high_precision_steps."
+                "YAML hybrid_gemm_schedule cannot be combined with --num_hybrid_gemm_high_precision_steps."
             )
         if self.hybrid_gemm_schedule is not None:
-            scheduled_formats = {
-                token.strip().lower()
-                for token in self.hybrid_gemm_schedule.split(",")
-            }
+            scheduled_formats = {token.strip().lower() for token in self.hybrid_gemm_schedule.split(",")}
             if scheduled_formats - spec.formats:
-                raise ValueError(
-                    "YAML hybrid_gemm_schedule entries must match "
-                    f"--gemm_quantization {spec}."
-                )
+                raise ValueError(f"YAML hybrid_gemm_schedule entries must match --gemm_quantization {spec}.")
         if self.use_fp6_gemms and self.use_fp8_gemms:
             raise ValueError(
-                "--use_fp8_gemms cannot be combined with --use_fp6_gemms; "
-                "MXFP6 already owns every declared FP8 target."
+                "--use_fp8_gemms cannot be combined with --use_fp6_gemms; MXFP6 already owns every declared FP8 target."
             )
         if self.use_fp6_gemms and self.use_int8_gemms:
-            raise ValueError(
-                "--use_int8_gemms cannot be combined with --use_fp6_gemms."
-            )
+            raise ValueError("--use_int8_gemms cannot be combined with --use_fp6_gemms.")
         if self.use_int8_gemms and (self.use_fp8_gemms or self.use_fp4_gemms):
             raise ValueError(
                 "--use_int8_gemms cannot be combined with --use_fp8_gemms or "
@@ -1461,18 +1463,14 @@ class xFuserArgs:
                 "--use_hybrid_gemm_schedule explicitly owns the mixed FP8/FP4 mode."
             )
         if self.use_hybrid_gemm_schedule and not self.use_fp4_gemms:
-            raise ValueError(
-                "When use_hybrid_gemm_schedule is True, use_fp4_gemms must be set."
-            )
+            raise ValueError("When use_hybrid_gemm_schedule is True, use_fp4_gemms must be set.")
 
     def create_config(
         self,
     ) -> Tuple[EngineConfig, InputConfig]:
         self._validate_gemm_quantization_flags()
         if not self.use_ray and not torch.distributed.is_initialized():
-            logger.warning(
-                "Distributed environment is not initialized. " "Initializing..."
-            )
+            logger.warning("Distributed environment is not initialized. Initializing...")
             init_distributed_environment()
         if self.use_ray:
             self.world_size = self.ray_world_size
@@ -1481,19 +1479,22 @@ class xFuserArgs:
 
         if self.dit_parallel_size == 0 and (not self.use_parallel_vae or self.vae_parallel_size == 0):
             self.dit_parallel_size = self.world_size
-        assert self.dit_parallel_size+self.vae_parallel_size == self.world_size, (
+        assert self.dit_parallel_size + self.vae_parallel_size == self.world_size, (
             f"DIT parallel size {self.dit_parallel_size} and VAE parallel size {self.vae_parallel_size} must sum to world size {self.world_size}"
         )
 
         # Hybrid attention schedule validation
         if self.use_hybrid_attn_schedule:
             if self.attention_backend is not None:
-                raise ValueError(
-                    "When use_hybrid_attn_schedule is True, attention_backend must not be set."
-                )
+                raise ValueError("When use_hybrid_attn_schedule is True, attention_backend must not be set.")
             if self.hybrid_attn_schedule is not None:
-                if self.hybrid_attn_low_precision_backend is not None or self.hybrid_attn_high_precision_backend is not None:
-                    raise ValueError("When an explicit hybrid attention schedule is provided, neither hybrid_attn_low_precision_backend nor hybrid_attn_high_precision_backend may be set.")
+                if (
+                    self.hybrid_attn_low_precision_backend is not None
+                    or self.hybrid_attn_high_precision_backend is not None
+                ):
+                    raise ValueError(
+                        "When an explicit hybrid attention schedule is provided, neither hybrid_attn_low_precision_backend nor hybrid_attn_high_precision_backend may be set."
+                    )
             elif self.hybrid_attn_low_precision_backend is None or self.hybrid_attn_high_precision_backend is None:
                 raise ValueError(
                     "When use_hybrid_attn_schedule is True, both hybrid_attn_low_precision_backend and "
@@ -1506,23 +1507,12 @@ class xFuserArgs:
             # a typo in a 40-entry list should not surface after the weights have loaded.
             SolAttnBetaSchedule.from_spec(
                 self.solattn_beta_schedule,
-                len(self.solattn_beta_schedule.split(","))
-                if ":" not in self.solattn_beta_schedule else 2,
+                len(self.solattn_beta_schedule.split(",")) if ":" not in self.solattn_beta_schedule else 2,
             )
 
         if self.group_offload_low_cpu_mem and not self.enable_group_cpu_offload:
             raise ValueError(
-                "--group_offload_low_cpu_mem only affects group CPU offload; pass "
-                "--enable_group_cpu_offload too."
-            )
-
-        if (
-            self.fp8_precision_override_prefix_patterns is not None
-            or self.fp8_precision_override_suffix_patterns is not None
-        ) and not self.use_fp4_gemms:
-            raise ValueError(
-                "FP8 precision override patterns require --use_fp4_gemms: "
-                "overrides apply when quantizing linear layers for FP4 GEMMs."
+                "--group_offload_low_cpu_mem only affects group CPU offload; pass --enable_group_cpu_offload too."
             )
 
         model_config = ModelConfig(
@@ -1549,6 +1539,11 @@ class xFuserArgs:
             use_sparseattn_head_balance=self.use_sparseattn_head_balance,
             solattn_beta=self.solattn_beta,
             solattn_beta_schedule=self.solattn_beta_schedule,
+            sol_attn_tau=self.sol_attn_tau,
+            sol_attn_thresh_type=self.sol_attn_thresh_type,
+            sol_attn_kv_splits=self.sol_attn_kv_splits,
+            sol_attn_sink_tokens=self.sol_attn_sink_tokens,
+            sol_attn_sink_start=self.sol_attn_sink_start,
             vsa_block_size=self.vsa_block_size,
             vsa_top_k=self.vsa_top_k,
             vsa_top_k_ratio=self.vsa_top_k_ratio,

@@ -20,22 +20,26 @@ from xfuser.core.distributed import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
-from xfuser.core.distributed.attention_backend import (
-    AITER_MHA_V4_SOL_BACKEND_SET,
+from xfuser.core.attention import registry as attention_registry
+from xfuser.core.attention.backends.aiter_sol.spec import (
     SOL_EXACT_TOKENS_KEY,
     SOL_SEQUENCE_INVERSE_PERMUTATION_KEY,
     SOL_SEQUENCE_PERMUTATION_KEY,
-    VSA_H3_AITER_RECIPE_BY_BACKEND,
-    VSA_H3_BACKENDS,
-    AttentionBackendType,
 )
+from xfuser.core.attention.backends.vsa_h3.attention import build_h3_vsa_metadata
+from xfuser.core.attention.backends.vsa_h3.spec import VSA_H3_AITER_RECIPE_BY_BACKEND
+from xfuser.core.attention.spec import AttentionBackendType, Sparsity
 from xfuser.core.sparse_attention.sparge import get_gilbert_perm
-from xfuser.core.vsa_h3_attention import build_h3_vsa_metadata
 from xfuser.model_executor.layers.usp import (
     ULYSSES_EXTRA_INPUTS_KEY,
     USP,
     attention,
 )
+
+# Every VSA-H3 backend declares the same sparsity strategy, and every AITER Sol
+# one its own, so both sets follow from the specs rather than being listed here.
+VSA_H3_BACKENDS = attention_registry.types_where(sparsity=Sparsity.H3)
+SOL_BACKENDS = attention_registry.types_where(sparsity=Sparsity.SOL)
 
 
 MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT = 64
@@ -112,7 +116,7 @@ def _dense_backend_for(backend):
     Returns the argument unchanged when it is not routed, which leaves None as None so the call
     keeps deferring to the runtime state rather than pinning today's answer.
     """
-    if _effective_backend(backend) in AITER_MHA_V4_SOL_BACKEND_SET:
+    if _effective_backend(backend) in SOL_BACKENDS:
         return AttentionBackendType.AITER
     return backend
 
@@ -502,7 +506,7 @@ class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
         )
         if recipe is None:
             return
-        from xfuser.core.vsa_h3_aiter import (
+        from xfuser.core.attention.backends.vsa_h3.aiter_kernel import (
             vsa_h3_aiter_row_available,
             warn_if_padded_tiling,
         )
@@ -633,7 +637,7 @@ class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
         self._usp_attention_kwargs.pop(SOL_SEQUENCE_PERMUTATION_KEY, None)
         self._usp_attention_kwargs.pop(SOL_SEQUENCE_INVERSE_PERMUTATION_KEY, None)
         if (
-            _effective_backend(self._attention_backend) in AITER_MHA_V4_SOL_BACKEND_SET
+            _effective_backend(self._attention_backend) in SOL_BACKENDS
             and self._usp_attention_kwargs.get("spargeattn_reorder_sequence", False)
         ):
             video_hw = self._usp_attention_kwargs.get("minimax_h3_video_hw")
