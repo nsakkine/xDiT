@@ -4,7 +4,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from xfuser.core.distributed.ssta import get_sparse_mask, setup_ssta  # noqa: E402
+from xfuser.core.sparse_attention.ssta import get_sparse_mask, setup_ssta  # noqa: E402
 
 _HEADS = 4
 _THW = (4, 4, 4)

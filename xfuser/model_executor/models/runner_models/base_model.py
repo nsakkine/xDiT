@@ -3,6 +3,7 @@ import torch
 import copy
 import json
 import os
+from math import gcd
 from PIL.Image import Image
 from typing import Callable, List, Optional, Tuple, Generator
 from dataclasses import dataclass, field
@@ -96,6 +97,9 @@ _SPARGE_ATTENTION_BACKENDS = (
     | attention_registry.types_where(sparsity=Sparsity.VSA)
     | attention_registry.types_where(sparsity=Sparsity.SOL)
 )
+# Prism's block-sparse attention needs a token grid that only models declaring the
+# capability publish; anywhere else it would quietly run dense.
+_BSA_ATTENTION_BACKENDS = attention_registry.types_where(sparsity=Sparsity.BSA)
 
 # Which of those rows a model opts into is a separate question per family, though. "Wired for
 # Sparge" and "wired for Sol-Attn" are different claims: Sparge builds a mask from the operands,
@@ -161,7 +165,10 @@ def _selected_attention_backends(config: xFuserArgs) -> list[AttentionBackendTyp
 
 
 def _validate_attention_head_dims(model: "xFuserModel", config: xFuserArgs) -> None:
-    """Refuse a backend that cannot serve any head dimension the model runs.
+    """Validate backend head widths and the Ulysses Q/KV head layout.
+
+    Ulysses must divide the declared head counts unless the model pads heads.
+    Refuse a backend that cannot serve any head dimension the model runs.
 
     Disjoint rather than subset on purpose: LTX-2 pairs 128-wide video blocks with 64-wide
     audio ones and the odd size falls back per call, so a model keeps a backend as long as
@@ -172,26 +179,44 @@ def _validate_attention_head_dims(model: "xFuserModel", config: xFuserArgs) -> N
     unrestricted, and guessing would trade a silent bypass for a wrong refusal.
     """
     required = getattr(model, "attention_head_dims", None)
-    if not required:
-        return
-    for backend in _selected_attention_backends(config):
-        spec = attention_registry.find(backend)
-        supported = spec.accepts.head_dims() if spec is not None else None
-        if supported is None or not set(supported).isdisjoint(required):
-            continue
-        # What a rejected call does differs by backend, and the difference is the
-        # whole reason to refuse here: one wastes the selection, the other stops
-        # the run at the first layer.
-        outcome = (
-            f"every layer would fall through to {spec.fallback.name} and the selection would have no effect"
-            if spec.fallback is not None
-            else "every layer would be refused"
-        )
+    if required:
+        for backend in _selected_attention_backends(config):
+            spec = attention_registry.find(backend)
+            supported = spec.accepts.head_dims() if spec is not None else None
+            if supported is None or not set(supported).isdisjoint(required):
+                continue
+            # What a rejected call does differs by backend, and the difference is the
+            # whole reason to refuse here: one wastes the selection, the other stops
+            # the run at the first layer.
+            outcome = (
+                f"every layer would fall through to {spec.fallback.name} and the selection would have no effect"
+                if spec.fallback is not None
+                else "every layer would be refused"
+            )
+            raise ValueError(
+                f"{model.settings.model_name} does not support --attention_backend "
+                f"{backend.name}: it runs head dimension "
+                f"{', '.join(str(d) for d in sorted(required))} and that backend serves only "
+                f"{', '.join(str(d) for d in sorted(supported))}, so {outcome}."
+            )
+
+    heads = model.attention_heads
+    kv_heads = model.attention_kv_heads
+    ulysses_degree = config.ulysses_degree or 1
+    head_divisor = gcd(heads, kv_heads) if heads and kv_heads else heads
+    if (
+        model.capabilities.ulysses_degree
+        and not model.supports_ulysses_head_padding
+        and head_divisor
+        and head_divisor % ulysses_degree != 0
+    ):
+        divisors = ", ".join(str(d) for d in range(1, head_divisor + 1) if head_divisor % d == 0)
+        layout = f"{heads} attention heads" + (f" and {kv_heads} KV heads" if kv_heads else "")
+        required = "both head counts" if kv_heads else str(heads)
+        hint = " Use --ring_degree to scale sequence parallelism further." if model.capabilities.ring_degree else ""
         raise ValueError(
-            f"{model.settings.model_name} does not support --attention_backend "
-            f"{backend.name}: it runs head dimension "
-            f"{', '.join(str(d) for d in sorted(required))} and that backend serves only "
-            f"{', '.join(str(d) for d in sorted(supported))}, so {outcome}."
+            f"{model.settings.model_name} has {layout}, so "
+            f"--ulysses_degree must divide {required} ({divisors}); got {ulysses_degree}.{hint}"
         )
 
 
@@ -222,6 +247,7 @@ class ModelCapabilities:
     use_fp6_gemms: bool = False
     use_a6w4_gemms: bool = False
     supports_step_caching: bool = False
+    supports_lora: bool = False
     use_fp8_comms: bool = False
     use_hybrid_attn_schedule: bool = False
     use_hybrid_gemm_schedule: bool = False
@@ -229,6 +255,7 @@ class ModelCapabilities:
     supports_sparse_attention_backends: bool = False
     supports_sparge_attention_backends: bool = False
     supports_sol_attention_backends: bool = False
+    supports_bsa_attention_backends: bool = False
     supports_distilled_weights: bool = False
     profile_capture_phase: bool = False
 
@@ -374,16 +401,25 @@ class xFuserModel(abc.ABC):
     capabilities: ModelCapabilities = ModelCapabilities()
     default_input_values: DefaultInputValues = DefaultInputValues()
     settings: ModelSettings = ModelSettings()
-    model_output_type: str = ""
-    fps: int = 0
     checkpoint_request_defaults: dict = {}
+
+    # Attention heads of the model's transformer(s). When set, a --ulysses_degree that
+    # does not divide it is refused while validating the config, before any weights are
+    # downloaded or loaded; runtime_state re-checks it against the loaded model. A runner
+    # whose registered names differ in head count sets it per instance in
+    # _customize_settings.
+    attention_heads: Optional[int] = None
+    # Set only when GQA keeps KV heads compact through the Ulysses exchange.
+    attention_kv_heads: Optional[int] = None
+    # Z-Image pads Q/K/V heads, so divisibility of its real heads is not required.
+    supports_ulysses_head_padding: bool = False
 
     # Lowest diffusers release this model is expected to run on, used only to name an
     # upgrade target when a load fails. It never gates a load, so a value above the
-    # true minimum costs an over-stated recommendation and blocks nothing, while a
-    # value below it is a bug that tests/integration/cpu/repository/test_diffusers_floors.py
-    # catches. Use DIFFUSERS_FROM_SOURCE when the model's support has not been released yet,
-    # and leave None when no floor is known.
+    # true minimum costs an over-stated recommendation and blocks nothing. A value
+    # below the release that ships the symbols still fails in _load_model, and
+    # _load_model_checked reports this floor. Use DIFFUSERS_FROM_SOURCE when the
+    # model's support has not been released yet, and leave None when no floor is known.
     min_diffusers_version: Optional[str] = None
 
     def __init__(self, config: xFuserArgs) -> None:
@@ -647,6 +683,17 @@ class xFuserModel(abc.ABC):
     def _validate_config(self, config: xFuserArgs) -> None:
         """Validate if the model supports requested config"""
         config._validate_gemm_quantization_flags()
+        if config.lora_path:
+            if not self.capabilities.supports_lora:
+                raise ValueError(f"Model {self.settings.model_name} does not support startup LoRA fusion.")
+            if (
+                config.pipefusion_parallel_degree > 1
+                or config.fully_shard_degree > 1
+                or config.memory_efficient_sharding
+                or config.memory_efficient_replicated_load
+                or not config.gemm_quantization_spec.is_pure("none")
+            ):
+                raise ValueError("Startup LoRA fusion requires eager, unquantized loading without FSDP or PipeFusion.")
         _validate_attention_head_dims(self, config)
         for key in ModelCapabilities.__annotations__.keys():
             config_value = getattr(
@@ -670,6 +717,20 @@ class xFuserModel(abc.ABC):
                 )
 
         self._validate_supported_attn_backends(config)
+
+        if not self.capabilities.supports_bsa_attention_backends:
+            for value, label in (
+                (config.attention_backend, "attention backend"),
+                (config.cross_attention_backend, "cross attention backend"),
+                (config.hybrid_attn_low_precision_backend, "hybrid low-precision attention backend"),
+                (config.hybrid_attn_high_precision_backend, "hybrid high-precision attention backend"),
+            ):
+                bsa = _parse_attention_backend(value, label)
+                if bsa in _BSA_ATTENTION_BACKENDS:
+                    raise ValueError(
+                        f"Model {config.model} does not support {bsa.name}: it publishes no token grid "
+                        f"for block-sparse attention, so every call would run dense."
+                    )
 
         backend = _parse_attention_backend(config.attention_backend, "attention backend")
         supports_sparse = self.capabilities.supports_sparse_attention_backends
@@ -747,7 +808,7 @@ class xFuserModel(abc.ABC):
 
         validate_fp8_comms_config(config, self.capabilities, self.settings)
 
-        if self.model_output_type == "video" and not self.fps:
+        if self.settings.model_output_type == "video" and not self.settings.fps:
             raise ValueError(f"Model {self.settings.model_name} produces video output but fps is not set.")
 
         if config.use_int8_gemms and _is_hip():
@@ -789,6 +850,10 @@ class xFuserModel(abc.ABC):
 
     def _get_compile_dynamic(self) -> Optional[bool]:
         return None  # torch default (auto)
+
+    def _prefer_blockwise_compile(self) -> bool:
+        """Compile per block even without FSDP or caching, for forwards that sync to host outside the block loop."""
+        return False
 
     def _mark_cudagraph_steps(self, component: torch.nn.Module) -> None:
         """Tell CUDA Graphs where one inference step ends, so the next may reuse its buffers.
@@ -867,7 +932,7 @@ class xFuserModel(abc.ABC):
                 and component_name in self.settings.fsdp_strategy
                 and (requested_shards is None or component_name in requested_shards)
             )
-            if component_is_sharded or self.config.cache_method:
+            if component_is_sharded or self.config.cache_method or self._prefer_blockwise_compile():
                 # Per-block compile: leaves transformer as original object so cache-dit's
                 # transformer.forward patch remains visible during compiled execution.
                 wrap_attrs = self.settings.fsdp_strategy.get(component_name, {}).get("wrap_attrs", [])
@@ -977,6 +1042,10 @@ class xFuserModel(abc.ABC):
                 warmup_args["prompt"] = warmup_args["prompt"][: self.config.batch_size]
             self._run_warmup_calls(warmup_args)
 
+        # Compile warmup traces the graphs, then frees its outputs, so the next
+        # call re-records. Absorb that here unless an explicit warmup already did.
+        captured_cudagraph = self._warmup_cudagraph_capture(input_args)
+
         if self.config.determinism_check > 0:
             log(
                 f"Since determinism check is enabled ({self.config.determinism_check}), "
@@ -1014,8 +1083,8 @@ class xFuserModel(abc.ABC):
 
         output = self._gather_dp_outputs(output)
 
-        if not self.config.warmup_calls and len(timings) > 1:
-            # Without warmup calls, the first timed run absorbs one-time costs such as compilation.
+        if not self.config.warmup_calls and not captured_cudagraph and len(timings) > 1:
+            # Without a warmup, the first timed run absorbs one-time costs such as compilation.
             timings.pop(0)
         log(f"Average time over {len(timings)} runs: {sum(timings) / len(timings):.2f}s")
         log(f"Total time spent: {inference_start.elapsed_time(inference_end) / 1000:.2f}s")
@@ -1044,6 +1113,31 @@ class xFuserModel(abc.ABC):
             log(f"Batch {batch_index} completed in {timing:.2f}s")
 
         return DiffusionOutput.from_outputs(all_outputs, self.settings.model_output_type), timings
+
+    def _warmup_cudagraph_capture(self, input_args: dict) -> bool:
+        """Record CUDA graphs once, before timings, and report whether that happened.
+
+        This is not the compile-time capture. ``_run_compile_warmup`` still traces
+        the graphs (and, with ``--profile_capture_phase``, profiles that recording).
+        ``--warmup_calls`` is also left to do its own full pipe calls. Both of those
+        already give the measured loop a warmed allocator, so this adds a call only
+        when neither has, and only for modes that actually record CUDA graphs.
+        """
+        if not getattr(self.config, "use_torch_compile", False):
+            return False
+        if self.config.warmup_calls:
+            return False
+        if self._get_compile_mode() not in self.CUDAGRAPH_COMPILE_MODES:
+            return False
+
+        capture_args = copy.deepcopy(input_args)
+        if self.config.batch_size and isinstance(capture_args.get("prompt"), list):
+            capture_args["prompt"] = capture_args["prompt"][: self.config.batch_size]
+        log("CUDA graph capture warmup (untimed, excluded from timings)...")
+        _output, timing = self._run_timed_pipe(capture_args)
+        del _output
+        log(f"CUDA graph capture warmup completed in {timing:.2f}s")
+        return True
 
     def _run_warmup_calls(self, input_args: dict) -> None:
         """Run initial warmup calls if specified"""

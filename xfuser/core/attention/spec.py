@@ -73,6 +73,7 @@ class AttentionBackendType(Enum):
     TRITON_VSA_H3 = "FastH3 VSA-H3 (Triton)"
     AITER_BF16_VSA_H3 = "AITER BF16 VSA-H3"
     AITER_FP8_VSA_H3 = "AITER FP8 VSA-H3"
+    TRITON_BSA = "Prism block-sparse attention (Triton)"
     FLEX_BLOCK_SPARGE = "Flex Block Sparge"
     AITER_FLYDSL = "AITER FlyDSL"
     AITER_FLYDSL_FP8 = "AITER FlyDSL FP8"
@@ -96,6 +97,7 @@ class Sparsity(Enum):
     # skipped blocks from pooled K/V. Not SPARGE, because a model checked for
     # one is not thereby checked for the other.
     SOL = "sol"
+    BSA = "bsa"
 
 
 @dataclass(frozen=True)

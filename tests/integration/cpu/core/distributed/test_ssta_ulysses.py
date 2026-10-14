@@ -58,7 +58,7 @@ def _masks(rank, world_size):
     """Return {(case, share): (reference mask, this rank's Ulysses mask)}."""
     import torch
 
-    from xfuser.core.distributed.ssta import get_sparse_mask, setup_ssta
+    from xfuser.core.sparse_attention.ssta import get_sparse_mask, setup_ssta
 
     generator = torch.Generator().manual_seed(0)
     image_len = _THW[0] * _THW[1] * _THW[2]
