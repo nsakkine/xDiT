@@ -31,18 +31,17 @@ _MHA_V4_PACKED = "aiter.ops.mha_v4:mha_v4_packed"
 GFX950 = ARCH("gfx950")
 GFX950_OR_GFX942 = ARCH("gfx950", "gfx942")
 
-# When the dense rows may take part in ring attention.
+# When a dense row may take part in ring attention: AITER exports the LSE, and
+# the row's arch is one its LSE has been measured on (MhaV4Format.lse_on).
 #
 # The lse output buffer rather than the return_lse argument: return_lse has
 # always been accepted and always raised, so its presence proves nothing,
 # whereas the buffer only exists once the kernels write one.
 #
-# Stated as gfx950 rather than "not gfx942" -- the same set, since requires
-# already pins these rows to one of the two -- because AITER refuses the LSE on
-# gfx942 until its value has been measured against a reference. Be conservative
-# here: a wrong LSE is invisible to every output check, because O never reads
-# it, so a new architecture should have to opt in rather than inherit this.
-DENSE_RING = PARAM(_MHA_V4_PACKED, "lse") & GFX950
+# Per row and per arch, opted into rather than inherited: a wrong LSE is
+# invisible to every output check, because O never reads it, and on gfx942 only
+# the BF16 and BF16/FP8 dense objects store one at all.
+DENSE_LSE = PARAM(_MHA_V4_PACKED, "lse")
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +92,8 @@ class MhaV4Format:
     qk_scale: Optional[Scale] = None
     v_scale: Optional[Scale] = None
     dense: bool = True  # False = sparge variant only
+    # Where the dense row's LSE has been checked against a reference, so it may ring.
+    lse_on: Requirement = GFX950
 
     @property
     def is_mxfp8(self) -> bool:
@@ -107,8 +108,10 @@ class MhaV4Format:
 # the columns and the header would index nothing.
 FORMATS = [
     #            name        Q/K              V                sparge on
-    MhaV4Format("BF16",      Fmt.BF16,        Fmt.BF16,        GFX950_OR_GFX942),
-    MhaV4Format("BF16FP8",   Fmt.BF16,        Fmt.NATIVE_FP8,  GFX950_OR_GFX942),
+    MhaV4Format("BF16",      Fmt.BF16,        Fmt.BF16,        GFX950_OR_GFX942,
+                lse_on=GFX950_OR_GFX942),
+    MhaV4Format("BF16FP8",   Fmt.BF16,        Fmt.NATIVE_FP8,  GFX950_OR_GFX942,
+                lse_on=GFX950_OR_GFX942),
     MhaV4Format("I8FP8",     Fmt.INT8,        Fmt.NATIVE_FP8,  GFX950_OR_GFX942),
     MhaV4Format("F8F6",      Fmt.NATIVE_FP8,  Fmt.MXFP6,       GFX950),
     MhaV4Format("MXFP6",     Fmt.MXFP6,       Fmt.NATIVE_FP8,  GFX950),
@@ -152,7 +155,7 @@ def _dense_spec(fmt: MhaV4Format) -> Spec:
     return Spec(
         AttentionBackendType[f"AITER_{fmt.name}"],
         impl=Impl("kernel:mha_v4_dense", {"fmt": fmt}),
-        ring=DENSE_RING,
+        ring=DENSE_LSE & fmt.lse_on,
         low_precision=fmt.qk is not Fmt.BF16,
         accepts=DENSE_CALLS,
         # Every row here is head dim 128, which makes the family unselectable
@@ -162,7 +165,8 @@ def _dense_spec(fmt: MhaV4Format) -> Spec:
         # LSE -- on a ring run that would hand the merge a partial from the
         # 128-wide blocks and nothing from the rest.
         fallback=AttentionBackendType.AITER,
-        requires=SYMBOL(_MHA_V4) & GFX950_OR_GFX942 & _scale_modes(fmt),
+        # AITER ships a format's dense and sparse rows on the same arches.
+        requires=SYMBOL(_MHA_V4) & fmt.sparge_on & _scale_modes(fmt),
     )
 
 

@@ -57,14 +57,14 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # manifest calls default for the selected recipe: 256x64 on gfx950 for the BF16 and BF16/FP8
     # rows, 256x128 there for the rest, 256x64 on gfx942.
     #
-    # gfx950 also ships 64x64, for the FP8 and BF16 recipes, so it takes --attention_backend
-    # aiter_fp8_sol or aiter_bf16_sol; the other rows exist at their default alone and reject the
-    # override at setup. What 64x64 buys over a recipe's default is whatever that default does not
-    # already have: against FP8's 256x128 it quarters both the KV width and the query rows, so a
-    # query tile's threshold is computed over 4x more, 4x smaller blocks; against BF16's 256x64 the
-    # KV width is already 64 and only the query tile narrows, which sharpens the threshold without
-    # changing what a block is. Either way it costs throughput per token, since the same KV is
-    # re-read by 4x as many query tiles. Env rather than a CLI flag because it
+    # Both also ship 64x64: gfx950 for every recipe, gfx942 for BF16, BF16/FP8, FP8 and I8/FP8. A
+    # recipe without a 64x64 row rejects the override at setup. What 64x64 buys over a recipe's
+    # default is whatever that default does not already have: against FP8's 256x128 it quarters
+    # both the KV width and the query rows, so a query tile's threshold is computed over 4x more,
+    # 4x smaller blocks; against a 256x64 default the KV width is already 64 and only the query
+    # tile narrows, which sharpens the threshold without changing what a block is. Either way it
+    # costs throughput per token, since the same KV is re-read by 4x as many query tiles. On gfx942
+    # the 64x64 kernels run at 0.5-0.8x the 256x64 ones per unit of work. Env rather than a CLI flag because it
     # selects a kernel rather than a model behaviour, and the choice has to be measured per model.
     "SOL_ATTN_BLOCK_TILE": lambda: os.environ.get("XFUSER_SOL_ATTN_BLOCK_TILE", None),
     "XDIT_FBCACHE_THRESH": lambda: os.environ.get("XDIT_FBCACHE_THRESH", None),

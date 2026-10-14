@@ -29,7 +29,7 @@ from xfuser.logger import init_logger
 logger = init_logger(__name__)
 
 # VSA-H3 pools and selects over 64-token tiles, so its selection is only expressible at this
-# geometry. gfx950 serves it in BF16 and FP8; gfx942's finest block-sparse row is 256x64.
+# geometry, which gfx950 and gfx942 both serve in BF16 and FP8.
 VSA_H3_AITER_TILE = (FASTH3_VSA_TILE_ELEMENTS, FASTH3_VSA_TILE_ELEMENTS)
 
 # mha_v4 rows are hd128 only, in every precision.
@@ -125,7 +125,7 @@ def vsa_h3_aiter_row_available(recipe_id: str) -> bool:
     """Whether this device has a 64x64 sorted-sparse MHA v4 row for ``recipe_id``.
 
     Asked with the recipe's operands rather than for the geometry alone, because a geometry need
-    not exist in every precision: 64x64 is BF16 and FP8 only, and the MX rows stop at 256x128.
+    not exist in every precision: gfx942, for one, has no MX rows at any geometry.
 
     Memoised in a plain dict rather than functools.lru_cache: Dynamo inlines an lru_cache wrapper
     instead of calling it, so under the transformer's compile the query itself would be traced,

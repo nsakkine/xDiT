@@ -54,8 +54,8 @@ def _vsa_h3(query, key, value, call: AttnCall, *, kernel: str, recipe=None):
             logger,
             ("vsa_h3_aiter", recipe),
             f"VSA-H3 has no AITER {recipe} 64x64 block-sparse MHA v4 row on "
-            f"this device, falling back to the FlexAttention path. That "
-            f"geometry is gfx950 only; gfx942's finest is 256x64.",
+            f"this device, falling back to the FlexAttention path. gfx950 "
+            f"and gfx942 serve that geometry with an AITER that ships it.",
             level=logging.WARNING,
         )
         kernel = "flex"
@@ -91,9 +91,7 @@ def aiter_vsa_h3(query, key, value, call: AttnCall, *, recipe: str):
     """Through AITER's 64x64 sorted-sparse MHA v4 row for ``recipe``,
     FlexAttention where this device has none.
 
-    The FP8 row stages its LUT in LDS, which caps the key length at its 1919
-    entries -- 122,816 tokens -- and FastH3's default 768x1344x124 render is
-    2024 tiles, so it lands just past that and the launcher refuses it by name.
-    The BF16 row walks the LUT from memory instead and has no such ceiling.
+    The 64x64 rows on gfx950 and gfx942 walk their LUT from memory, so the
+    key length has no LUT ceiling.
     """
     return _vsa_h3(query, key, value, call, kernel="aiter", recipe=recipe)

@@ -79,6 +79,23 @@ def test_mxfp8_sparge_is_gfx950_only():
     assert fp8.sparge_on.names == ("gfx950", "gfx942")
 
 
+def test_gfx942_serves_every_recipe_it_has_kernels_for():
+    """gfx942 ships BF16, BF16/FP8, FP8 and I8/FP8 sparse and Sol-Attn rows, so each of those
+    backends has to be selectable there, and only BF16 and BF16/FP8 store a dense LSE."""
+    from xfuser.core.attention.backends.aiter_mha_v4.spec import FORMATS
+    from xfuser.core.attention.backends.aiter_sol.spec import RECIPES
+
+    by_name = {f.name: f for f in FORMATS}
+    for name in ("BF16", "BF16FP8", "I8FP8", "FP8"):
+        assert "gfx942" in by_name[name].sparge_on.names, name
+    sol = {r.name: r for r in RECIPES}
+    for name in ("BF16", "BF16FP8", "I8FP8", "FP8"):
+        assert "gfx942" in sol[name].archs.names, name
+    for name in ("BF16", "BF16FP8"):
+        assert "gfx942" in by_name[name].lse_on.names, name
+    assert "gfx942" not in by_name["I8FP8"].lse_on.names
+
+
 @pytest.mark.parametrize("backend_name", _MHA_V4_SPARGE_BACKENDS)
 def test_sparge_rejects_causal_and_dropout(backend_name):
     """Declared in `accepts`, so the refusal happens before the kernel runs."""

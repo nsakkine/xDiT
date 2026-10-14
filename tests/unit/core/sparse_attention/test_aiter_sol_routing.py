@@ -36,7 +36,8 @@ def test_a_malformed_block_tile_env_var_says_what_it_wanted(monkeypatch):
 @pytest.mark.parametrize("ragged_kv", [True, False])
 def test_kv_is_padded_to_the_tile_only_for_a_row_that_cannot_bound_its_last_block(monkeypatch, pinned_tile, ragged_kv):
     """A zero key scores 0 rather than -inf, so a pad the row does not need takes softmax mass.
-    gfx950's rows mask a short last block themselves; gfx942's index KV in whole tiles."""
+    The gfx950 and gfx942 rows mask a short last block themselves; a row that indexes KV in whole
+    tiles does not."""
     monkeypatch.setattr(sol, "_takes_ragged_kv", lambda recipe: ragged_kv)
     key = torch.randn(1, 2 * pinned_tile + 5, 2, 128)
 

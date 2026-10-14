@@ -406,10 +406,10 @@ def test_a_warm_spec_does_not_rewalk_its_fallback_chain():
 
 
 def test_the_mha_v4_dense_rows_ring_only_where_the_lse_is_measured():
-    """AITER refuses the LSE on gfx942 until its value has been checked
-    against a reference, and a wrong one is invisible to every output test
-    because O never reads it. Stated as gfx950 rather than "not gfx942" so a
-    new architecture opts in rather than inheriting the claim."""
+    """A row rings only on the arches its LSE has been checked on against a
+    reference, since a wrong one is invisible to every output test because O
+    never reads it. Each row names those arches, so a new one opts in rather
+    than inheriting the claim; on gfx942 that is BF16 and BF16/FP8."""
     from xfuser.core.attention import registry
     from xfuser.core.attention.backends.aiter_mha_v4.spec import DENSE_BACKENDS
 

@@ -49,11 +49,11 @@ class SolRecipe:
 # fmt: off
 # Q/K format then V format, as the dense MHA v4 table names them: F8F6 is FP8
 # Q/K with MXFP6 V, F6F6 MXFP6 throughout. The MX-V rows are gfx950's FP6-P
-# kernels. gfx942 builds the two per-tensor rows only.
+# kernels. gfx942 builds the BF16 and per-tensor rows only.
 RECIPES = [
     #          name       recipe     on                low precision
-    SolRecipe("BF16",    "bf16",    GFX950,           False),
-    SolRecipe("BF16FP8", "bf16fp8", GFX950,           False),
+    SolRecipe("BF16",    "bf16",    GFX950_OR_GFX942, False),
+    SolRecipe("BF16FP8", "bf16fp8", GFX950_OR_GFX942, False),
     SolRecipe("I8FP8",   "i8fp8",   GFX950_OR_GFX942, True),
     SolRecipe("FP8",     "fp8",     GFX950_OR_GFX942, True),
     SolRecipe("MXFP8",   "mxfp8",   GFX950,           True),

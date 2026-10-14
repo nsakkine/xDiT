@@ -80,7 +80,7 @@ def test_bf16_rows_route_to_mha_v4_while_aiter_stays_on_mha_v3():
     assert aiter.impl.bound == {}
 
 
-def _require_mha_v4_aiter(backend_name, supported_arches=("gfx950",)):
+def _require_mha_v4_aiter(backend_name, supported_arches=("gfx950", "gfx942")):
     """Skip unless this machine can actually run the backend.
 
     Two separate questions. The spec answers the first -- arch, symbols and

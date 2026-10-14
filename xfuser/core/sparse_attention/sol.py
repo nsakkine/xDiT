@@ -12,10 +12,9 @@ from typing import NamedTuple
 
 import torch
 
-# gfx950 carries a mode-2 manifest row for every recipe below; gfx942 carries only the two
-# per-tensor ones, so the rest are refused per recipe rather than per device.
+# gfx950 carries a mode-2 manifest row for every recipe below; gfx942 carries the BF16, BF16/FP8,
+# FP8 and I8/FP8 ones. Which recipe a device serves is read from aiter's manifest, per recipe.
 _SUPPORTED_ARCHS = ("gfx942", "gfx950")
-_ARCH_RECIPES = {"gfx942": ("fp8", "i8fp8")}
 
 
 class SolAttnUnsupported(RuntimeError):
@@ -310,26 +309,35 @@ def _device_arch(device=None):
 def check_sol_attn_recipe(recipe_id, device=None):
     """Raise unless this device has a Sol-Attn manifest row for recipe_id.
 
-    Separate from check_sol_attn_device because the answer is per recipe: gfx942 runs the two
-    per-tensor rows and has neither the BF16 nor the MX ones, so selecting aiter_mxfp8_sol there
-    has to fail at setup with the reason rather than at the first launch with a missing-kernel
-    error.
+    Separate from check_sol_attn_device because the answer is per recipe, read from aiter's
+    manifest: gfx942 has no MX rows, so selecting aiter_mxfp8_sol there has to fail at setup with
+    the reason rather than at the first launch with a missing-kernel error.
     """
     check_sol_attn_device(device)
-    allowed = _ARCH_RECIPES.get(_device_arch(device))
-    if allowed is not None and recipe_id not in allowed:
+    recipe = _resolve_recipe(recipe_id)
+    if not _serves_recipe(recipe):
         raise SolAttnUnsupported(
             f"Sol-Attn '{recipe_id}' has no {_device_arch(device)} manifest row; "
-            f"this device serves {', '.join(allowed)}")
-    _check_block_tile_override(_resolve_recipe(recipe_id))
+            f"this device serves {', '.join(sol_attn_recipes_served()) or 'none'}")
+    _check_block_tile_override(recipe)
+
+
+def sol_attn_recipes_served():
+    """The recipe ids this device has a Sol-Attn row for, in declaration order."""
+    return [r for r in SOL_ATTN_RECIPES if _serves_recipe(_RECIPES[r])]
+
+
+def _serves_recipe(recipe):
+    """Whether the active device's manifest has a mode-2 row, at any geometry, for `recipe`."""
+    return bool(_AITER.block_tiles(_recipe_operands(recipe), _AITER.sol_mode))
 
 
 def _check_block_tile_override(recipe=None):
     """Raise unless XFUSER_SOL_ATTN_BLOCK_TILE names a geometry this device has a kernel for.
 
     Checked against `recipe`'s operands when one is given, because a geometry need not exist in
-    every precision: gfx950's 64x64 rows are FP8 and BF16 only, so the override is valid for those
-    two recipes and for none of the others. Without a recipe it only asks whether any precision
+    every precision, so the override is valid only for the recipes whose own row serves it. Without
+    a recipe it only asks whether any precision
     serves the tile, which is all a caller reaching sol_attn_bhsd() directly has settled by then,
     and which is a question for the union of the rows rather than for the per-Q-tile query: that
     one collapses to a single KV tile and refuses where the rows disagree, as gfx950's now do at
@@ -374,8 +382,8 @@ def _recipe_operands(recipe):
 def _takes_ragged_kv(recipe):
     """Whether `recipe`'s row at this process's tile masks a short last KV block itself.
 
-    gfx950's Sol rows do, so they are handed the true key length; gfx942's do not, and need K/V
-    padded to a whole number of blocks.
+    Every gfx950 and gfx942 Sol row does today, so it is handed the true key length; a row that
+    does not needs K/V padded to a whole number of blocks.
     """
     if _ragged_kv is None:
         return False
@@ -510,7 +518,7 @@ def sol_attn_routing_for(q, k, v, beta, recipe=_RECIPES["fp8"], force_blocks=Non
         v[0],
         beta,
         # Not aiter's SOL_ATTN_TS_QO/TS_KV defaults, which are the gfx950 256x128 row: gfx942 pools
-        # 64 rows per block, and an opted-in gfx950 run may be on the 64x64 row. Pooling at the
+        # 64 rows per block, and an opted-in run may be on a 64x64 row. Pooling at the
         # wrong tile is not a rounding difference, it hands the kernel pooled tensors of the wrong
         # height. The dispatch below reads the same source, which keeps the two from drifting apart.
         *sol_attn_block_tile(recipe),
@@ -578,12 +586,12 @@ def _pad_kv_to_tile(key, value, recipe):
     """Right-pad BSHD K/V with zero tokens to a whole number of KV blocks, where the row needs it.
 
     A ragged row masks the keys past the end of a short last block, so it is handed the true key
-    length and nothing here runs. That is every gfx950 Sol row, which matters because Wan lands on
-    a short block at every standard size -- 720p is 21 latent frames x 80 x 45 = 75600 tokens,
-    which is 590.6 blocks of 128 -- and MiniMax-H3's packed sequence is no multiple of the tile
-    either once its own alignment pad is dropped.
+    length and nothing here runs. That is every gfx950 and gfx942 Sol row, which matters because
+    Wan lands on a short block at every standard size -- 720p is 21 latent frames x 80 x 45 =
+    75600 tokens, which is 590.6 blocks of 128 -- and MiniMax-H3's packed sequence is no multiple
+    of the tile either once its own alignment pad is dropped.
 
-    gfx942's rows index KV in whole tiles and aiter rejects a ragged seqlen_k there, so this pads.
+    A row that indexes KV in whole tiles makes aiter reject a ragged seqlen_k, so this pads.
     Zero tokens are not free: a zero key scores q . 0 = 0 rather than -inf, so the pad draws
     softmax weight exp(-max) per token instead of none, and its zero value pulls the row toward
     the origin by that weight. The pad is at most one block and the mass it takes is

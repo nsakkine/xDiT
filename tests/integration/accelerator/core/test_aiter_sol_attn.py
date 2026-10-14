@@ -72,8 +72,7 @@ def _recipes_on_this_device():
     """The Sol-Attn recipe ids this arch builds rows for, in declaration order."""
     from xfuser.core.sparse_attention import sol
 
-    allowed = sol._ARCH_RECIPES.get(sol._device_arch())
-    return [r for r in sol.SOL_ATTN_RECIPES if allowed is None or r in allowed]
+    return sol.sol_attn_recipes_served()
 
 
 def _serves(recipe, tile):
@@ -708,9 +707,8 @@ def test_the_64x64_override_routes_and_dispatches_at_64(monkeypatch):
 
 
 def test_a_block_tile_not_every_recipe_serves_is_rejected_at_setup(monkeypatch):
-    """gfx950's 64x64 rows are FP8 and BF16, and the others have to say so by name, at setup:
-    this is the check that stands between a mistyped launch and a run that loads a model for
-    minutes before dying."""
+    """A recipe without a 64x64 row has to say so by name, at setup: this is the check that
+    stands between a mistyped launch and a run that loads a model for minutes before dying."""
     _require_sol_recipe("fp8")
     from xfuser.core.sparse_attention.sol import SolAttnUnsupported, check_sol_attn_recipe
 
@@ -721,7 +719,8 @@ def test_a_block_tile_not_every_recipe_serves_is_rejected_at_setup(monkeypatch):
     recipes = _recipes_on_this_device()
     served = [recipe for recipe in recipes if _serves(recipe, (64, 64))]
     unserved = [recipe for recipe in recipes if recipe not in served]
-    assert unserved, "every recipe serves 64x64, so the rejection half below checks nothing"
+    if not unserved:
+        pytest.skip("every recipe this device has serves 64x64, so there is nothing to reject.")
 
     for recipe in served:
         check_sol_attn_recipe(recipe)
