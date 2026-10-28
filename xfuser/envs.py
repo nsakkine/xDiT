@@ -67,6 +67,17 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # the 64x64 kernels run at 0.5-0.8x the 256x64 ones per unit of work. Env rather than a CLI flag because it
     # selects a kernel rather than a model behaviour, and the choice has to be measured per model.
     "SOL_ATTN_BLOCK_TILE": lambda: os.environ.get("XFUSER_SOL_ATTN_BLOCK_TILE", None),
+    # "1" adds the second-order (Jensen) term 0.5 * scale^2 * sum_d q_d^2 * var_k[d] to every pooled
+    # block's logit, from each block's K variance, damped per block to at most ln(kv_tile) for the
+    # worst query that pools it (aiter's sol_jensen_cap); on the block-scaled MX recipes the damping
+    # is a power of two, written into the variance's E8M0 scale. Served by every recipe. Moves
+    # every call onto aiter's packed API.
+    "SOL_ATTN_JENSEN": lambda: os.environ.get("XFUSER_SOL_ATTN_JENSEN", "0"),
+    # Rank of the low-rank pooled value tilt (PoC), 0 for none: each pooled block's value also gets
+    # the leading `rank` terms of its Cov(v, k) q. Implies SOL_ATTN_JENSEN. Every recipe serves it
+    # at its default block tile and at 64x64, on aiter's tilt kernels. Its shifts stay on the
+    # device, so a compiled forward holds one graph.
+    "SOL_ATTN_TILT_RANK": lambda: os.environ.get("XFUSER_SOL_ATTN_TILT_RANK", "0"),
     "XDIT_FBCACHE_THRESH": lambda: os.environ.get("XDIT_FBCACHE_THRESH", None),
     # opt-in breakdown of where a memory-efficient fill spends its time. Off by default because an
     # honest breakdown has to synchronise at each phase boundary, and that serialises a fill which
