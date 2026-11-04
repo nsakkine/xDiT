@@ -21,6 +21,7 @@ from xfuser.core.distributed import (
     get_ring_parallel_rank,
     get_ulysses_parallel_rank,
     get_runtime_state,
+    runtime_state_is_initialized,
 )
 
 from xfuser.compat import version_at_least
@@ -52,6 +53,14 @@ _FP8_NCCL_NEEDS_VIEW = not version_at_least(torch.__version__, "2.11.0")
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2, torch.float8_e5m2fnuz)
 _warned_fp8_comms_missing_attn = False
 logger = init_logger(__name__)
+
+
+def _compile_capture_bypasses_attention() -> bool:
+    return runtime_state_is_initialized() and getattr(
+        get_runtime_state(),
+        "_xdit_compile_capture_bypass_attention",
+        False,
+    )
 
 
 def _warn_fp8_comms_missing_attn():
@@ -384,11 +393,10 @@ def _trim_trailing_kv_padding(key, value, attention_kwargs, backend=None):
     return key[:, :, :valid_kv_len], value[:, :, :valid_kv_len], consumed
 
 
-# setup_sparge strips the rows past the published `thw` layout itself before it
-# reorders Q and K/V against that layout. Trimming K/V ahead of it would break
-# the equal Q/K/V lengths these backends need: Sparge refuses the call, VSA
-# silently falls back to dense attention.
-_SPARSITY_STRIPPING_SP_PAD = (Sparsity.SPARGE, Sparsity.VSA)
+# Spatial sparse setup strips the rows past the published `thw` layout itself
+# before reordering Q and K/V. SSTA also drops `encoder_sp_padding` from text.
+# Trimming K/V first breaks the equal Q/K/V lengths required by these paths.
+_SPARSITY_STRIPPING_SP_PAD = (Sparsity.SSTA, Sparsity.SPARGE, Sparsity.VSA)
 
 
 def _backend_strips_sp_pad(backend, attention_kwargs) -> bool:
@@ -561,6 +569,10 @@ def USP(
     Ring attention. Also supports joint tensors and key-value caching for pipeline parallelism.
     Explicit backend can be provided to specify the attention backend to use.
 
+    ``attention_kwargs["valid_kv_len"]`` declares the global number of valid
+    main K/V tokens before uniform SP suffix padding, across both Ulysses and
+    ring ranks. Joint tokens are excluded from this count and remain intact.
+
     ``attn_layer`` (optional): the attention module. Used to resolve Ulysses FP8
     communication state and to update the PipeFusion KV cache for modules that
     registered one. Callers only pass the module; USP no-ops when FP8 comms is
@@ -583,6 +595,15 @@ def USP(
     if combine_qkv_a2a is None:
         combine_qkv_a2a = False
     _validate_gqa_params(query, key, value, kv_head_repeat, joint_strategy)
+
+    if _compile_capture_bypasses_attention():
+        # Capture needs the public attention output contract, not attention
+        # values. Bypass before communication or backend-specific quantization
+        # so every activation dtype is preserved without guessing how a
+        # low-precision backend represents Q/K/V internally.
+        if joint_strategy:
+            query = _concat_joint_tensor(query, joint_query, joint_strategy, dim=2)
+        return torch.zeros_like(query)
 
     attention_function = _get_attention_function(backend=backend)
 
@@ -628,7 +649,8 @@ def USP(
 
     joint_attn_kwargs = None
     if joint_strategy:
-        query = _concat_joint_tensor(query, joint_query, joint_strategy, dim=2)
+        if joint_query is not None:
+            query = _concat_joint_tensor(query, joint_query, joint_strategy, dim=2)
         joint_key, joint_value = _preprocess_joint_tensors(joint_key, joint_value)
         joint_attn_kwargs = {
             "joint_value": joint_value,
@@ -684,6 +706,18 @@ def USP(
     valid_kv_len = (attention_kwargs or {}).get("valid_kv_len")
     if valid_kv_len is None:
         pass
+    elif joint_strategy and (
+        is_causal
+        or attention_kwargs.get("indices_k") is not None
+        or _backend_strips_sp_pad(hb_backend, attention_kwargs)
+    ):
+        # In these three cases the pad stays in K for the backend to handle (below), which cannot tell
+        # it from the joint tokens joined afterwards. No model combines them with joint tensors.
+        # Make the backend handle the pad of the main tokens before joining the others, then delete this.
+        raise NotImplementedError(
+            "valid_kv_len cannot be combined with joint tensors for causal attention, packed keys, "
+            "or a backend that strips the pad against a spatial layout (Sparge, VSA, SSTA)."
+        )
     elif is_causal:
         # Causality already hides a trailing pad from every real query, and the
         # untrimmed equal lengths leave no room for the backends' differing
@@ -695,6 +729,12 @@ def USP(
         attention_function = _ring_trim_trailing_kv_padding(attention_function, valid_kv_len, key.shape[2])
     else:
         key, value, attention_kwargs = _trim_trailing_kv_padding(key, value, attention_kwargs, hb_backend)
+
+    if joint_strategy and valid_kv_len is not None:
+        # The published length counts main K/V only. Their pad has now been dropped (or will be inside
+        # each ring step), so a backend must not apply that length again to the K/V with the joint tokens
+        # joined: the dense fallback of AITER_VSA, for one, crops K to it.
+        attention_kwargs = {**attention_kwargs, "valid_kv_len": None}
 
     if kv_head_repeat > 1:
         key, value = _repeat_kv_heads(key, value, kv_head_repeat)
@@ -779,6 +819,9 @@ def attention(
     parity with ``USP`` but ignored here: with no Ulysses parallelism there is
     no head sharding or FP8 all-to-all.
     """
+    if _compile_capture_bypasses_attention():
+        return torch.zeros_like(query)
+
     attention_function = _get_attention_function(backend=backend)
     # Same rule as USP: a backend that cannot serve packed keys gets the pad
     # sliced instead, which is the same computation.

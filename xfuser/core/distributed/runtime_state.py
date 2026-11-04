@@ -355,6 +355,8 @@ class DiTRuntimeState(RuntimeState):
     # Class-level default so states built without __init__ (as some tests do) can still
     # call set_input_parameters.
     split_latents_by_rows: bool = True
+    # Read by reset_step_counter() at every pipeline-run boundary, so it needs the same default.
+    step_counter: Optional[torch.Tensor] = None
 
     def __init__(self, pipeline: DiffusionPipeline, config: EngineConfig):
         self.attention_schedule: Optional[AttentionSchedule] = None
